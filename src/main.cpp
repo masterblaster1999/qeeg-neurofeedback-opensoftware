@@ -1,6 +1,7 @@
 #include "qeeg/bandpower.hpp"
 #include "qeeg/bmp_writer.hpp"
 #include "qeeg/montage.hpp"
+#include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/topomap.hpp"
 #include "qeeg/utils.hpp"
@@ -27,11 +28,28 @@ struct Args {
   double demo_seconds{10.0};
 
   bool average_reference{false};
+
+  // Optional preprocessing filters
+  double notch_hz{0.0};
+  double notch_q{30.0};
+  double bandpass_low_hz{0.0};
+  double bandpass_high_hz{0.0};
+  bool zero_phase{false};
+
   bool export_psd{false};
 
   size_t nperseg{1024};
   double overlap{0.5};
   int grid{256};
+
+  // Topomap interpolation
+  std::string interp{"idw"};  // idw | spline
+  double idw_power{2.0};
+
+  // Spherical spline parameters
+  int spline_terms{50};
+  int spline_m{4};
+  double spline_lambda{1e-5};
 };
 
 static void print_help() {
@@ -51,7 +69,16 @@ static void print_help() {
     << "  --nperseg N             Welch segment length (default: 1024)\n"
     << "  --overlap FRAC          Welch overlap fraction in [0,1) (default: 0.5)\n"
     << "  --grid N                Topomap grid size (default: 256)\n"
-    << "  --average-reference     Apply average reference across channels\n"
+    << "  --interp METHOD         Topomap interpolation: idw|spline (default: idw)\n"
+    << "  --idw-power P           IDW power parameter (default: 2.0)\n"
+    << "  --spline-terms N        Spherical spline Legendre terms (default: 50)\n"
+    << "  --spline-m N            Spherical spline order m (default: 4)\n"
+    << "  --spline-lambda X       Spline regularization (default: 1e-5)\n"
+    << "  --average-reference     Apply common average reference across channels\n"
+    << "  --notch HZ              Apply a notch filter at HZ (e.g., 50 or 60)\n"
+    << "  --notch-q Q             Notch Q factor (default: 30)\n"
+    << "  --bandpass LO HI        Apply a simple bandpass (highpass LO then lowpass HI)\n"
+    << "  --zero-phase            Offline: forward-backward filtering (less phase distortion)\n"
     << "  --export-psd            Write psd.csv (freq + PSD per channel)\n"
     << "  --demo                  Generate synthetic recording instead of reading file\n"
     << "  --seconds S             Duration for --demo (default: 10)\n"
@@ -83,8 +110,27 @@ static Args parse_args(int argc, char** argv) {
       a.overlap = to_double(argv[++i]);
     } else if (arg == "--grid" && i + 1 < argc) {
       a.grid = to_int(argv[++i]);
+    } else if (arg == "--interp" && i + 1 < argc) {
+      a.interp = to_lower(argv[++i]);
+    } else if (arg == "--idw-power" && i + 1 < argc) {
+      a.idw_power = to_double(argv[++i]);
+    } else if (arg == "--spline-terms" && i + 1 < argc) {
+      a.spline_terms = to_int(argv[++i]);
+    } else if (arg == "--spline-m" && i + 1 < argc) {
+      a.spline_m = to_int(argv[++i]);
+    } else if (arg == "--spline-lambda" && i + 1 < argc) {
+      a.spline_lambda = to_double(argv[++i]);
     } else if (arg == "--average-reference") {
       a.average_reference = true;
+    } else if (arg == "--notch" && i + 1 < argc) {
+      a.notch_hz = to_double(argv[++i]);
+    } else if (arg == "--notch-q" && i + 1 < argc) {
+      a.notch_q = to_double(argv[++i]);
+    } else if (arg == "--bandpass" && i + 2 < argc) {
+      a.bandpass_low_hz = to_double(argv[++i]);
+      a.bandpass_high_hz = to_double(argv[++i]);
+    } else if (arg == "--zero-phase") {
+      a.zero_phase = true;
     } else if (arg == "--export-psd") {
       a.export_psd = true;
     } else if (arg == "--demo") {
@@ -173,19 +219,6 @@ static EEGRecording make_demo_recording(const Montage& montage, double fs_hz, do
   return rec;
 }
 
-static void apply_average_reference(EEGRecording& rec) {
-  const size_t C = rec.n_channels();
-  const size_t N = rec.n_samples();
-  if (C == 0 || N == 0) return;
-
-  for (size_t i = 0; i < N; ++i) {
-    double m = 0.0;
-    for (size_t c = 0; c < C; ++c) m += rec.data[c][i];
-    m /= static_cast<double>(C);
-    for (size_t c = 0; c < C; ++c) rec.data[c][i] = static_cast<float>(rec.data[c][i] - m);
-  }
-}
-
 static std::pair<double,double> minmax_ignore_nan(const std::vector<float>& v) {
   double mn = std::numeric_limits<double>::infinity();
   double mx = -std::numeric_limits<double>::infinity();
@@ -224,9 +257,31 @@ int main(int argc, char** argv) {
     std::cout << "Loaded recording: " << rec.n_channels() << " channels, "
               << rec.n_samples() << " samples, fs=" << rec.fs_hz << " Hz\n";
 
-    if (args.average_reference) {
-      std::cout << "Applying average reference...\n";
-      apply_average_reference(rec);
+    PreprocessOptions popt;
+    popt.average_reference = args.average_reference;
+    popt.notch_hz = args.notch_hz;
+    popt.notch_q = args.notch_q;
+    popt.bandpass_low_hz = args.bandpass_low_hz;
+    popt.bandpass_high_hz = args.bandpass_high_hz;
+    popt.zero_phase = args.zero_phase;
+
+    const bool do_pre = popt.average_reference || popt.notch_hz > 0.0 ||
+                        popt.bandpass_low_hz > 0.0 || popt.bandpass_high_hz > 0.0;
+    if (do_pre) {
+      std::cout << "Preprocessing:\n";
+      if (popt.average_reference) {
+        std::cout << "  - CAR (average reference)\n";
+      }
+      if (popt.notch_hz > 0.0) {
+        std::cout << "  - notch " << popt.notch_hz << " Hz (Q=" << popt.notch_q << ")\n";
+      }
+      if (popt.bandpass_low_hz > 0.0 || popt.bandpass_high_hz > 0.0) {
+        std::cout << "  - bandpass " << popt.bandpass_low_hz << ".." << popt.bandpass_high_hz << " Hz\n";
+      }
+      if (popt.zero_phase && (popt.notch_hz > 0.0 || popt.bandpass_low_hz > 0.0 || popt.bandpass_high_hz > 0.0)) {
+        std::cout << "  - zero-phase (forward-backward)\n";
+      }
+      preprocess_recording_inplace(rec, popt);
     }
 
     const std::vector<BandDefinition> bands = parse_band_spec(args.band_spec);
@@ -310,6 +365,16 @@ int main(int argc, char** argv) {
     // Render maps per band
     TopomapOptions topt;
     topt.grid_size = args.grid;
+    topt.idw_power = args.idw_power;
+
+    if (args.interp == "spline" || args.interp == "spherical_spline" || args.interp == "spherical-spline") {
+      topt.method = TopomapInterpolation::SPHERICAL_SPLINE;
+    } else {
+      topt.method = TopomapInterpolation::IDW;
+    }
+    topt.spline.n_terms = args.spline_terms;
+    topt.spline.m = args.spline_m;
+    topt.spline.lambda = args.spline_lambda;
 
     for (size_t b = 0; b < bands.size(); ++b) {
       std::cout << "Rendering band: " << bands[b].name << "\n";
@@ -317,7 +382,7 @@ int main(int argc, char** argv) {
       std::vector<double> values(rec.n_channels());
       for (size_t c = 0; c < rec.n_channels(); ++c) values[c] = bandpower_matrix[b][c];
 
-      Grid2D grid = make_topomap_idw(montage, rec.channel_names, values, topt);
+      Grid2D grid = make_topomap(montage, rec.channel_names, values, topt);
       auto [vmin, vmax] = minmax_ignore_nan(grid.values);
 
       const std::string outpath = args.outdir + "/topomap_" + bands[b].name + ".bmp";
@@ -331,7 +396,7 @@ int main(int argc, char** argv) {
             zvals[c] = z;
           }
         }
-        Grid2D zg = make_topomap_idw(montage, rec.channel_names, zvals, topt);
+        Grid2D zg = make_topomap(montage, rec.channel_names, zvals, topt);
         // common visualization range
         const std::string zout = args.outdir + "/topomap_" + bands[b].name + "_z.bmp";
         render_grid_to_bmp(zout, zg.size, zg.values, -3.0, 3.0);

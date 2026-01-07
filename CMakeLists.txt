@@ -13,11 +13,22 @@ option(QEEG_BUILD_TESTS "Build tests" ON)
 add_library(qeeg STATIC
   src/utils.cpp
   src/reader.cpp
+  src/annotations.cpp
   src/edf_reader.cpp
+  src/bdf_reader.cpp
   src/csv_reader.cpp
   src/fft.cpp
+  src/spectrogram.cpp
+  src/biquad.cpp
+  src/preprocess.cpp
   src/welch_psd.cpp
   src/bandpower.cpp
+  src/coherence.cpp
+  src/pac.cpp
+  src/online_bandpower.cpp
+  src/online_coherence.cpp
+  src/online_pac.cpp
+  src/spherical_spline.cpp
   src/montage.cpp
   src/topomap.cpp
   src/bmp_writer.cpp
@@ -37,9 +48,70 @@ endif()
 add_executable(qeeg_map_cli src/main.cpp)
 target_link_libraries(qeeg_map_cli PRIVATE qeeg)
 
+add_executable(qeeg_nf_cli src/nf_cli.cpp)
+target_link_libraries(qeeg_nf_cli PRIVATE qeeg)
+
+add_executable(qeeg_coherence_cli src/coherence_cli.cpp)
+target_link_libraries(qeeg_coherence_cli PRIVATE qeeg)
+
+add_executable(qeeg_epoch_cli src/epoch_cli.cpp)
+target_link_libraries(qeeg_epoch_cli PRIVATE qeeg)
+
+add_executable(qeeg_spectrogram_cli src/spectrogram_cli.cpp)
+target_link_libraries(qeeg_spectrogram_cli PRIVATE qeeg)
+
+add_executable(qeeg_pac_cli src/pac_cli.cpp)
+target_link_libraries(qeeg_pac_cli PRIVATE qeeg)
+
 if(QEEG_BUILD_TESTS)
   enable_testing()
-  add_executable(qeeg_tests tests/test_fft.cpp)
-  target_link_libraries(qeeg_tests PRIVATE qeeg)
-  add_test(NAME qeeg_tests COMMAND qeeg_tests)
+
+  add_executable(qeeg_test_fft tests/test_fft.cpp)
+  target_link_libraries(qeeg_test_fft PRIVATE qeeg)
+  add_test(NAME qeeg_test_fft COMMAND qeeg_test_fft)
+
+  add_executable(qeeg_test_bdf_reader tests/test_bdf_reader.cpp)
+  target_link_libraries(qeeg_test_bdf_reader PRIVATE qeeg)
+  add_test(NAME qeeg_test_bdf_reader COMMAND qeeg_test_bdf_reader)
+
+  add_executable(qeeg_test_online_bandpower tests/test_online_bandpower.cpp)
+  target_link_libraries(qeeg_test_online_bandpower PRIVATE qeeg)
+  add_test(NAME qeeg_test_online_bandpower COMMAND qeeg_test_online_bandpower)
+
+  add_executable(qeeg_test_spherical_spline tests/test_spherical_spline.cpp)
+  target_link_libraries(qeeg_test_spherical_spline PRIVATE qeeg)
+  add_test(NAME qeeg_test_spherical_spline COMMAND qeeg_test_spherical_spline)
+
+  add_executable(qeeg_test_coherence tests/test_coherence.cpp)
+  target_link_libraries(qeeg_test_coherence PRIVATE qeeg)
+  add_test(NAME qeeg_test_coherence COMMAND qeeg_test_coherence)
+
+  add_executable(qeeg_test_online_coherence tests/test_online_coherence.cpp)
+  target_link_libraries(qeeg_test_online_coherence PRIVATE qeeg)
+  add_test(NAME qeeg_test_online_coherence COMMAND qeeg_test_online_coherence)
+
+  add_executable(qeeg_test_biquad tests/test_biquad.cpp)
+  target_link_libraries(qeeg_test_biquad PRIVATE qeeg)
+  add_test(NAME qeeg_test_biquad COMMAND qeeg_test_biquad)
+
+  add_executable(qeeg_test_preprocess tests/test_preprocess.cpp)
+  target_link_libraries(qeeg_test_preprocess PRIVATE qeeg)
+  add_test(NAME qeeg_test_preprocess COMMAND qeeg_test_preprocess)
+
+  add_executable(qeeg_test_annotations tests/test_annotations.cpp)
+  target_link_libraries(qeeg_test_annotations PRIVATE qeeg)
+  add_test(NAME qeeg_test_annotations COMMAND qeeg_test_annotations)
+
+  add_executable(qeeg_test_spectrogram tests/test_spectrogram.cpp)
+  target_link_libraries(qeeg_test_spectrogram PRIVATE qeeg)
+  add_test(NAME qeeg_test_spectrogram COMMAND qeeg_test_spectrogram)
+
+  add_executable(qeeg_test_pac tests/test_pac.cpp)
+  target_link_libraries(qeeg_test_pac PRIVATE qeeg)
+  add_test(NAME qeeg_test_pac COMMAND qeeg_test_pac)
+
+  add_executable(qeeg_test_online_pac tests/test_online_pac.cpp)
+  target_link_libraries(qeeg_test_online_pac PRIVATE qeeg)
+  add_test(NAME qeeg_test_online_pac COMMAND qeeg_test_online_pac)
+
 endif()

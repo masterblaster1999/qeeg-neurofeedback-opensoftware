@@ -1,9 +1,10 @@
-#include "qeeg/edf_reader.hpp"
+#include "qeeg/bdf_reader.hpp"
 
 #include "qeeg/annotations.hpp"
 #include "qeeg/utils.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -15,22 +16,29 @@ namespace qeeg {
 static std::string read_fixed(std::ifstream& f, size_t n) {
   std::string s(n, '\0');
   f.read(&s[0], static_cast<std::streamsize>(n));
-  if (!f) throw std::runtime_error("EDF parse error: unexpected EOF");
+  if (!f) throw std::runtime_error("BDF parse error: unexpected EOF");
   return s;
 }
 
-static int16_t read_i16_le(std::ifstream& f) {
-  uint8_t b0 = 0, b1 = 0;
+static int32_t read_i24_le(std::ifstream& f) {
+  uint8_t b0 = 0, b1 = 0, b2 = 0;
   f.read(reinterpret_cast<char*>(&b0), 1);
   f.read(reinterpret_cast<char*>(&b1), 1);
-  if (!f) throw std::runtime_error("EDF parse error: unexpected EOF while reading samples");
-  return static_cast<int16_t>(static_cast<uint16_t>(b0) | (static_cast<uint16_t>(b1) << 8));
+  f.read(reinterpret_cast<char*>(&b2), 1);
+  if (!f) throw std::runtime_error("BDF parse error: unexpected EOF while reading samples");
+
+  uint32_t u = static_cast<uint32_t>(b0) |
+               (static_cast<uint32_t>(b1) << 8) |
+               (static_cast<uint32_t>(b2) << 16);
+  // Sign-extend 24-bit two's complement into 32-bit.
+  if (u & 0x00800000u) u |= 0xFF000000u;
+  return static_cast<int32_t>(u);
 }
 
 static std::string normalize_label(std::string label) {
   label = trim(label);
 
-  // Common variants in EDF labels
+  // Common variants in EDF/BDF labels
   // e.g., "EEG Fp1", "EEG-Fp1", "Fp1-REF", etc.
   std::string low = to_lower(label);
 
@@ -43,7 +51,7 @@ static std::string normalize_label(std::string label) {
     }
   }
 
-  // Strip trailing "-ref" or "ref"
+  // Strip trailing "-ref" or " ref"
   low = to_lower(label);
   auto strip_suffix = [&](const std::string& suf) {
     if (ends_with(low, suf)) {
@@ -63,9 +71,9 @@ static std::string normalize_label(std::string label) {
   return label;
 }
 
-EEGRecording EDFReader::read(const std::string& path) {
+EEGRecording BDFReader::read(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("Failed to open EDF: " + path);
+  if (!f) throw std::runtime_error("Failed to open BDF: " + path);
 
   // Header (fixed part)
   std::string version = read_fixed(f, 8);
@@ -90,7 +98,7 @@ EEGRecording EDFReader::read(const std::string& path) {
   catch (...) { record_duration = 0.0; }
 
   const int num_signals = to_int(num_signals_s);
-  if (num_signals <= 0) throw std::runtime_error("EDF: invalid number of signals");
+  if (num_signals <= 0) throw std::runtime_error("BDF: invalid number of signals");
 
   // Per-signal fields (each field is an array of num_signals entries)
   std::vector<std::string> labels(num_signals);
@@ -118,29 +126,29 @@ EEGRecording EDFReader::read(const std::string& path) {
   for (int i = 0; i < num_signals; ++i) (void)read_fixed(f, 32);
 
   if (record_duration <= 0.0) {
-    throw std::runtime_error("EDF: record_duration must be > 0 (got " + std::to_string(record_duration) + ")");
+    throw std::runtime_error("BDF: record_duration must be > 0 (got " + std::to_string(record_duration) + ")");
   }
 
   // Infer num_records if unknown (<= 0)
   const std::uintmax_t file_size = std::filesystem::file_size(std::filesystem::u8path(path));
   const size_t header_size = static_cast<size_t>(header_bytes);
 
-  // EDF samples are 16-bit signed per spec (this reader only supports EDF, not BDF 24-bit).
+  // BDF samples are 24-bit signed (3 bytes per sample).
   size_t bytes_per_record = 0;
   for (int i = 0; i < num_signals; ++i) {
-    if (samples_per_record[i] < 0) throw std::runtime_error("EDF: negative samples_per_record");
-    bytes_per_record += static_cast<size_t>(samples_per_record[i]) * 2u;
+    if (samples_per_record[i] < 0) throw std::runtime_error("BDF: negative samples_per_record");
+    bytes_per_record += static_cast<size_t>(samples_per_record[i]) * 3u;
   }
 
-  if (bytes_per_record == 0) throw std::runtime_error("EDF: bytes_per_record computed as 0");
+  if (bytes_per_record == 0) throw std::runtime_error("BDF: bytes_per_record computed as 0");
 
   if (num_records <= 0) {
-    if (file_size < header_size) throw std::runtime_error("EDF: file smaller than header");
+    if (file_size < header_size) throw std::runtime_error("BDF: file smaller than header");
     const size_t data_bytes = static_cast<size_t>(file_size - header_size);
     num_records = static_cast<int>(data_bytes / bytes_per_record);
   }
 
-  if (num_records <= 0) throw std::runtime_error("EDF: could not determine number of data records");
+  if (num_records <= 0) throw std::runtime_error("BDF: could not determine number of data records");
 
   // Determine per-signal sampling rates and ensure they match
   std::vector<double> fs_per_signal(num_signals, 0.0);
@@ -157,7 +165,8 @@ EEGRecording EDFReader::read(const std::string& path) {
   for (int i = 0; i < num_signals; ++i) {
     std::string label = trim(labels[i]);
     std::string low = to_lower(label);
-    if (low.find("edf annotations") != std::string::npos ||
+    if (low.find("bdf annotations") != std::string::npos ||
+        low.find("edf annotations") != std::string::npos ||
         low.find("annotations") != std::string::npos) {
       keep[i] = false;
       is_annotation[i] = true;
@@ -172,7 +181,7 @@ EEGRecording EDFReader::read(const std::string& path) {
   }
 
   if (kept_names.empty()) {
-    throw std::runtime_error("EDF: no EEG channels found (only annotations?)");
+    throw std::runtime_error("BDF: no EEG channels found (only annotations?)");
   }
 
   // Choose a global fs_hz: require all kept channels to match (within tolerance)
@@ -183,11 +192,11 @@ EEGRecording EDFReader::read(const std::string& path) {
     else {
       double diff = std::abs(fs_per_signal[i] - fs0);
       if (diff > 1e-6) {
-        throw std::runtime_error("EDF: channels have different sampling rates; this first pass requires equal fs");
+        throw std::runtime_error("BDF: channels have different sampling rates; this first pass requires equal fs");
       }
     }
   }
-  if (fs0 <= 0.0) throw std::runtime_error("EDF: invalid sampling rate");
+  if (fs0 <= 0.0) throw std::runtime_error("BDF: invalid sampling rate");
 
   // Allocate output recording
   EEGRecording rec;
@@ -214,7 +223,7 @@ EEGRecording EDFReader::read(const std::string& path) {
 
   // Seek to start of data (header_bytes)
   f.seekg(static_cast<std::streamoff>(header_bytes), std::ios::beg);
-  if (!f) throw std::runtime_error("EDF: failed to seek to data");
+  if (!f) throw std::runtime_error("BDF: failed to seek to data");
 
   // Map original signal index -> kept channel index
   std::vector<int> kept_index(num_signals, -1);
@@ -239,20 +248,19 @@ EEGRecording EDFReader::read(const std::string& path) {
     for (int s = 0; s < num_signals; ++s) {
       const int n = samples_per_record[s];
       if (is_annotation[s]) {
-        // EDF+ annotation channel: samples are stored as 16-bit integers but only
-        // the low 8 bits are used as 8-bit bytes for the TAL text.
+        // BDF+ annotation channel: samples are stored as 24-bit integers but
+        // only the low 8 bits are used as 8-bit bytes for the TAL text.
         std::vector<uint8_t> bytes;
         bytes.reserve(static_cast<size_t>(n));
         for (int j = 0; j < n; ++j) {
-          int16_t dig = read_i16_le(f);
-          uint16_t u = static_cast<uint16_t>(dig);
-          bytes.push_back(static_cast<uint8_t>(u & 0xFFu));
+          int32_t dig = read_i24_le(f);
+          bytes.push_back(static_cast<uint8_t>(static_cast<uint32_t>(dig) & 0xFFu));
         }
         auto ev = parse_edfplus_annotations_record(bytes);
         rec.events.insert(rec.events.end(), ev.begin(), ev.end());
       } else {
         for (int j = 0; j < n; ++j) {
-          int16_t dig = read_i16_le(f);
+          int32_t dig = read_i24_le(f);
           if (keep[s]) {
             double phys = static_cast<double>(dig) * scale[s] + offset[s];
             rec.data[static_cast<size_t>(kept_index[s])].push_back(static_cast<float>(phys));
@@ -266,7 +274,7 @@ EEGRecording EDFReader::read(const std::string& path) {
   const size_t nsamp = rec.n_samples();
   for (const auto& ch : rec.data) {
     if (ch.size() != nsamp) {
-      throw std::runtime_error("EDF: channel length mismatch after read");
+      throw std::runtime_error("BDF: channel length mismatch after read");
     }
   }
 

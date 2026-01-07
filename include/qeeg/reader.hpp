@@ -14,7 +14,11 @@ public:
 
 // Read a file based on extension:
 // - .edf/.EDF => EDFReader (16-bit EDF/EDF+)
+// - .bdf/.BDF => BDFReader (24-bit BDF/BDF+)
 // - .csv => CSVReader (requires fs_hz_for_csv > 0)
+//
+// If the input is EDF+/BDF+ and contains an "Annotations" signal, the readers
+// will also fill EEGRecording::events with parsed TAL entries.
 EEGRecording read_recording_auto(const std::string& path, double fs_hz_for_csv);
 
 } // namespace qeeg

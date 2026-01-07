@@ -7,7 +7,7 @@
 namespace qeeg {
 
 // Minimal EDF/EDF+ (16-bit) reader.
-// - ignores annotation channels
+// - parses EDF+ annotation channels ("EDF Annotations") into EEGRecording::events
 // - reads signals into physical units using per-signal scaling
 // - supports "unknown number of records" by inferring from file size (best effort)
 class EDFReader {

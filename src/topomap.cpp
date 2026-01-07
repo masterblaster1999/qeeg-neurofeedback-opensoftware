@@ -89,4 +89,74 @@ Grid2D make_topomap_idw(const Montage& montage,
   return grid;
 }
 
+
+Grid2D make_topomap_spherical_spline(const Montage& montage,
+                                    const std::vector<std::string>& channel_names,
+                                    const std::vector<double>& channel_values,
+                                    const TopomapOptions& opt) {
+  if (channel_names.size() != channel_values.size()) {
+    throw std::runtime_error("make_topomap_spherical_spline: channel_names and channel_values size mismatch");
+  }
+  if (opt.grid_size < 8) throw std::runtime_error("make_topomap_spherical_spline: grid_size too small");
+
+  // Gather points on unit sphere (z >= 0 hemisphere)
+  std::vector<Vec3> pos;
+  std::vector<double> val;
+  pos.reserve(channel_names.size());
+  val.reserve(channel_names.size());
+
+  for (size_t i = 0; i < channel_names.size(); ++i) {
+    Vec2 p2;
+    if (!montage.get(channel_names[i], &p2)) continue;
+    pos.push_back(project_to_unit_sphere(p2));
+    val.push_back(channel_values[i]);
+  }
+
+  if (pos.size() < 3) {
+    throw std::runtime_error("make_topomap_spherical_spline: need at least 3 channels with montage positions");
+  }
+
+  const SphericalSplineInterpolator interp = SphericalSplineInterpolator::fit(pos, val, opt.spline);
+
+  Grid2D grid;
+  grid.size = opt.grid_size;
+  grid.values.assign(static_cast<size_t>(grid.size) * static_cast<size_t>(grid.size),
+                     std::numeric_limits<float>::quiet_NaN());
+
+  const int N = grid.size;
+
+  for (int j = 0; j < N; ++j) {
+    // y: +1 at top, -1 at bottom
+    const double y = 1.0 - 2.0 * static_cast<double>(j) / static_cast<double>(N - 1);
+    for (int i = 0; i < N; ++i) {
+      const double x = -1.0 + 2.0 * static_cast<double>(i) / static_cast<double>(N - 1);
+
+      if (!inside_head(x, y)) {
+        continue; // leave NaN
+      }
+
+      const Vec3 q = project_to_unit_sphere(Vec2{x, y});
+      const double v = interp.evaluate(q);
+      grid.values[static_cast<size_t>(j) * static_cast<size_t>(N) + static_cast<size_t>(i)] =
+          static_cast<float>(v);
+    }
+  }
+
+  return grid;
+}
+
+Grid2D make_topomap(const Montage& montage,
+                    const std::vector<std::string>& channel_names,
+                    const std::vector<double>& channel_values,
+                    const TopomapOptions& opt) {
+  switch (opt.method) {
+    case TopomapInterpolation::IDW:
+      return make_topomap_idw(montage, channel_names, channel_values, opt);
+    case TopomapInterpolation::SPHERICAL_SPLINE:
+      return make_topomap_spherical_spline(montage, channel_names, channel_values, opt);
+    default:
+      return make_topomap_idw(montage, channel_names, channel_values, opt);
+  }
+}
+
 } // namespace qeeg
