@@ -5,6 +5,7 @@ A small, dependency-light **C++17** project that:
 - computes per‑channel **PSD via Welch's method**
 - integrates **band power** (delta/theta/alpha/beta/gamma)
 - estimates **magnitude-squared coherence** (basic connectivity)
+- performs a first-pass **EEG microstate analysis** (GFP peak clustering + template maps)
 - renders **2D topographic scalp maps (topomaps)** to **BMP** images
 - parses **EDF+/BDF+ annotations/events** (TAL) and supports basic **epoch/segment feature extraction**
 
@@ -31,6 +32,7 @@ A small, dependency-light **C++17** project that:
 - **Outputs**
   - `bandpowers.csv`
   - `topomap_<band>.bmp`
+  - Tip: add `--annotate` in `qeeg_map_cli` to draw a head outline, electrode markers, and an embedded vmin/vmax colorbar in the BMPs
   - Optional: `topomap_<band>_z.bmp` if `--reference` is provided
   - Coherence CLI outputs:
     - `coherence_matrix_<band>.csv` (matrix)
@@ -267,6 +269,7 @@ Common tweaks:
 
 Outputs:
 - `spectrogram_<channel>.bmp` — heatmap (time on x, low freq at bottom)
+- Tip: add `--colorbar` to embed a vertical vmin/vmax colorbar into the BMP
 - `spectrogram_<channel>.csv` — dB matrix (wide by default; use `--csv-long` for long format)
 - `spectrogram_<channel>_meta.txt` — parameters used (for reproducibility)
 
@@ -331,6 +334,59 @@ Example:
 ./build/qeeg_artifacts_cli --input path/to/recording.edf --outdir out_artifacts_filtered \
   --window 1.0 --step 0.5 --baseline 10 --average-reference --notch 50 --bandpass 1 45 --zero-phase
 ```
+
+### 12) Individual Alpha Frequency (IAF) / alpha peak estimation
+
+Estimate an **alpha peak frequency** (IAF) per channel from a Welch PSD.
+
+By default this CLI:
+- computes a Welch PSD per channel
+- optionally removes a simple **1/f trend** in log-frequency space (enabled by default)
+- smooths the spectrum and finds the dominant peak in an alpha search band (default **7–13 Hz**)
+- writes a per-channel table and renders an optional IAF topomap
+
+```bash
+./build/qeeg_iaf_cli --input path/to/recording.edf --outdir out_iaf \
+  --average-reference --notch 50 --bandpass 1 45 --zero-phase
+```
+
+Outputs:
+- `iaf_by_channel.csv` — per-channel IAF estimates
+- `iaf_summary.txt` — parameters + aggregate IAF
+- `topomap_iaf.bmp` — topomap of per-channel IAF (when enabled)
+
+The CLI also writes a small helper file `iaf_band_spec.txt` containing a
+simple **IAF-relative band spec** you can pass into other CLIs that accept
+`--bands` (e.g., `qeeg_nf_cli`, `qeeg_map_cli`).
+
+```bash
+# Example: compute IAF, then run NF using IAF-relative alpha band
+./build/qeeg_iaf_cli --input recording.edf --outdir out_iaf
+
+./build/qeeg_nf_cli --input recording.edf --outdir out_nf \
+  --bands "$(cat out_iaf/iaf_band_spec.txt)" --metric alpha:Pz
+```
+
+### 13) EEG microstates (first pass)
+
+Estimate EEG **microstates** by:
+- computing Global Field Power (GFP) over time
+- taking local maxima of GFP (optionally thinned by a minimum distance)
+- clustering peak topographies with k-means (polarity-invariant by default)
+- assigning every sample to the closest template and exporting basic microstate statistics
+
+```bash
+./build/qeeg_microstates_cli --input path/to/recording.edf --outdir out_ms \
+  --average-reference --notch 50 --bandpass 1 45 --zero-phase \
+  --k 4 --peak-fraction 0.10 --min-duration-ms 30
+```
+
+Outputs:
+- `microstate_templates.csv` — one row per microstate (A,B,C,...) containing the template topography values
+- `topomap_microstate_<state>.bmp` — template topomap per microstate
+- `microstate_timeseries.csv` — per-sample label + GFP + correlation to template
+- `microstate_transition_counts.csv` — segment-to-segment transition count matrix
+- `microstate_summary.txt` — parameters + Global Explained Variance (GEV) and per-state coverage/duration/occurrence
 
 ### Topomap interpolation
 

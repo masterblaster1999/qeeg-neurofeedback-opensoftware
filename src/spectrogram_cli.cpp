@@ -36,6 +36,8 @@ struct Args {
   bool export_csv{true};
   bool csv_long{false};
 
+  bool colorbar{false}; // add vmin/vmax colorbar to BMP output
+
   // Preprocess
   bool average_reference{false};
   double notch_hz{0.0};
@@ -64,6 +66,7 @@ static void print_help() {
     << "  --vmax-db DB            Fix vmax in dB (default: auto ~95th percentile)\n"
     << "  --no-csv                Do not export CSV\n"
     << "  --csv-long              Export long-format CSV (time,freq,power_db)\n"
+    << "  --colorbar              Add a vertical colorbar (vmin/vmax) to the BMP\n"
     << "  --average-reference     Apply common average reference across channels\n"
     << "  --notch HZ              Apply a notch filter at HZ (e.g., 50 or 60)\n"
     << "  --notch-q Q             Notch Q factor (default: 30)\n"
@@ -103,6 +106,8 @@ static Args parse_args(int argc, char** argv) {
       a.export_csv = false;
     } else if (arg == "--csv-long") {
       a.csv_long = true;
+    } else if (arg == "--colorbar") {
+      a.colorbar = true;
     } else if (arg == "--average-reference") {
       a.average_reference = true;
     } else if (arg == "--notch" && i + 1 < argc) {
@@ -295,7 +300,13 @@ int main(int argc, char** argv) {
     }
 
     const std::string bmp_path = args.outdir + "/spectrogram_" + safe_ch + ".bmp";
-    write_bmp24(bmp_path, width, height, pixels);
+    if (args.colorbar) {
+      // Add a vmin/vmax colorbar directly into the BMP for easier interpretation.
+      VerticalColorbarOptions opt;
+      write_bmp24_with_vertical_colorbar(bmp_path, width, height, pixels, vmin, vmax, opt);
+    } else {
+      write_bmp24(bmp_path, width, height, pixels);
+    }
     std::cout << "Wrote: " << bmp_path << "\n";
 
     if (args.export_csv) {

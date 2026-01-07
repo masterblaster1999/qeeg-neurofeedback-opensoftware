@@ -38,6 +38,9 @@ struct Args {
 
   bool export_psd{false};
 
+  // Output visualization
+  bool annotate{false}; // draw head outline/electrodes + colorbar on topomaps
+
   size_t nperseg{1024};
   double overlap{0.5};
   int grid{256};
@@ -80,6 +83,7 @@ static void print_help() {
     << "  --bandpass LO HI        Apply a simple bandpass (highpass LO then lowpass HI)\n"
     << "  --zero-phase            Offline: forward-backward filtering (less phase distortion)\n"
     << "  --export-psd            Write psd.csv (freq + PSD per channel)\n"
+    << "  --annotate              Annotate topomaps with head outline/electrodes + colorbar\n"
     << "  --demo                  Generate synthetic recording instead of reading file\n"
     << "  --seconds S             Duration for --demo (default: 10)\n"
     << "  -h, --help              Show this help\n";
@@ -133,6 +137,8 @@ static Args parse_args(int argc, char** argv) {
       a.zero_phase = true;
     } else if (arg == "--export-psd") {
       a.export_psd = true;
+    } else if (arg == "--annotate") {
+      a.annotate = true;
     } else if (arg == "--demo") {
       a.demo = true;
     } else if (arg == "--seconds" && i + 1 < argc) {
@@ -320,6 +326,15 @@ int main(int argc, char** argv) {
     // Compute bandpowers
     std::vector<std::vector<double>> bandpower_matrix(bands.size(),
                                                       std::vector<double>(rec.n_channels(), 0.0));
+    std::vector<Vec2> electrode_positions_unit;
+    if (args.annotate) {
+      electrode_positions_unit.reserve(rec.n_channels());
+      for (const auto& ch_name : rec.channel_names) {
+        Vec2 p;
+        if (montage.get(ch_name, &p)) electrode_positions_unit.push_back(p);
+      }
+    }
+
     for (size_t b = 0; b < bands.size(); ++b) {
       for (size_t c = 0; c < rec.n_channels(); ++c) {
         bandpower_matrix[b][c] = integrate_bandpower(psds[c], bands[b].fmin_hz, bands[b].fmax_hz);
@@ -386,7 +401,11 @@ int main(int argc, char** argv) {
       auto [vmin, vmax] = minmax_ignore_nan(grid.values);
 
       const std::string outpath = args.outdir + "/topomap_" + bands[b].name + ".bmp";
-      render_grid_to_bmp(outpath, grid.size, grid.values, vmin, vmax);
+      if (args.annotate) {
+        render_grid_to_bmp_annotated(outpath, grid.size, grid.values, vmin, vmax, electrode_positions_unit);
+      } else {
+        render_grid_to_bmp(outpath, grid.size, grid.values, vmin, vmax);
+      }
 
       if (have_ref) {
         std::vector<double> zvals(rec.n_channels(), std::numeric_limits<double>::quiet_NaN());
@@ -399,7 +418,13 @@ int main(int argc, char** argv) {
         Grid2D zg = make_topomap(montage, rec.channel_names, zvals, topt);
         // common visualization range
         const std::string zout = args.outdir + "/topomap_" + bands[b].name + "_z.bmp";
-        render_grid_to_bmp(zout, zg.size, zg.values, -3.0, 3.0);
+        if (args.annotate) {
+          // Common visualization range for z-maps
+          AnnotatedTopomapOptions aopt;
+          render_grid_to_bmp_annotated(zout, zg.size, zg.values, -3.0, 3.0, electrode_positions_unit, aopt);
+        } else {
+          render_grid_to_bmp(zout, zg.size, zg.values, -3.0, 3.0);
+        }
       }
     }
 

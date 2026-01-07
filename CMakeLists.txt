@@ -23,6 +23,8 @@ add_library(qeeg STATIC
   src/preprocess.cpp
   src/welch_psd.cpp
   src/bandpower.cpp
+  src/iaf.cpp
+  src/microstates.cpp
   src/coherence.cpp
   src/pac.cpp
   src/artifacts.cpp
@@ -68,6 +70,12 @@ target_link_libraries(qeeg_epoch_cli PRIVATE qeeg)
 
 add_executable(qeeg_spectrogram_cli src/spectrogram_cli.cpp)
 target_link_libraries(qeeg_spectrogram_cli PRIVATE qeeg)
+
+add_executable(qeeg_iaf_cli src/iaf_cli.cpp)
+target_link_libraries(qeeg_iaf_cli PRIVATE qeeg)
+
+add_executable(qeeg_microstates_cli src/microstates_cli.cpp)
+target_link_libraries(qeeg_microstates_cli PRIVATE qeeg)
 
 add_executable(qeeg_pac_cli src/pac_cli.cpp)
 target_link_libraries(qeeg_pac_cli PRIVATE qeeg)
@@ -120,6 +128,14 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_spectrogram tests/test_spectrogram.cpp)
   target_link_libraries(qeeg_test_spectrogram PRIVATE qeeg)
   add_test(NAME qeeg_test_spectrogram COMMAND qeeg_test_spectrogram)
+
+  add_executable(qeeg_test_iaf tests/test_iaf.cpp)
+  target_link_libraries(qeeg_test_iaf PRIVATE qeeg)
+  add_test(NAME qeeg_test_iaf COMMAND qeeg_test_iaf)
+
+  add_executable(qeeg_test_microstates tests/test_microstates.cpp)
+  target_link_libraries(qeeg_test_microstates PRIVATE qeeg)
+  add_test(NAME qeeg_test_microstates COMMAND qeeg_test_microstates)
 
   add_executable(qeeg_test_pac tests/test_pac.cpp)
   target_link_libraries(qeeg_test_pac PRIVATE qeeg)
