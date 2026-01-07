@@ -25,6 +25,8 @@ add_library(qeeg STATIC
   src/bandpower.cpp
   src/coherence.cpp
   src/pac.cpp
+  src/artifacts.cpp
+  src/online_artifacts.cpp
   src/online_bandpower.cpp
   src/online_coherence.cpp
   src/online_pac.cpp
@@ -32,6 +34,8 @@ add_library(qeeg STATIC
   src/montage.cpp
   src/topomap.cpp
   src/bmp_writer.cpp
+  src/wav_writer.cpp
+  src/osc.cpp
 )
 
 target_include_directories(qeeg PUBLIC
@@ -43,6 +47,11 @@ if (MSVC)
   target_compile_options(qeeg PRIVATE /W4)
 else()
   target_compile_options(qeeg PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Sockets (OSC) on Windows
+if (WIN32)
+  target_link_libraries(qeeg PUBLIC ws2_32)
 endif()
 
 add_executable(qeeg_map_cli src/main.cpp)
@@ -62,6 +71,12 @@ target_link_libraries(qeeg_spectrogram_cli PRIVATE qeeg)
 
 add_executable(qeeg_pac_cli src/pac_cli.cpp)
 target_link_libraries(qeeg_pac_cli PRIVATE qeeg)
+
+add_executable(qeeg_artifacts_cli src/artifacts_cli.cpp)
+target_link_libraries(qeeg_artifacts_cli PRIVATE qeeg)
+
+add_executable(qeeg_reference_cli src/reference_cli.cpp)
+target_link_libraries(qeeg_reference_cli PRIVATE qeeg)
 
 if(QEEG_BUILD_TESTS)
   enable_testing()
@@ -113,5 +128,26 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_online_pac tests/test_online_pac.cpp)
   target_link_libraries(qeeg_test_online_pac PRIVATE qeeg)
   add_test(NAME qeeg_test_online_pac COMMAND qeeg_test_online_pac)
+
+  add_executable(qeeg_test_artifacts tests/test_artifacts.cpp)
+  target_link_libraries(qeeg_test_artifacts PRIVATE qeeg)
+  add_test(NAME qeeg_test_artifacts COMMAND qeeg_test_artifacts)
+
+  add_executable(qeeg_test_online_artifacts tests/test_online_artifacts.cpp)
+  target_link_libraries(qeeg_test_online_artifacts PRIVATE qeeg)
+  add_test(NAME qeeg_test_online_artifacts COMMAND qeeg_test_online_artifacts)
+
+  add_executable(qeeg_test_wav_writer tests/test_wav_writer.cpp)
+  target_link_libraries(qeeg_test_wav_writer PRIVATE qeeg)
+  add_test(NAME qeeg_test_wav_writer COMMAND qeeg_test_wav_writer)
+
+
+  add_executable(qeeg_test_osc tests/test_osc.cpp)
+  target_link_libraries(qeeg_test_osc PRIVATE qeeg)
+  add_test(NAME qeeg_test_osc COMMAND qeeg_test_osc)
+
+  add_executable(qeeg_test_running_stats tests/test_running_stats.cpp)
+  target_link_libraries(qeeg_test_running_stats PRIVATE qeeg)
+  add_test(NAME qeeg_test_running_stats COMMAND qeeg_test_running_stats)
 
 endif()

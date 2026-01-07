@@ -97,6 +97,32 @@ Example row:
 ./build/qeeg_map_cli --input path/to/recording.edf --reference my_reference.csv --outdir out_z
 ```
 
+#### Build a reference CSV from a small dataset
+
+If you don't already have reference stats, you can build a simple reference file from
+one or more recordings using `qeeg_reference_cli`. It computes per-channel Welch PSD,
+integrates bandpower, and aggregates a **mean** and **standard deviation** per
+channel-band across files.
+
+```bash
+# Build reference from multiple files (repeat --input)
+./build/qeeg_reference_cli --input subj01.edf --input subj02.edf --input subj03.edf \
+  --outdir out_ref
+
+# Or pass a text file listing recordings (one path per line; "#" comments allowed)
+./build/qeeg_reference_cli --list recordings.txt --outdir out_ref
+```
+
+By default the output is `out_ref/reference.csv` and is compatible with
+`qeeg_map_cli --reference ...`.
+
+Optional: compute stats over `log10(power)` (often closer to a normal distribution
+than raw power):
+
+```bash
+./build/qeeg_reference_cli --list recordings.txt --outdir out_ref --log10
+```
+
 ### Optional preprocessing (CAR + filters)
 
 All CLIs support `--average-reference`. In addition:
@@ -136,6 +162,53 @@ Supported metrics:
   --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6
 ```
 
+Optional: write a simple reward-tone WAV you can play back or feed into another system:
+
+```bash
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+  --audio-wav nf_reward.wav --audio-tone 440 --audio-gain 0.2
+```
+
+Optional: stream neurofeedback state over OSC/UDP
+
+If you want to drive external software (e.g., Max/MSP, Pure Data, TouchOSC), you can stream each NF update over UDP using **Open Sound Control (OSC)**:
+
+```bash
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+  --osc-host 127.0.0.1 --osc-port 9000 --osc-prefix /qeeg --osc-mode state
+```
+
+Messages sent:
+- `${prefix}/metric_spec` (string) — once at startup
+- `${prefix}/fs` (float32) — once at startup
+- `${prefix}/state` (float32 t_end_sec, float32 metric, float32 threshold, int32 reward, float32 reward_rate, int32 have_threshold) — every update
+
+If you use `--osc-mode split`, `qeeg_nf_cli` sends multiple addresses per update:
+`${prefix}/time`, `${prefix}/metric`, `${prefix}/threshold`, `${prefix}/reward`, `${prefix}/reward_rate`, `${prefix}/have_threshold`.
+
+Note: UDP delivery is **best-effort**; packets may be dropped or reordered.
+
+Optional: artifact gating (recommended for real data)
+
+You can suppress rewards and adaptive threshold updates during gross artifacts
+(e.g., big blinks / movement) using a simple, robust time-domain detector.
+This uses sliding-window peak-to-peak, RMS and excess kurtosis outliers
+relative to the baseline period.
+
+```bash
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+  --artifact-gate --artifact-ptp-z 6 --artifact-rms-z 6 --artifact-kurtosis-z 6 \
+  --export-artifacts
+```
+
+When OSC is enabled, the CLI also emits:
+- `${prefix}/artifact_ready` (int32 0/1)
+- `${prefix}/artifact` (int32 0/1)
+- `${prefix}/artifact_bad_channels` (int32)
+
 Coherence neurofeedback example:
 
 ```bash
@@ -159,6 +232,8 @@ Outputs:
 - `nf_feedback.csv` — time series of metric, threshold and reward
 - (optional) `bandpower_timeseries.csv` — all bands/channels per update (bandpower mode)
 - (optional) `coherence_timeseries.csv` — all bands for the chosen pair per update (coherence mode)
+- (optional) `artifact_gate_timeseries.csv` — artifact gate aligned to NF updates (when `--export-artifacts`)
+- (optional) `nf_reward.wav` — a simple reward-tone audio track (mono PCM16). Use `--audio-wav nf_reward.wav`.
 
 ### 7) Connectivity: coherence matrix / pair report
 
@@ -235,6 +310,27 @@ Outputs:
 - `events.csv` — exported event list
 - `epoch_bandpowers.csv` — long-format table of (event × channel × band)
 - `epoch_bandpowers_summary.csv` — mean power per channel/band across processed epochs
+
+### 11) Artifact window detection (first pass)
+
+Flag likely artifact-contaminated windows using simple **robust** time-domain features
+(peak-to-peak amplitude, RMS, and excess kurtosis) computed on sliding windows.
+
+This produces:
+- `artifact_windows.csv` — one row per time window (including list of bad channels)
+- `artifact_channels.csv` — long-format per-window × per-channel feature table
+- `artifact_summary.txt` — parameters + summary stats
+
+Example:
+
+```bash
+./build/qeeg_artifacts_cli --input path/to/recording.edf --outdir out_artifacts \
+  --window 1.0 --step 0.5 --baseline 10 --ptp-z 6 --rms-z 6 --kurtosis-z 6
+
+# Optional light preprocessing before scoring
+./build/qeeg_artifacts_cli --input path/to/recording.edf --outdir out_artifacts_filtered \
+  --window 1.0 --step 0.5 --baseline 10 --average-reference --notch 50 --bandpass 1 45 --zero-phase
+```
 
 ### Topomap interpolation
 

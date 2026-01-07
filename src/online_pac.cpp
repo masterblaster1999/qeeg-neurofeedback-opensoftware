@@ -75,10 +75,10 @@ std::vector<OnlinePacFrame> OnlinePAC::push_block(const std::vector<float>& x) {
     ++since_last_update_;
 
     if (since_last_update_ >= update_samples_) {
-      since_last_update_ = 0;
-      if (ring_.full()) {
-        out.push_back(compute_frame());
-      }
+      // Keep remainder so update timing stays stable when chunk sizes don't
+      // divide update_samples_.
+      since_last_update_ -= update_samples_;
+      if (ring_.full()) out.push_back(compute_frame());
     }
   }
 

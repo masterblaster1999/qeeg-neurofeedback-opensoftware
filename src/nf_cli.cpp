@@ -3,9 +3,12 @@
 #include "qeeg/preprocess.hpp"
 #include "qeeg/online_bandpower.hpp"
 #include "qeeg/online_coherence.hpp"
+#include "qeeg/online_artifacts.hpp"
 #include "qeeg/online_pac.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
+#include "qeeg/wav_writer.hpp"
+#include "qeeg/osc.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -58,6 +62,30 @@ struct Args {
   bool export_bandpowers{false};   // bandpower mode only
   bool export_coherence{false};    // coherence mode only
 
+  // Optional artifact gating (time-domain robust outlier detection)
+  bool artifact_gate{false};
+  double artifact_ptp_z{6.0};
+  double artifact_rms_z{6.0};
+  double artifact_kurtosis_z{6.0};
+  int artifact_min_bad_channels{1};
+  bool export_artifacts{false};
+
+  // Optional audio feedback (writes a simple reward tone WAV)
+  // If audio_wav is a filename without any path separators, it will be written inside --outdir.
+  std::string audio_wav; // empty => disabled
+  int audio_rate{44100};
+  double audio_tone_hz{440.0};
+  double audio_gain{0.20};
+  double audio_attack_sec{0.005};
+  double audio_release_sec{0.010};
+
+  // Optional OSC/UDP output (for integrating with external apps).
+  // Enabled when --osc-port is set to a value > 0.
+  std::string osc_host{"127.0.0.1"};
+  int osc_port{0};
+  std::string osc_prefix{"/qeeg"};
+  std::string osc_mode{"state"}; // 'state' (one message) or 'split' (several)
+
   // PAC estimator params (PAC mode only)
   size_t pac_bins{18};
   double pac_trim{0.10};
@@ -98,6 +126,22 @@ static void print_help() {
     << "  --chunk S                 File playback chunk seconds (default: 0.10)\n"
     << "  --export-bandpowers        Write bandpower_timeseries.csv (bandpower/ratio modes)\n"
     << "  --export-coherence         Write coherence_timeseries.csv (coherence mode)\n"
+    << "  --artifact-gate            Suppress reward/adaptation during detected artifacts\n"
+    << "  --artifact-ptp-z Z         Artifact threshold: peak-to-peak robust z (<=0 disables; default: 6)\n"
+    << "  --artifact-rms-z Z         Artifact threshold: RMS robust z (<=0 disables; default: 6)\n"
+    << "  --artifact-kurtosis-z Z    Artifact threshold: excess kurtosis robust z (<=0 disables; default: 6)\n"
+    << "  --artifact-min-bad-ch N    Artifact frame is bad if >=N channels flagged (default: 1)\n"
+    << "  --export-artifacts         Write artifact_gate_timeseries.csv aligned to NF updates\n"
+    << "  --audio-wav PATH           Optional: write a reward-tone WAV (mono PCM16)\n"
+    << "  --audio-rate HZ            Audio sample rate (default: 44100)\n"
+    << "  --audio-tone HZ            Reward tone frequency (default: 440)\n"
+    << "  --audio-gain G             Reward tone gain in [0,1] (default: 0.2)\n"
+    << "  --audio-attack S           Tone attack seconds (default: 0.005)\n"
+    << "  --audio-release S          Tone release seconds (default: 0.010)\n"
+    << "  --osc-host HOST            Optional: OSC/UDP destination host (default: 127.0.0.1)\n"
+    << "  --osc-port PORT            Optional: OSC/UDP destination port (0 disables; e.g. 9000)\n"
+    << "  --osc-prefix PATH          OSC address prefix (default: /qeeg)\n"
+    << "  --osc-mode MODE            OSC mode: state|split (default: state)\n"
     << "  --pac-bins N              PAC: #phase bins for MI (default: 18)\n"
     << "  --pac-trim FRAC           PAC: edge trim fraction per window (default: 0.10)\n"
     << "  --pac-zero-phase          PAC: use zero-phase bandpass filters (default: off)\n"
@@ -156,6 +200,38 @@ static Args parse_args(int argc, char** argv) {
       a.export_bandpowers = true;
     } else if (arg == "--export-coherence") {
       a.export_coherence = true;
+    } else if (arg == "--artifact-gate") {
+      a.artifact_gate = true;
+    } else if (arg == "--artifact-ptp-z" && i + 1 < argc) {
+      a.artifact_ptp_z = to_double(argv[++i]);
+    } else if (arg == "--artifact-rms-z" && i + 1 < argc) {
+      a.artifact_rms_z = to_double(argv[++i]);
+    } else if (arg == "--artifact-kurtosis-z" && i + 1 < argc) {
+      a.artifact_kurtosis_z = to_double(argv[++i]);
+    } else if (arg == "--artifact-min-bad-ch" && i + 1 < argc) {
+      a.artifact_min_bad_channels = to_int(argv[++i]);
+    } else if (arg == "--export-artifacts") {
+      a.export_artifacts = true;
+    } else if (arg == "--audio-wav" && i + 1 < argc) {
+      a.audio_wav = argv[++i];
+    } else if (arg == "--audio-rate" && i + 1 < argc) {
+      a.audio_rate = to_int(argv[++i]);
+    } else if (arg == "--audio-tone" && i + 1 < argc) {
+      a.audio_tone_hz = to_double(argv[++i]);
+    } else if (arg == "--audio-gain" && i + 1 < argc) {
+      a.audio_gain = to_double(argv[++i]);
+    } else if (arg == "--audio-attack" && i + 1 < argc) {
+      a.audio_attack_sec = to_double(argv[++i]);
+    } else if (arg == "--audio-release" && i + 1 < argc) {
+      a.audio_release_sec = to_double(argv[++i]);
+    } else if (arg == "--osc-host" && i + 1 < argc) {
+      a.osc_host = argv[++i];
+    } else if (arg == "--osc-port" && i + 1 < argc) {
+      a.osc_port = to_int(argv[++i]);
+    } else if (arg == "--osc-prefix" && i + 1 < argc) {
+      a.osc_prefix = argv[++i];
+    } else if (arg == "--osc-mode" && i + 1 < argc) {
+      a.osc_mode = argv[++i];
     } else if (arg == "--pac-bins" && i + 1 < argc) {
       a.pac_bins = static_cast<size_t>(to_int(argv[++i]));
     } else if (arg == "--pac-trim" && i + 1 < argc) {
@@ -171,6 +247,213 @@ static Args parse_args(int argc, char** argv) {
     }
   }
   return a;
+}
+
+static std::string resolve_out_path(const std::string& outdir, const std::string& path_or_name) {
+  if (path_or_name.empty()) return path_or_name;
+  // If it looks like a filename (no path separators), write inside outdir.
+  if (path_or_name.find('/') == std::string::npos && path_or_name.find('\\') == std::string::npos) {
+    return outdir + "/" + path_or_name;
+  }
+  return path_or_name;
+}
+
+static void write_reward_tone_wav_if_requested(const Args& args,
+                                              const std::vector<int>& reward_flags) {
+  if (args.audio_wav.empty()) return;
+  if (args.audio_rate <= 0) throw std::runtime_error("--audio-rate must be > 0");
+  if (args.audio_tone_hz <= 0.0) throw std::runtime_error("--audio-tone must be > 0");
+  if (args.audio_gain < 0.0) throw std::runtime_error("--audio-gain must be >= 0");
+  if (args.audio_attack_sec < 0.0) throw std::runtime_error("--audio-attack must be >= 0");
+  if (args.audio_release_sec < 0.0) throw std::runtime_error("--audio-release must be >= 0");
+
+  const std::string outpath = resolve_out_path(args.outdir, args.audio_wav);
+
+  // One audio segment per NF update.
+  const int sr = args.audio_rate;
+  const size_t seg = std::max<size_t>(1, static_cast<size_t>(std::llround(args.update_seconds * sr)));
+
+  const size_t attack = static_cast<size_t>(std::llround(args.audio_attack_sec * sr));
+  const size_t release = static_cast<size_t>(std::llround(args.audio_release_sec * sr));
+
+  std::vector<float> mono;
+  mono.reserve(reward_flags.size() * seg);
+
+  const double two_pi = 2.0 * std::acos(-1.0);
+  const double phase_inc = two_pi * args.audio_tone_hz / static_cast<double>(sr);
+  double phase = 0.0;
+
+  // Generate contiguous runs of reward=1 as continuous tones with a simple attack/release envelope.
+  for (size_t i = 0; i < reward_flags.size(); ) {
+    if (reward_flags[i] == 0) {
+      mono.insert(mono.end(), seg, 0.0f);
+      ++i;
+      // Reset phase so re-started beeps are phase-aligned (also avoids large phase accumulation).
+      phase = 0.0;
+      continue;
+    }
+
+    size_t j = i;
+    while (j < reward_flags.size() && reward_flags[j] != 0) ++j;
+    const size_t run_frames = j - i;
+    const size_t run_samples = run_frames * seg;
+
+    for (size_t k = 0; k < run_samples; ++k) {
+      // Piecewise-linear envelope at the run boundaries.
+      double env = 1.0;
+      if (attack > 0 && k < attack) {
+        env = static_cast<double>(k) / static_cast<double>(attack);
+      }
+      if (release > 0 && k + release > run_samples) {
+        const size_t kr = run_samples - k;
+        const double e2 = static_cast<double>(kr) / static_cast<double>(release);
+        if (e2 < env) env = e2;
+      }
+      if (env < 0.0) env = 0.0;
+      if (env > 1.0) env = 1.0;
+
+      const float s = static_cast<float>(std::sin(phase) * (args.audio_gain * env));
+      mono.push_back(s);
+      phase += phase_inc;
+      if (phase > two_pi) phase -= two_pi;
+    }
+
+    i = j;
+  }
+
+  write_wav_mono_pcm16(outpath, sr, mono);
+  std::cout << "Wrote audio reward tone: " << outpath << "\n";
+}
+
+
+static std::string normalize_osc_prefix(std::string p) {
+  p = trim(p);
+  if (p.empty()) p = "/qeeg";
+  if (!p.empty() && p[0] != '/') p = "/" + p;
+  // Remove trailing slashes (but keep "/" if user explicitly wants it).
+  while (p.size() > 1 && p.back() == '/') p.pop_back();
+  return p;
+}
+
+static void osc_send_info(OscUdpClient* osc, const std::string& prefix, const Args& args, double fs_hz) {
+  if (!osc) return;
+  try {
+    OscMessage m1(prefix + "/metric_spec");
+    m1.add_string(args.metric_spec);
+    osc->send(m1);
+
+    OscMessage m2(prefix + "/fs");
+    m2.add_float32(static_cast<float>(fs_hz));
+    osc->send(m2);
+  } catch (...) {
+    // best-effort
+  }
+}
+
+static void osc_send_state(OscUdpClient* osc,
+                           const std::string& prefix,
+                           const std::string& mode,
+                           double t_end_sec,
+                           double metric,
+                           double threshold,
+                           int reward,
+                           double reward_rate,
+                           int have_threshold) {
+  if (!osc) return;
+  try {
+    if (mode == "split") {
+      OscMessage mt(prefix + "/time");
+      mt.add_float32(static_cast<float>(t_end_sec));
+      osc->send(mt);
+
+      OscMessage mm(prefix + "/metric");
+      mm.add_float32(static_cast<float>(metric));
+      osc->send(mm);
+
+      OscMessage mth(prefix + "/threshold");
+      mth.add_float32(static_cast<float>(threshold));
+      osc->send(mth);
+
+      OscMessage mr(prefix + "/reward");
+      mr.add_int32(reward);
+      osc->send(mr);
+
+      OscMessage mrr(prefix + "/reward_rate");
+      mrr.add_float32(static_cast<float>(reward_rate));
+      osc->send(mrr);
+
+      OscMessage mht(prefix + "/have_threshold");
+      mht.add_int32(have_threshold);
+      osc->send(mht);
+
+      return;
+    }
+
+    // Default: one state message per update.
+    OscMessage msg(prefix + "/state");
+    msg.add_float32(static_cast<float>(t_end_sec));
+    msg.add_float32(static_cast<float>(metric));
+    msg.add_float32(static_cast<float>(threshold));
+    msg.add_int32(reward);
+    msg.add_float32(static_cast<float>(reward_rate));
+    msg.add_int32(have_threshold);
+    osc->send(msg);
+  } catch (...) {
+    // best-effort
+  }
+}
+
+static void osc_send_artifact(OscUdpClient* osc,
+                              const std::string& prefix,
+                              const OnlineArtifactFrame& fr) {
+  if (!osc) return;
+  try {
+    OscMessage mr(prefix + "/artifact_ready");
+    mr.add_int32(fr.baseline_ready ? 1 : 0);
+    osc->send(mr);
+
+    OscMessage ma(prefix + "/artifact");
+    ma.add_int32((fr.baseline_ready && fr.bad) ? 1 : 0);
+    osc->send(ma);
+
+    OscMessage mb(prefix + "/artifact_bad_channels");
+    mb.add_int32(static_cast<int>(fr.bad_channel_count));
+    osc->send(mb);
+  } catch (...) {
+    // best-effort
+  }
+}
+
+static OnlineArtifactFrame take_artifact_frame(std::deque<OnlineArtifactFrame>* q,
+                                               double t_end_sec,
+                                               double eps_sec) {
+  OnlineArtifactFrame none;
+  none.t_end_sec = t_end_sec;
+  none.baseline_ready = false;
+  none.bad = false;
+  none.bad_channel_count = 0;
+  if (!q) return none;
+
+  while (!q->empty() && q->front().t_end_sec < t_end_sec - eps_sec) {
+    q->pop_front();
+  }
+  if (q->empty()) return none;
+
+  // If the next artifact frame matches closely, consume it.
+  if (std::fabs(q->front().t_end_sec - t_end_sec) <= eps_sec) {
+    OnlineArtifactFrame out = q->front();
+    q->pop_front();
+    return out;
+  }
+
+  // If artifact frame is slightly behind, consume it; otherwise leave it.
+  if (q->front().t_end_sec <= t_end_sec + eps_sec) {
+    OnlineArtifactFrame out = q->front();
+    q->pop_front();
+    return out;
+  }
+
+  return none;
 }
 
 static EEGRecording make_demo_recording(const Montage& montage, double fs_hz, double seconds) {
@@ -432,6 +715,9 @@ int main(int argc, char** argv) {
     if (args.adapt_eta < 0.0) {
       throw std::runtime_error("--eta must be >= 0");
     }
+    if (args.artifact_min_bad_channels < 1) {
+      throw std::runtime_error("--artifact-min-bad-ch must be >= 1");
+    }
 
     ensure_directory(args.outdir);
 
@@ -448,6 +734,32 @@ int main(int argc, char** argv) {
 
     std::cout << "Loaded recording: " << rec.n_channels() << " channels, "
               << rec.n_samples() << " samples, fs=" << rec.fs_hz << " Hz\n";
+
+
+    // Optional OSC output for integration with external tools (UDP is best-effort / unreliable).
+    std::unique_ptr<OscUdpClient> osc_client;
+    OscUdpClient* osc = nullptr;
+    std::string osc_prefix;
+    std::string osc_mode = to_lower(args.osc_mode);
+
+    if (args.osc_port != 0) {
+      if (args.osc_port < 0 || args.osc_port > 65535) {
+        throw std::runtime_error("--osc-port must be 0 (disable) or in [1, 65535]");
+      }
+      if (osc_mode != "state" && osc_mode != "split") {
+        throw std::runtime_error("--osc-mode must be 'state' or 'split'");
+      }
+      osc_prefix = normalize_osc_prefix(args.osc_prefix);
+      osc_client = std::make_unique<OscUdpClient>(args.osc_host, args.osc_port);
+      if (!osc_client->ok()) {
+        std::cerr << "OSC disabled: " << osc_client->last_error() << "\n";
+      } else {
+        osc = osc_client.get();
+        std::cout << "OSC/UDP output enabled: " << args.osc_host << ":" << args.osc_port
+                  << " prefix=" << osc_prefix << " mode=" << osc_mode << "\n";
+        osc_send_info(osc, osc_prefix, args, rec.fs_hz);
+      }
+    }
 
     PreprocessOptions popt;
     popt.average_reference = args.average_reference;
@@ -481,7 +793,12 @@ int main(int argc, char** argv) {
     std::ofstream out(args.outdir + "/nf_feedback.csv");
     if (!out) throw std::runtime_error("Failed to write nf_feedback.csv");
 
+    const bool do_artifacts = args.artifact_gate || args.export_artifacts;
+
     out << "t_end_sec,metric,threshold,reward,reward_rate";
+    if (do_artifacts) {
+      out << ",artifact_ready,artifact,bad_channels";
+    }
     if (metric.type == MetricSpec::Type::Band) {
       out << ",band,channel";
     } else if (metric.type == MetricSpec::Type::Ratio) {
@@ -513,6 +830,36 @@ int main(int argc, char** argv) {
       for (int v : reward_hist) sum += v;
       return static_cast<double>(sum) / static_cast<double>(reward_hist.size());
     };
+
+    // Optional audio export: one 0/1 flag per emitted NF update (including baseline frames).
+    std::vector<int> audio_reward_flags;
+    audio_reward_flags.reserve(1024);
+
+    // Optional artifact engine (aligned to NF updates).
+    std::unique_ptr<OnlineArtifactGate> artifact_gate;
+    OnlineArtifactGate* art = nullptr;
+    std::deque<OnlineArtifactFrame> art_queue;
+    std::ofstream out_art;
+
+    if (args.artifact_gate || args.export_artifacts) {
+      OnlineArtifactOptions aopt;
+      aopt.window_seconds = args.window_seconds;
+      aopt.update_seconds = args.update_seconds;
+      aopt.baseline_seconds = args.baseline_seconds;
+      aopt.ptp_z = args.artifact_ptp_z;
+      aopt.rms_z = args.artifact_rms_z;
+      aopt.kurtosis_z = args.artifact_kurtosis_z;
+      aopt.min_bad_channels = static_cast<size_t>(args.artifact_min_bad_channels);
+      artifact_gate = std::make_unique<OnlineArtifactGate>(rec.channel_names, rec.fs_hz, aopt);
+      art = artifact_gate.get();
+      if (args.export_artifacts) {
+        out_art.open(args.outdir + "/artifact_gate_timeseries.csv");
+        if (!out_art) throw std::runtime_error("Failed to write artifact_gate_timeseries.csv");
+        out_art << "t_end_sec,artifact_ready,artifact,bad_channels,max_ptp_z,max_rms_z,max_kurtosis_z\n";
+      }
+      std::cout << "Artifact engine enabled (gate=" << (args.artifact_gate ? "on" : "off")
+                << ", export=" << (args.export_artifacts ? "on" : "off") << ")\n";
+    }
 
     const size_t chunk_samples = std::max<size_t>(1, sec_to_samples(args.chunk_seconds, rec.fs_hz));
     std::vector<std::vector<float>> block(rec.n_channels());
@@ -558,6 +905,20 @@ int main(int argc, char** argv) {
 
         pre.process_block(&block);
 
+        if (art) {
+          const auto aframes = art->push_block(block);
+          for (const auto& af : aframes) {
+            art_queue.push_back(af);
+            if (args.export_artifacts) {
+              out_art << af.t_end_sec << "," << (af.baseline_ready ? 1 : 0)
+                      << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                      << "," << af.bad_channel_count
+                      << "," << af.max_ptp_z << "," << af.max_rms_z
+                      << "," << af.max_kurtosis_z << "\n";
+            }
+          }
+        }
+
         const auto frames = eng.push_block(block);
         for (const auto& fr : frames) {
           if (b_idx < 0) {
@@ -574,8 +935,17 @@ int main(int argc, char** argv) {
             out_coh << "\n";
           }
 
+          const OnlineArtifactFrame af = take_artifact_frame(art ? &art_queue : nullptr,
+                                                            fr.t_end_sec,
+                                                            0.5 / rec.fs_hz);
+          const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
+
           const double val = fr.coherences[static_cast<size_t>(b_idx)][0];
-          if (!std::isfinite(val)) continue;
+          if (!std::isfinite(val)) {
+            if (art) osc_send_artifact(osc, osc_prefix, af);
+            audio_reward_flags.push_back(0);
+            continue;
+          }
 
           if (!have_threshold) {
             if (fr.t_end_sec <= args.baseline_seconds) {
@@ -587,10 +957,34 @@ int main(int argc, char** argv) {
               std::cout << "Initial threshold set to: " << threshold
                         << " (baseline=" << args.baseline_seconds << "s, n=" << baseline_values.size() << ")\n";
             }
+            const double thr_send = have_threshold ? threshold : 0.0;
+            osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,
+                          have_threshold ? 1 : 0);
+            if (art) osc_send_artifact(osc, osc_prefix, af);
+            audio_reward_flags.push_back(0);
+            continue;
+          }
+
+          if (artifact_hit) {
+            const double rr = reward_rate();
+            osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                          0, rr, 1);
+            if (art) osc_send_artifact(osc, osc_prefix, af);
+            audio_reward_flags.push_back(0);
+
+            out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
+            if (do_artifacts) {
+              out << "," << (af.baseline_ready ? 1 : 0)
+                  << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                  << "," << af.bad_channel_count;
+            }
+            out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
+            out << "\n";
             continue;
           }
 
           const bool reward = (val > threshold);
+          audio_reward_flags.push_back(reward ? 1 : 0);
           reward_hist.push_back(reward ? 1 : 0);
           while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
           const double rr = reward_rate();
@@ -599,12 +993,22 @@ int main(int argc, char** argv) {
             threshold *= std::exp(args.adapt_eta * (rr - args.target_reward_rate));
           }
 
+          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                        (reward ? 1 : 0), rr, 1);
+          if (art) osc_send_artifact(osc, osc_prefix, af);
+
           out << fr.t_end_sec << "," << val << "," << threshold << "," << (reward ? 1 : 0) << "," << rr;
+          if (do_artifacts) {
+            out << "," << (af.baseline_ready ? 1 : 0)
+                << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                << "," << af.bad_channel_count;
+          }
           out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
           out << "\n";
         }
       }
 
+      write_reward_tone_wav_if_requested(args, audio_reward_flags);
       std::cout << "Done. Outputs written to: " << args.outdir << "\n";
       return 0;
     }
@@ -635,10 +1039,33 @@ int main(int argc, char** argv) {
 
         pre.process_block(&block);
 
+        if (art) {
+          const auto aframes = art->push_block(block);
+          for (const auto& af : aframes) {
+            art_queue.push_back(af);
+            if (args.export_artifacts) {
+              out_art << af.t_end_sec << "," << (af.baseline_ready ? 1 : 0)
+                      << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                      << "," << af.bad_channel_count
+                      << "," << af.max_ptp_z << "," << af.max_rms_z
+                      << "," << af.max_kurtosis_z << "\n";
+            }
+          }
+        }
+
         const auto frames = eng.push_block(block[static_cast<size_t>(ic)]);
         for (const auto& fr : frames) {
+          const OnlineArtifactFrame af = take_artifact_frame(art ? &art_queue : nullptr,
+                                                            fr.t_end_sec,
+                                                            0.5 / rec.fs_hz);
+          const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
+
           const double val = fr.value;
-          if (!std::isfinite(val)) continue;
+          if (!std::isfinite(val)) {
+            if (art) osc_send_artifact(osc, osc_prefix, af);
+            audio_reward_flags.push_back(0);
+            continue;
+          }
 
           if (!have_threshold) {
             if (fr.t_end_sec <= args.baseline_seconds) {
@@ -650,10 +1077,35 @@ int main(int argc, char** argv) {
               std::cout << "Initial threshold set to: " << threshold
                         << " (baseline=" << args.baseline_seconds << "s, n=" << baseline_values.size() << ")\n";
             }
+            const double thr_send = have_threshold ? threshold : 0.0;
+            osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,
+                          have_threshold ? 1 : 0);
+            if (art) osc_send_artifact(osc, osc_prefix, af);
+            audio_reward_flags.push_back(0);
+            continue;
+          }
+
+          if (artifact_hit) {
+            const double rr = reward_rate();
+            osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                          0, rr, 1);
+            if (art) osc_send_artifact(osc, osc_prefix, af);
+            audio_reward_flags.push_back(0);
+
+            out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
+            if (do_artifacts) {
+              out << "," << (af.baseline_ready ? 1 : 0)
+                  << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                  << "," << af.bad_channel_count;
+            }
+            out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel;
+            out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
+            out << "\n";
             continue;
           }
 
           const bool reward = (val > threshold);
+          audio_reward_flags.push_back(reward ? 1 : 0);
           reward_hist.push_back(reward ? 1 : 0);
           while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
           const double rr = reward_rate();
@@ -662,13 +1114,23 @@ int main(int argc, char** argv) {
             threshold *= std::exp(args.adapt_eta * (rr - args.target_reward_rate));
           }
 
+          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                        (reward ? 1 : 0), rr, 1);
+          if (art) osc_send_artifact(osc, osc_prefix, af);
+
           out << fr.t_end_sec << "," << val << "," << threshold << "," << (reward ? 1 : 0) << "," << rr;
+          if (do_artifacts) {
+            out << "," << (af.baseline_ready ? 1 : 0)
+                << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                << "," << af.bad_channel_count;
+          }
           out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel;
           out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
           out << "\n";
         }
       }
 
+      write_reward_tone_wav_if_requested(args, audio_reward_flags);
       std::cout << "Done. Outputs written to: " << args.outdir << "\n";
       return 0;
     }
@@ -711,6 +1173,20 @@ int main(int argc, char** argv) {
 
       pre.process_block(&block);
 
+      if (art) {
+        const auto aframes = art->push_block(block);
+        for (const auto& af : aframes) {
+          art_queue.push_back(af);
+          if (args.export_artifacts) {
+            out_art << af.t_end_sec << "," << (af.baseline_ready ? 1 : 0)
+                    << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                    << "," << af.bad_channel_count
+                    << "," << af.max_ptp_z << "," << af.max_rms_z
+                    << "," << af.max_kurtosis_z << "\n";
+          }
+        }
+      }
+
       const auto frames = eng.push_block(block);
       for (const auto& fr : frames) {
         if (ch_idx < 0) {
@@ -727,8 +1203,17 @@ int main(int argc, char** argv) {
           }
         }
 
+        const OnlineArtifactFrame af = take_artifact_frame(art ? &art_queue : nullptr,
+                                                          fr.t_end_sec,
+                                                          0.5 / rec.fs_hz);
+        const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
+
         const double val = compute_metric_band_or_ratio(fr, metric, ch_idx, b_idx, b_num, b_den);
-        if (!std::isfinite(val)) continue;
+        if (!std::isfinite(val)) {
+          if (art) osc_send_artifact(osc, osc_prefix, af);
+          audio_reward_flags.push_back(0);
+          continue;
+        }
 
         if (!have_threshold) {
           if (fr.t_end_sec <= args.baseline_seconds) {
@@ -740,10 +1225,38 @@ int main(int argc, char** argv) {
             std::cout << "Initial threshold set to: " << threshold
                       << " (baseline=" << args.baseline_seconds << "s, n=" << baseline_values.size() << ")\n";
           }
+          const double thr_send = have_threshold ? threshold : 0.0;
+          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,
+                        have_threshold ? 1 : 0);
+          if (art) osc_send_artifact(osc, osc_prefix, af);
+          audio_reward_flags.push_back(0);
+          continue;
+        }
+
+        if (artifact_hit) {
+          const double rr = reward_rate();
+          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                        0, rr, 1);
+          if (art) osc_send_artifact(osc, osc_prefix, af);
+          audio_reward_flags.push_back(0);
+
+          out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
+          if (do_artifacts) {
+            out << "," << (af.baseline_ready ? 1 : 0)
+                << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                << "," << af.bad_channel_count;
+          }
+          if (metric.type == MetricSpec::Type::Band) {
+            out << "," << metric.band << "," << metric.channel;
+          } else {
+            out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
+          }
+          out << "\n";
           continue;
         }
 
         const bool reward = (val > threshold);
+        audio_reward_flags.push_back(reward ? 1 : 0);
         reward_hist.push_back(reward ? 1 : 0);
         while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
         const double rr = reward_rate();
@@ -752,7 +1265,16 @@ int main(int argc, char** argv) {
           threshold *= std::exp(args.adapt_eta * (rr - args.target_reward_rate));
         }
 
+        osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                      (reward ? 1 : 0), rr, 1);
+        if (art) osc_send_artifact(osc, osc_prefix, af);
+
         out << fr.t_end_sec << "," << val << "," << threshold << "," << (reward ? 1 : 0) << "," << rr;
+        if (do_artifacts) {
+          out << "," << (af.baseline_ready ? 1 : 0)
+              << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+              << "," << af.bad_channel_count;
+        }
         if (metric.type == MetricSpec::Type::Band) {
           out << "," << metric.band << "," << metric.channel;
         } else {
@@ -772,6 +1294,7 @@ int main(int argc, char** argv) {
       }
     }
 
+    write_reward_tone_wav_if_requested(args, audio_reward_flags);
     std::cout << "Done. Outputs written to: " << args.outdir << "\n";
     return 0;
   } catch (const std::exception& e) {

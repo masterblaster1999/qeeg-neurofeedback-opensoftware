@@ -107,7 +107,9 @@ std::vector<OnlineCoherenceFrame> OnlineWelchCoherence::push_block(const std::ve
     ++since_last_update_;
 
     if (since_last_update_ >= update_samples_) {
-      since_last_update_ = 0;
+      // Keep remainder so update timing stays stable when chunk sizes don't
+      // divide update_samples_.
+      since_last_update_ -= update_samples_;
       // Only emit once the window is full for all channels.
       bool ready = true;
       for (const auto& r : rings_) {
