@@ -78,7 +78,7 @@ static void print_help() {
     << "  --update S               Update seconds (default: 0.25)\n\n"
     << "I/O:\n"
     << "  --input PATH             Input EDF/BDF/CSV\n"
-    << "  --fs HZ                  Sampling rate for CSV (required for CSV)\n"
+    << "  --fs HZ                  Sampling rate for CSV (optional if first column is time)\n"
     << "  --outdir DIR             Output directory (default: out_pac)\n"
     << "  --channel NAME           Channel name (case-insensitive); default: first\n\n"
     << "Optional preprocessing:\n"

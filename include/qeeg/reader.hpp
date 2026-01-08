@@ -15,7 +15,7 @@ public:
 // Read a file based on extension:
 // - .edf/.EDF => EDFReader (16-bit EDF/EDF+)
 // - .bdf/.BDF => BDFReader (24-bit BDF/BDF+)
-// - .csv => CSVReader (requires fs_hz_for_csv > 0)
+// - .csv => CSVReader (fs_hz_for_csv can be omitted if the first column is a time axis)
 //
 // If the input is EDF+/BDF+ and contains an "Annotations" signal, the readers
 // will also fill EEGRecording::events with parsed TAL entries.

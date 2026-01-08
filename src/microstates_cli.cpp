@@ -67,7 +67,7 @@ static void print_help() {
     << "  qeeg_microstates_cli --input file.csv --fs 250 --outdir out_ms\n\n"
     << "Options:\n"
     << "  --input PATH            Input EDF/BDF/CSV\n"
-    << "  --fs HZ                 Sampling rate for CSV (required for CSV)\n"
+    << "  --fs HZ                 Sampling rate for CSV (optional if first column is time)\n"
     << "  --outdir DIR            Output directory (default: out)\n"
     << "  --montage SPEC          builtin:standard_1020_19 (default) or PATH to montage CSV\n"
     << "  --start S               Start time in seconds (default: 0)\n"

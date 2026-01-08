@@ -18,6 +18,7 @@ add_library(qeeg STATIC
   src/bdf_reader.cpp
   src/csv_reader.cpp
   src/fft.cpp
+  src/signal.cpp
   src/spectrogram.cpp
   src/biquad.cpp
   src/preprocess.cpp
@@ -27,6 +28,7 @@ add_library(qeeg STATIC
   src/microstates.cpp
   src/coherence.cpp
   src/pac.cpp
+  src/plv.cpp
   src/artifacts.cpp
   src/online_artifacts.cpp
   src/online_bandpower.cpp
@@ -96,6 +98,13 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_bdf_reader tests/test_bdf_reader.cpp)
   target_link_libraries(qeeg_test_bdf_reader PRIVATE qeeg)
   add_test(NAME qeeg_test_bdf_reader COMMAND qeeg_test_bdf_reader)
+  add_executable(qeeg_test_csv_reader tests/test_csv_reader.cpp)
+  target_link_libraries(qeeg_test_csv_reader PRIVATE qeeg)
+  add_test(NAME qeeg_test_csv_reader COMMAND qeeg_test_csv_reader)
+
+  add_executable(qeeg_test_plv tests/test_plv.cpp)
+  target_link_libraries(qeeg_test_plv PRIVATE qeeg)
+  add_test(NAME qeeg_test_plv COMMAND qeeg_test_plv)
 
   add_executable(qeeg_test_online_bandpower tests/test_online_bandpower.cpp)
   target_link_libraries(qeeg_test_online_bandpower PRIVATE qeeg)

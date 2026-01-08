@@ -47,7 +47,7 @@ static void print_help() {
     << "  qeeg_artifacts_cli --input file.csv --fs 250 --outdir out_art --baseline 10\n\n"
     << "Options:\n"
     << "  --input PATH            Input EDF/BDF/CSV (CSV requires --fs)\n"
-    << "  --fs HZ                 Sampling rate for CSV (required for CSV)\n"
+    << "  --fs HZ                 Sampling rate for CSV (optional if first column is time)\n"
     << "  --outdir DIR            Output directory (default: out_artifacts)\n"
     << "  --window SEC            Sliding window length (default: 1.0)\n"
     << "  --step SEC              Step between window starts (default: 0.5)\n"

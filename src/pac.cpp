@@ -2,6 +2,7 @@
 
 #include "qeeg/biquad.hpp"
 #include "qeeg/fft.hpp"
+#include "qeeg/signal.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -24,63 +25,8 @@ static void validate_band(const BandDefinition& b, double fs_hz, const std::stri
   }
 }
 
-static std::vector<float> bandpass_filter(const std::vector<float>& x,
-                                          double fs_hz,
-                                          double lo_hz,
-                                          double hi_hz,
-                                          bool zero_phase) {
-  std::vector<float> y = x;
-
-  std::vector<BiquadCoeffs> stages;
-  stages.reserve(2);
-  if (lo_hz > 0.0) stages.push_back(design_highpass(fs_hz, lo_hz, kButterworthQ));
-  if (hi_hz > 0.0) stages.push_back(design_lowpass(fs_hz, hi_hz, kButterworthQ));
-  if (stages.empty()) return y;
-
-  if (zero_phase) {
-    filtfilt_inplace(&y, stages);
-  } else {
-    BiquadChain chain(stages);
-    chain.process_inplace(&y);
-  }
-  return y;
-}
-
-static std::vector<std::complex<double>> analytic_signal_fft(const std::vector<float>& x) {
-  const size_t n = x.size();
-  if (n == 0) return {};
-
-  // Use zero-padding to a power of 2 to leverage the radix-2 FFT.
-  const size_t nfft = next_power_of_two(n);
-  std::vector<std::complex<double>> a(nfft);
-  for (size_t i = 0; i < n; ++i) a[i] = std::complex<double>(static_cast<double>(x[i]), 0.0);
-  for (size_t i = n; i < nfft; ++i) a[i] = std::complex<double>(0.0, 0.0);
-
-  fft_inplace(a, false);
-
-  // Create analytic signal by:
-  // - keeping DC and Nyquist
-  // - doubling positive frequencies
-  // - zeroing negative frequencies
-  // (for even-length FFT).
-  if (nfft > 1) {
-    const size_t half = nfft / 2;
-    for (size_t k = 1; k < half; ++k) a[k] *= 2.0;
-    for (size_t k = half + 1; k < nfft; ++k) a[k] = 0.0;
-  }
-
-  fft_inplace(a, true);
-  a.resize(n);
-  return a;
-}
-
-static size_t edge_trim_samples(size_t n, double frac) {
-  if (n == 0) return 0;
-  if (frac <= 0.0) return 0;
-  if (frac >= 0.49) frac = 0.49;
-  const size_t k = static_cast<size_t>(std::llround(frac * static_cast<double>(n)));
-  return std::min(k, (n > 1 ? (n - 1) / 2 : size_t{0}));
-}
+// Note: shared implementations for bandpass filtering / analytic signal /
+// edge trimming live in qeeg/signal.*.
 
 static PacResult compute_pac_mi(const std::vector<double>& phase,
                                const std::vector<double>& amp,

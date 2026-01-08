@@ -16,7 +16,7 @@ A small, dependency-light **C++17** project that:
 - **Readers**
   - `EDFReader`: EDF/EDF+ (16-bit) parser (EDF+ annotations are parsed into `EEGRecording::events`)
   - `BDFReader`: BDF/BDF+ (24-bit) parser (BDF+ annotations are parsed into `EEGRecording::events`)
-  - `CSVReader`: simple numeric CSV reader (fs provided via `--fs`)
+  - `CSVReader`: simple numeric CSV reader (fs provided via `--fs` or inferred from a time column)
 
 - **Signal processing**
   - Welch PSD (Hann window, overlap, mean detrend)
@@ -72,8 +72,9 @@ cmake --build build --config Release
 ### 3) Run on CSV
 
 CSV format:
-- first row: channel names
+- first row: channel names (or: `time,<ch1>,<ch2>,...`)
 - each following row: one sample per column
+- if the first column is `time`/`time_ms` (seconds or milliseconds), `--fs` can be omitted
 
 ```bash
 ./build/qeeg_map_cli --input examples/sample_data_sine.csv --fs 250 --outdir out_csv

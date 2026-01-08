@@ -72,7 +72,7 @@ static void print_help() {
     << "  qeeg_iaf_cli --input file.csv --fs 250 --outdir out_iaf\n\n"
     << "Options:\n"
     << "  --input PATH              Input EDF/BDF/CSV\n"
-    << "  --fs HZ                   Sampling rate for CSV (required for CSV)\n"
+    << "  --fs HZ                   Sampling rate for CSV (optional if first column is time)\n"
     << "  --outdir DIR              Output directory (default: out_iaf)\n"
     << "  --channels LIST           Comma-separated channel list used for aggregate IAF (default: all)\n"
     << "  --occipital               Use a default occipital/parietal set for aggregate (O1,O2,Oz,Pz,P3,P4)\n"

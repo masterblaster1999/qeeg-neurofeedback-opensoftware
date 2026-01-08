@@ -51,7 +51,7 @@ static void print_help() {
     << "  qeeg_coherence_cli --input file.csv --fs 250 --outdir out --band 8-12\n\n"
     << "Options:\n"
     << "  --input PATH            Input EDF/BDF/CSV (CSV requires --fs)\n"
-    << "  --fs HZ                 Sampling rate for CSV (required for CSV)\n"
+    << "  --fs HZ                 Sampling rate for CSV (optional if first column is time)\n"
     << "  --outdir DIR            Output directory (default: out_coherence)\n"
     << "  --bands SPEC            Band spec, e.g. 'alpha:8-12,beta:13-30' (default: built-in EEG bands)\n"
     << "  --band NAME|FMIN-FMAX    Which band to report (default: alpha)\n"

@@ -104,7 +104,7 @@ static void print_help() {
     << "  qeeg_nf_cli --demo --fs 250 --seconds 60 --outdir out_demo_nf\n\n"
     << "Options:\n"
     << "  --input PATH              Input EDF/BDF/CSV (CSV requires --fs)\n"
-    << "  --fs HZ                   Sampling rate for CSV (required for CSV); also used for --demo\n"
+    << "  --fs HZ                   Sampling rate for CSV (optional if first column is time); also used for --demo\n"
     << "  --outdir DIR              Output directory (default: out_nf)\n"
     << "  --bands SPEC              Band spec, e.g. 'delta:0.5-4,theta:4-7,alpha:8-12'\n"
     << "  --metric SPEC             Metric: 'alpha:Pz' (bandpower), 'alpha/beta:Pz' (ratio),\n"

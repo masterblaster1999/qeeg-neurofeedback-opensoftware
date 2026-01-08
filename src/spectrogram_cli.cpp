@@ -55,7 +55,7 @@ static void print_help() {
     << "  qeeg_spectrogram_cli --input file.csv --fs 250 --channel Cz --outdir out\n\n"
     << "Options:\n"
     << "  --input PATH            Input EDF/BDF/CSV\n"
-    << "  --fs HZ                 Sampling rate for CSV (required for CSV)\n"
+    << "  --fs HZ                 Sampling rate for CSV (optional if first column is time)\n"
     << "  --outdir DIR            Output directory (default: out)\n"
     << "  --channel NAME          Channel name (case-insensitive); default: first\n"
     << "  --window S              Window length in seconds (default: 2.0)\n"
