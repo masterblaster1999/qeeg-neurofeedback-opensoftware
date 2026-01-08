@@ -162,7 +162,9 @@ static std::vector<AnnotationEvent> load_events_csv(const std::string& path) {
   size_t lineno = 0;
   while (std::getline(f, line)) {
     ++lineno;
-    std::string t = trim(line);
+    std::string raw = line;
+    if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+    std::string t = trim(raw);
     if (t.empty()) continue;
     if (starts_with(t, "#")) continue;
 
@@ -172,11 +174,16 @@ static std::vector<AnnotationEvent> load_events_csv(const std::string& path) {
       continue;
     }
 
-    // Basic CSV parsing: onset,duration,text (text may contain commas; we join the remainder).
-    std::vector<std::string> cols = split(t, ',');
+    // CSV parsing: onset,duration,text
+    // - quoted fields are supported (e.g., text may contain commas)
+    // - for robustness, if unquoted commas exist in text and produce >3 columns,
+    //   we join the remainder back into the text field.
+    std::vector<std::string> cols = split_csv_row(raw, ',');
     if (cols.size() < 2) {
       throw std::runtime_error("Events CSV parse error at line " + std::to_string(lineno) + ": expected onset,duration[,text]");
     }
+    for (auto& c : cols) c = trim(c);
+
     const double onset = to_double(cols[0]);
     const double dur = to_double(cols[1]);
     std::string text;

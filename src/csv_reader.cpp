@@ -13,12 +13,34 @@ namespace qeeg {
 
 namespace {
 
+size_t count_delim_outside_quotes(const std::string& s, char delim) {
+  bool in_quotes = false;
+  size_t n = 0;
+
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '"') {
+      if (in_quotes && (i + 1) < s.size() && s[i + 1] == '"') {
+        // Escaped quote
+        ++i;
+        continue;
+      }
+      in_quotes = !in_quotes;
+      continue;
+    }
+    if (!in_quotes && c == delim) ++n;
+  }
+  return n;
+}
+
 char detect_delim(const std::string& header_line) {
   // Heuristic delimiter detection. Comma is the default, but many datasets are
   // exported with ';' or tab delimiters depending on locale/software.
-  const size_t n_comma = static_cast<size_t>(std::count(header_line.begin(), header_line.end(), ','));
-  const size_t n_semi  = static_cast<size_t>(std::count(header_line.begin(), header_line.end(), ';'));
-  const size_t n_tab   = static_cast<size_t>(std::count(header_line.begin(), header_line.end(), '\t'));
+  // Count delimiters outside quoted fields to avoid being confused by channel
+  // names that contain commas (e.g. "Ch,1,2").
+  const size_t n_comma = count_delim_outside_quotes(header_line, ',');
+  const size_t n_semi  = count_delim_outside_quotes(header_line, ';');
+  const size_t n_tab   = count_delim_outside_quotes(header_line, '\t');
 
   char best = ',';
   size_t best_n = n_comma;
@@ -62,7 +84,7 @@ EEGRecording CSVReader::read(const std::string& path) {
     ++lineno;
     std::string t = trim(header);
     if (is_comment_or_empty(t)) continue;
-    header = t;
+    header = strip_utf8_bom(t);
     break;
   }
   if (trim(header).empty()) {
@@ -71,7 +93,7 @@ EEGRecording CSVReader::read(const std::string& path) {
 
   const char delim = detect_delim(header);
 
-  auto cols = split(trim(header), delim);
+  auto cols = split_csv_row(trim(header), delim);
   if (cols.size() < 2) throw std::runtime_error("CSV: need at least 2 columns");
   for (auto& c : cols) c = trim(c);
 
@@ -104,10 +126,12 @@ EEGRecording CSVReader::read(const std::string& path) {
   std::string line;
   while (std::getline(f, line)) {
     ++lineno;
-    std::string t = trim(line);
+    std::string raw = line;
+    if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+    std::string t = trim(raw);
     if (is_comment_or_empty(t)) continue;
 
-    auto vals = split(t, delim);
+    auto vals = split_csv_row(raw, delim);
     if (vals.size() != cols.size()) {
       throw std::runtime_error("CSV: column count mismatch at line " + std::to_string(lineno) +
                                " (expected " + std::to_string(cols.size()) + ", got " +

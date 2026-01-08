@@ -4,7 +4,7 @@ A small, dependency-light **C++17** project that:
 - loads EEG recordings from **EDF** (16‑bit EDF/EDF+), **BDF** (24‑bit) or **CSV**
 - computes per‑channel **PSD via Welch's method**
 - integrates **band power** (delta/theta/alpha/beta/gamma)
-- estimates **magnitude-squared coherence** (basic connectivity)
+- estimates **magnitude-squared coherence** and **phase locking value (PLV)** (basic connectivity)
 - performs a first-pass **EEG microstate analysis** (GFP peak clustering + template maps)
 - renders **2D topographic scalp maps (topomaps)** to **BMP** images
 - parses **EDF+/BDF+ annotations/events** (TAL) and supports basic **epoch/segment feature extraction**
@@ -37,6 +37,9 @@ A small, dependency-light **C++17** project that:
   - Coherence CLI outputs:
     - `coherence_matrix_<band>.csv` (matrix)
     - `coherence_pairs.csv` (edge list)
+  - PLV CLI outputs:
+    - `plv_matrix_<band>.csv` (matrix)
+    - `plv_pairs.csv` (edge list)
 
 ## Build
 
@@ -75,6 +78,8 @@ CSV format:
 - first row: channel names (or: `time,<ch1>,<ch2>,...`)
 - each following row: one sample per column
 - if the first column is `time`/`time_ms` (seconds or milliseconds), `--fs` can be omitted
+- commas inside quoted fields are supported (e.g., `time_ms;"Ch,1,2";"Ch,3,4"`)
+- comma/semicolon/tab delimiters are auto-detected from the header row
 
 ```bash
 ./build/qeeg_map_cli --input examples/sample_data_sine.csv --fs 250 --outdir out_csv
@@ -84,6 +89,10 @@ CSV format:
 
 Montage CSV format: `name,x,y` where `x,y` are within the unit circle.
 
+Notes:
+- comma/semicolon/tab delimiters are auto-detected
+- quoted fields are supported (e.g. `"Ch,1";0.1;0.2`)
+
 ```bash
 ./build/qeeg_map_cli --input path/to/recording.edf --montage examples/sample_montage_1020_19.csv --outdir out_custom
 ```
@@ -92,6 +101,11 @@ Montage CSV format: `name,x,y` where `x,y` are within the unit circle.
 
 Reference CSV format (one row per channel-band):
 `channel,band,mean,std`
+
+Notes:
+- comma/semicolon/tab delimiters are supported
+- quoted fields are supported
+- UTF-8 BOM at the start of the file is tolerated
 
 Example row:
 `Fz,alpha,3.21,0.84`
@@ -250,6 +264,20 @@ Compute **one pair** (and optionally export the full spectrum):
 
 ```bash
 ./build/qeeg_coherence_cli --input path/to/recording.edf --outdir out_pair --band alpha --pair F3:F4 --export-spectrum
+```
+
+### 7b) Connectivity: phase locking value (PLV)
+
+Compute a **PLV** matrix (phase-based connectivity) for all channel pairs:
+
+```bash
+./build/qeeg_plv_cli --input path/to/recording.edf --outdir out_plv --band alpha
+```
+
+Compute **one pair**:
+
+```bash
+./build/qeeg_plv_cli --input path/to/recording.edf --outdir out_plv_pair --band alpha --pair F3:F4
 ```
 
 ### 8) Time-frequency: STFT spectrogram (BMP + CSV)

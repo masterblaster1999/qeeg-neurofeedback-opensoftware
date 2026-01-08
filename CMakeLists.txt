@@ -67,6 +67,9 @@ target_link_libraries(qeeg_nf_cli PRIVATE qeeg)
 add_executable(qeeg_coherence_cli src/coherence_cli.cpp)
 target_link_libraries(qeeg_coherence_cli PRIVATE qeeg)
 
+add_executable(qeeg_plv_cli src/plv_cli.cpp)
+target_link_libraries(qeeg_plv_cli PRIVATE qeeg)
+
 add_executable(qeeg_epoch_cli src/epoch_cli.cpp)
 target_link_libraries(qeeg_epoch_cli PRIVATE qeeg)
 
@@ -174,5 +177,13 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_running_stats tests/test_running_stats.cpp)
   target_link_libraries(qeeg_test_running_stats PRIVATE qeeg)
   add_test(NAME qeeg_test_running_stats COMMAND qeeg_test_running_stats)
+
+  add_executable(qeeg_test_reference_csv tests/test_reference_csv.cpp)
+  target_link_libraries(qeeg_test_reference_csv PRIVATE qeeg)
+  add_test(NAME qeeg_test_reference_csv COMMAND qeeg_test_reference_csv)
+
+  add_executable(qeeg_test_montage_csv tests/test_montage_csv.cpp)
+  target_link_libraries(qeeg_test_montage_csv PRIVATE qeeg)
+  add_test(NAME qeeg_test_montage_csv COMMAND qeeg_test_montage_csv)
 
 endif()
