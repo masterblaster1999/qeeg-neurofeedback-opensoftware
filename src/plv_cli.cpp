@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -30,6 +31,12 @@ struct Args {
   // Otherwise format: CH1:CH2 (several delimiters accepted).
   std::string pair_spec;
 
+  // Which phase-based measure to compute.
+  //   plv  : Phase Locking Value
+  //   pli  : Phase Lag Index
+  //   wpli : Weighted Phase Lag Index
+  std::string measure{"plv"};
+
   // PLV estimator options
   bool plv_zero_phase{true};
   double trim{0.10};
@@ -45,7 +52,7 @@ struct Args {
 
 static void print_help() {
   std::cout
-      << "qeeg_plv_cli (phase connectivity; Phase Locking Value / PLV)\n\n"
+      << "qeeg_plv_cli (phase connectivity; PLV / PLI / wPLI)\n\n"
       << "Usage:\n"
       << "  qeeg_plv_cli --input file.edf --outdir out --band alpha\n"
       << "  qeeg_plv_cli --input file.edf --outdir out --band alpha --pair F3:F4\n"
@@ -56,6 +63,7 @@ static void print_help() {
       << "  --outdir DIR             Output directory (default: out_plv)\n"
       << "  --bands SPEC             Band spec, e.g. 'alpha:8-12,beta:13-30' (default: built-in EEG bands)\n"
       << "  --band NAME|FMIN-FMAX     Which band to report (default: alpha)\n"
+      << "  --measure plv|pli|wpli    Which measure to compute (default: plv)\n"
       << "  --pair CH1:CH2           If set, compute only this pair (otherwise output a full matrix)\n"
       << "  --trim FRAC              Edge trim fraction per channel window in [0,0.49] (default: 0.10)\n"
       << "  --plv-zero-phase         Use zero-phase filtering for the PLV internal bandpass (default)\n"
@@ -86,6 +94,8 @@ static Args parse_args(int argc, char** argv) {
       a.band_spec = argv[++i];
     } else if (arg == "--band" && i + 1 < argc) {
       a.band_name = argv[++i];
+    } else if (arg == "--measure" && i + 1 < argc) {
+      a.measure = argv[++i];
     } else if (arg == "--pair" && i + 1 < argc) {
       a.pair_spec = argv[++i];
     } else if (arg == "--trim" && i + 1 < argc) {
@@ -110,6 +120,14 @@ static Args parse_args(int argc, char** argv) {
     }
   }
   return a;
+}
+
+static std::string normalize_measure(const std::string& m) {
+  const std::string key = to_lower(trim(m));
+  if (key == "plv") return "plv";
+  if (key == "pli") return "pli";
+  if (key == "wpli" || key == "w-pli" || key == "w_pli") return "wpli";
+  throw std::runtime_error("Unknown --measure: '" + m + "' (expected: plv|pli|wpli)");
 }
 
 static int find_channel_index(const std::vector<std::string>& channels, const std::string& name) {
@@ -178,6 +196,8 @@ int main(int argc, char** argv) {
 
     ensure_directory(args.outdir);
 
+    const std::string measure = normalize_measure(args.measure);
+
     EEGRecording rec = read_recording_auto(args.input_path, args.fs_csv);
     if (rec.n_channels() < 2) throw std::runtime_error("Recording must have at least 2 channels");
     if (rec.fs_hz <= 0.0) throw std::runtime_error("Invalid sampling rate");
@@ -220,7 +240,8 @@ int main(int argc, char** argv) {
     std::cout << "Loaded recording: " << rec.n_channels() << " channels, " << rec.n_samples() << " samples, fs="
               << rec.fs_hz << " Hz\n";
     std::cout << "Band: " << band.name << " (" << band.fmin_hz << "-" << band.fmax_hz << " Hz)\n";
-    std::cout << "PLV internal filtering: " << (opt.zero_phase ? "zero-phase" : "causal")
+    std::cout << "Measure: " << measure << "\n";
+    std::cout << "Internal filtering: " << (opt.zero_phase ? "zero-phase" : "causal")
               << ", trim=" << opt.edge_trim_fraction << "\n";
 
     if (!args.pair_spec.empty()) {
@@ -231,18 +252,35 @@ int main(int argc, char** argv) {
       if (ib < 0) throw std::runtime_error("Channel not found: " + pr_names.second);
       if (ia == ib) throw std::runtime_error("--pair channels must be different");
 
-      const double v = compute_plv(rec.data[static_cast<size_t>(ia)],
-                                  rec.data[static_cast<size_t>(ib)],
-                                  rec.fs_hz,
-                                  band,
-                                  opt);
-      std::cout << "PLV(" << pr_names.first << "," << pr_names.second << ") = " << v << "\n";
+      double v = std::numeric_limits<double>::quiet_NaN();
+      if (measure == "plv") {
+        v = compute_plv(rec.data[static_cast<size_t>(ia)],
+                        rec.data[static_cast<size_t>(ib)],
+                        rec.fs_hz,
+                        band,
+                        opt);
+      } else if (measure == "pli") {
+        v = compute_pli(rec.data[static_cast<size_t>(ia)],
+                        rec.data[static_cast<size_t>(ib)],
+                        rec.fs_hz,
+                        band,
+                        opt);
+      } else if (measure == "wpli") {
+        v = compute_wpli(rec.data[static_cast<size_t>(ia)],
+                         rec.data[static_cast<size_t>(ib)],
+                         rec.fs_hz,
+                         band,
+                         opt);
+      }
+
+      std::cout << measure << "(" << pr_names.first << "," << pr_names.second << ") = " << v << "\n";
 
       // Always write a summary.
       {
-        std::ofstream f(args.outdir + "/plv_band.csv");
-        if (!f) throw std::runtime_error("Failed to write plv_band.csv");
-        f << "band,channel_a,channel_b,plv\n";
+        const std::string fname = args.outdir + "/" + measure + "_band.csv";
+        std::ofstream f(fname);
+        if (!f) throw std::runtime_error("Failed to write " + fname);
+        f << "band,channel_a,channel_b," << measure << "\n";
         f << band.name << "," << pr_names.first << "," << pr_names.second << "," << v << "\n";
       }
 
@@ -251,7 +289,14 @@ int main(int argc, char** argv) {
     }
 
     // Matrix mode.
-    const auto mat0 = compute_plv_matrix(rec.data, rec.fs_hz, band, opt);
+    std::vector<std::vector<double>> mat0;
+    if (measure == "plv") {
+      mat0 = compute_plv_matrix(rec.data, rec.fs_hz, band, opt);
+    } else if (measure == "pli") {
+      mat0 = compute_pli_matrix(rec.data, rec.fs_hz, band, opt);
+    } else if (measure == "wpli") {
+      mat0 = compute_wpli_matrix(rec.data, rec.fs_hz, band, opt);
+    }
     const size_t C = rec.n_channels();
     if (mat0.size() != C) throw std::runtime_error("PLV: unexpected matrix size");
 
@@ -261,12 +306,13 @@ int main(int argc, char** argv) {
       for (size_t j = 0; j < C; ++j) {
         if (!std::isfinite(mat[i][j])) mat[i][j] = 0.0;
       }
-      mat[i][i] = 1.0;
+      // Convention: PLV diagonal = 1; PLI/wPLI diagonal = 0.
+      mat[i][i] = (measure == "plv") ? 1.0 : 0.0;
     }
 
     // Write matrix.
     {
-      const std::string fname = args.outdir + "/plv_matrix_" + to_lower(band.name) + ".csv";
+      const std::string fname = args.outdir + "/" + measure + "_matrix_" + to_lower(band.name) + ".csv";
       std::ofstream f(fname);
       if (!f) throw std::runtime_error("Failed to write " + fname);
 
@@ -285,9 +331,10 @@ int main(int argc, char** argv) {
 
     // Also write a flat edge list (useful for graph tooling).
     {
-      std::ofstream f(args.outdir + "/plv_pairs.csv");
-      if (!f) throw std::runtime_error("Failed to write plv_pairs.csv");
-      f << "channel_a,channel_b,plv\n";
+      const std::string fname = args.outdir + "/" + measure + "_pairs.csv";
+      std::ofstream f(fname);
+      if (!f) throw std::runtime_error("Failed to write " + fname);
+      f << "channel_a,channel_b," << measure << "\n";
       for (size_t i = 0; i < C; ++i) {
         for (size_t j = i + 1; j < C; ++j) {
           f << rec.channel_names[i] << "," << rec.channel_names[j] << "," << mat[i][j] << "\n";

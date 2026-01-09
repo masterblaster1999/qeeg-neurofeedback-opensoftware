@@ -1,5 +1,7 @@
 #include "qeeg/online_artifacts.hpp"
 
+#include "qeeg/robust_stats.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -13,52 +15,6 @@ static size_t sec_to_samples(double sec, double fs_hz) {
   if (fs_hz <= 0.0) return 0;
   if (sec <= 0.0) return 0;
   return static_cast<size_t>(std::llround(sec * fs_hz));
-}
-
-double median_inplace(std::vector<double>* v) {
-  if (!v || v->empty()) return 0.0;
-  const size_t n = v->size();
-  const size_t mid = n / 2;
-  std::nth_element(v->begin(), v->begin() + static_cast<std::ptrdiff_t>(mid), v->end());
-  double med = (*v)[mid];
-  if (n % 2 == 0) {
-    auto max_it = std::max_element(v->begin(), v->begin() + static_cast<std::ptrdiff_t>(mid));
-    med = 0.5 * (med + *max_it);
-  }
-  return med;
-}
-
-double mean_of(const std::vector<double>& v) {
-  if (v.empty()) return 0.0;
-  double sum = 0.0;
-  for (double x : v) sum += x;
-  return sum / static_cast<double>(v.size());
-}
-
-double std_of(const std::vector<double>& v, double mean) {
-  if (v.size() < 2) return 0.0;
-  double acc = 0.0;
-  for (double x : v) {
-    const double d = x - mean;
-    acc += d * d;
-  }
-  const double var = acc / static_cast<double>(v.size() - 1);
-  return std::sqrt(std::max(0.0, var));
-}
-
-double robust_scale(const std::vector<double>& values, double med) {
-  if (values.empty()) return 1.0;
-  std::vector<double> absdev;
-  absdev.reserve(values.size());
-  for (double x : values) absdev.push_back(std::fabs(x - med));
-  const double mad = median_inplace(&absdev);
-  double scale = mad * 1.4826; // consistent with std for Gaussian data
-  if (!(scale > 1e-12)) {
-    const double mu = mean_of(values);
-    scale = std_of(values, mu);
-  }
-  if (!(scale > 1e-12)) scale = 1.0;
-  return scale;
 }
 
 } // namespace

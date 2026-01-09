@@ -29,6 +29,7 @@ add_library(qeeg STATIC
   src/coherence.cpp
   src/pac.cpp
   src/plv.cpp
+  src/nf_metric.cpp
   src/artifacts.cpp
   src/online_artifacts.cpp
   src/online_bandpower.cpp
@@ -109,6 +110,10 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_plv PRIVATE qeeg)
   add_test(NAME qeeg_test_plv COMMAND qeeg_test_plv)
 
+  add_executable(qeeg_test_wpli tests/test_wpli.cpp)
+  target_link_libraries(qeeg_test_wpli PRIVATE qeeg)
+  add_test(NAME qeeg_test_wpli COMMAND qeeg_test_wpli)
+
   add_executable(qeeg_test_online_bandpower tests/test_online_bandpower.cpp)
   target_link_libraries(qeeg_test_online_bandpower PRIVATE qeeg)
   add_test(NAME qeeg_test_online_bandpower COMMAND qeeg_test_online_bandpower)
@@ -120,6 +125,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_coherence tests/test_coherence.cpp)
   target_link_libraries(qeeg_test_coherence PRIVATE qeeg)
   add_test(NAME qeeg_test_coherence COMMAND qeeg_test_coherence)
+
+  add_executable(qeeg_test_imag_coherence tests/test_imag_coherence.cpp)
+  target_link_libraries(qeeg_test_imag_coherence PRIVATE qeeg)
+  add_test(NAME qeeg_test_imag_coherence COMMAND qeeg_test_imag_coherence)
 
   add_executable(qeeg_test_online_coherence tests/test_online_coherence.cpp)
   target_link_libraries(qeeg_test_online_coherence PRIVATE qeeg)
@@ -148,6 +157,11 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_microstates tests/test_microstates.cpp)
   target_link_libraries(qeeg_test_microstates PRIVATE qeeg)
   add_test(NAME qeeg_test_microstates COMMAND qeeg_test_microstates)
+
+  add_executable(qeeg_test_microstate_segments tests/test_microstate_segments.cpp)
+  target_link_libraries(qeeg_test_microstate_segments PRIVATE qeeg)
+  add_test(NAME qeeg_test_microstate_segments COMMAND qeeg_test_microstate_segments)
+
 
   add_executable(qeeg_test_pac tests/test_pac.cpp)
   target_link_libraries(qeeg_test_pac PRIVATE qeeg)
@@ -178,12 +192,36 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_running_stats PRIVATE qeeg)
   add_test(NAME qeeg_test_running_stats COMMAND qeeg_test_running_stats)
 
+  add_executable(qeeg_test_robust_stats tests/test_robust_stats.cpp)
+  target_link_libraries(qeeg_test_robust_stats PRIVATE qeeg)
+  add_test(NAME qeeg_test_robust_stats COMMAND qeeg_test_robust_stats)
+
   add_executable(qeeg_test_reference_csv tests/test_reference_csv.cpp)
   target_link_libraries(qeeg_test_reference_csv PRIVATE qeeg)
   add_test(NAME qeeg_test_reference_csv COMMAND qeeg_test_reference_csv)
 
+  add_executable(qeeg_test_relative_bandpower tests/test_relative_bandpower.cpp)
+  target_link_libraries(qeeg_test_relative_bandpower PRIVATE qeeg)
+  add_test(NAME qeeg_test_relative_bandpower COMMAND qeeg_test_relative_bandpower)
+
   add_executable(qeeg_test_montage_csv tests/test_montage_csv.cpp)
   target_link_libraries(qeeg_test_montage_csv PRIVATE qeeg)
   add_test(NAME qeeg_test_montage_csv COMMAND qeeg_test_montage_csv)
+
+  add_executable(qeeg_test_montage_aliases tests/test_montage_aliases.cpp)
+  target_link_libraries(qeeg_test_montage_aliases PRIVATE qeeg)
+  add_test(NAME qeeg_test_montage_aliases COMMAND qeeg_test_montage_aliases)
+
+  add_executable(qeeg_test_nf_metric_spec tests/test_nf_metric_spec.cpp)
+  target_link_libraries(qeeg_test_nf_metric_spec PRIVATE qeeg)
+  add_test(NAME qeeg_test_nf_metric_spec COMMAND qeeg_test_nf_metric_spec)
+
+  add_executable(qeeg_test_band_spec_file tests/test_band_spec_file.cpp)
+  target_link_libraries(qeeg_test_band_spec_file PRIVATE qeeg)
+  add_test(NAME qeeg_test_band_spec_file COMMAND qeeg_test_band_spec_file)
+
+  add_executable(qeeg_test_baseline_norm tests/test_baseline_norm.cpp)
+  target_link_libraries(qeeg_test_baseline_norm PRIVATE qeeg)
+  add_test(NAME qeeg_test_baseline_norm COMMAND qeeg_test_baseline_norm)
 
 endif()

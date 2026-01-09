@@ -1,6 +1,7 @@
 #include "qeeg/coherence.hpp"
 
 #include "qeeg/fft.hpp"
+#include "qeeg/utils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -26,15 +27,23 @@ static double mean_of_segment(const std::vector<float>& x, size_t start, size_t 
   return s / static_cast<double>(n);
 }
 
-CoherenceResult welch_coherence(const std::vector<float>& x,
-                               const std::vector<float>& y,
-                               double fs_hz,
-                               const WelchOptions& opt) {
-  if (fs_hz <= 0.0) throw std::runtime_error("welch_coherence: fs_hz must be > 0");
-  if (x.empty() || y.empty()) throw std::runtime_error("welch_coherence: input signal is empty");
-  if (x.size() != y.size()) throw std::runtime_error("welch_coherence: x and y must have same length");
+struct WelchCrossSpectra {
+  size_t nfft{0};
+  double fs_hz{0.0};
+  std::vector<double> pxx;
+  std::vector<double> pyy;
+  std::vector<std::complex<double>> pxy;
+};
+
+static WelchCrossSpectra welch_cross_spectra(const std::vector<float>& x,
+                                            const std::vector<float>& y,
+                                            double fs_hz,
+                                            const WelchOptions& opt) {
+  if (fs_hz <= 0.0) throw std::runtime_error("welch_cross_spectra: fs_hz must be > 0");
+  if (x.empty() || y.empty()) throw std::runtime_error("welch_cross_spectra: input signal is empty");
+  if (x.size() != y.size()) throw std::runtime_error("welch_cross_spectra: x and y must have same length");
   if (opt.overlap_fraction < 0.0 || opt.overlap_fraction >= 1.0) {
-    throw std::runtime_error("welch_coherence: overlap_fraction must be in [0,1)");
+    throw std::runtime_error("welch_cross_spectra: overlap_fraction must be in [0,1)");
   }
 
   size_t nperseg = opt.nperseg;
@@ -50,7 +59,7 @@ CoherenceResult welch_coherence(const std::vector<float>& x,
   std::vector<double> window = hann_window(nperseg);
   double U = 0.0;
   for (double wi : window) U += wi * wi;
-  if (U <= 0.0) throw std::runtime_error("welch_coherence: invalid window normalization");
+  if (U <= 0.0) throw std::runtime_error("welch_cross_spectra: invalid window normalization");
 
   std::vector<double> pxx_acc(nfreq, 0.0);
   std::vector<double> pyy_acc(nfreq, 0.0);
@@ -101,7 +110,7 @@ CoherenceResult welch_coherence(const std::vector<float>& x,
   }
 
   if (nsegments == 0) {
-    throw std::runtime_error("welch_coherence: not enough samples for one segment");
+    throw std::runtime_error("welch_cross_spectra: not enough samples for one segment");
   }
 
   for (size_t k = 0; k < nfreq; ++k) {
@@ -110,47 +119,34 @@ CoherenceResult welch_coherence(const std::vector<float>& x,
     pxy_acc[k] /= static_cast<double>(nsegments);
   }
 
-  CoherenceResult out;
-  out.freqs_hz.resize(nfreq);
-  out.coherence.resize(nfreq);
-
-  const double eps = 1e-24;
-  for (size_t k = 0; k < nfreq; ++k) {
-    out.freqs_hz[k] = static_cast<double>(k) * fs_hz / static_cast<double>(nfft);
-
-    const double denom = std::max(eps, pxx_acc[k] * pyy_acc[k]);
-    const double num = std::norm(pxy_acc[k]);
-    double c = num / denom;
-
-    // Numerical guard rails.
-    if (!std::isfinite(c)) c = 0.0;
-    if (c < 0.0) c = 0.0;
-    if (c > 1.0) c = 1.0;
-
-    out.coherence[k] = c;
-  }
-
+  WelchCrossSpectra out;
+  out.nfft = nfft;
+  out.fs_hz = fs_hz;
+  out.pxx = std::move(pxx_acc);
+  out.pyy = std::move(pyy_acc);
+  out.pxy = std::move(pxy_acc);
   return out;
 }
 
-double average_band_coherence(const CoherenceResult& coh,
-                             double fmin_hz,
-                             double fmax_hz) {
-  if (coh.freqs_hz.size() != coh.coherence.size() || coh.freqs_hz.size() < 2) {
-    throw std::runtime_error("average_band_coherence: invalid spectrum input");
+static double average_band_generic(const std::vector<double>& freqs_hz,
+                                  const std::vector<double>& values,
+                                  double fmin_hz,
+                                  double fmax_hz) {
+  if (freqs_hz.size() != values.size() || freqs_hz.size() < 2) {
+    throw std::runtime_error("average_band_generic: invalid spectrum input");
   }
   if (!(fmax_hz > fmin_hz)) {
-    throw std::runtime_error("average_band_coherence: fmax must be > fmin");
+    throw std::runtime_error("average_band_generic: fmax must be > fmin");
   }
 
   double area = 0.0;
   double covered = 0.0;
 
-  for (size_t i = 0; i + 1 < coh.freqs_hz.size(); ++i) {
-    const double f0 = coh.freqs_hz[i];
-    const double f1 = coh.freqs_hz[i + 1];
-    const double c0 = coh.coherence[i];
-    const double c1 = coh.coherence[i + 1];
+  for (size_t i = 0; i + 1 < freqs_hz.size(); ++i) {
+    const double f0 = freqs_hz[i];
+    const double f1 = freqs_hz[i + 1];
+    const double v0 = values[i];
+    const double v1 = values[i + 1];
 
     const double a = std::max(f0, fmin_hz);
     const double b = std::min(f1, fmax_hz);
@@ -162,10 +158,10 @@ double average_band_coherence(const CoherenceResult& coh,
       return y0 + t * (y1 - y0);
     };
 
-    const double ca = lerp(f0, c0, f1, c1, a);
-    const double cb = lerp(f0, c0, f1, c1, b);
+    const double va = lerp(f0, v0, f1, v1, a);
+    const double vb = lerp(f0, v0, f1, v1, b);
 
-    area += 0.5 * (ca + cb) * (b - a);
+    area += 0.5 * (va + vb) * (b - a);
     covered += (b - a);
   }
 
@@ -173,8 +169,88 @@ double average_band_coherence(const CoherenceResult& coh,
     return std::numeric_limits<double>::quiet_NaN();
   }
 
-  // Return the mean coherence across the band.
+  // Return the mean value across the band.
   return area / covered;
+}
+
+CoherenceSpectrum welch_coherence_spectrum(const std::vector<float>& x,
+                                          const std::vector<float>& y,
+                                          double fs_hz,
+                                          const WelchOptions& opt,
+                                          CoherenceMeasure measure) {
+  const WelchCrossSpectra cs = welch_cross_spectra(x, y, fs_hz, opt);
+  const size_t nfreq = cs.pxx.size();
+
+  CoherenceSpectrum out;
+  out.freqs_hz.resize(nfreq);
+  out.values.resize(nfreq);
+  out.measure = measure;
+
+  const double eps = 1e-24;
+  for (size_t k = 0; k < nfreq; ++k) {
+    out.freqs_hz[k] = static_cast<double>(k) * fs_hz / static_cast<double>(cs.nfft);
+
+    double v = 0.0;
+
+    if (measure == CoherenceMeasure::ImaginaryCoherencyAbs) {
+      const double denom = std::sqrt(std::max(eps, cs.pxx[k] * cs.pyy[k]));
+      const std::complex<double> cohy = cs.pxy[k] / denom;
+      v = std::fabs(std::imag(cohy));
+
+      // Numerical guard rails. |Im(cohy)| should be <= 1, but guard against drift.
+      if (!std::isfinite(v)) v = 0.0;
+      if (v < 0.0) v = 0.0;
+      if (v > 1.0) v = 1.0;
+    } else {
+      // Magnitude-squared coherence.
+      const double denom = std::max(eps, cs.pxx[k] * cs.pyy[k]);
+      const double num = std::norm(cs.pxy[k]);
+      v = num / denom;
+
+      // Numerical guard rails.
+      if (!std::isfinite(v)) v = 0.0;
+      if (v < 0.0) v = 0.0;
+      if (v > 1.0) v = 1.0;
+    }
+
+    out.values[k] = v;
+  }
+
+  return out;
+}
+
+CoherenceResult welch_coherence(const std::vector<float>& x,
+                               const std::vector<float>& y,
+                               double fs_hz,
+                               const WelchOptions& opt) {
+  const CoherenceSpectrum spec = welch_coherence_spectrum(x, y, fs_hz, opt, CoherenceMeasure::MagnitudeSquared);
+  CoherenceResult out;
+  out.freqs_hz = spec.freqs_hz;
+  out.coherence = spec.values;
+  return out;
+}
+
+double average_band_coherence(const CoherenceResult& coh,
+                             double fmin_hz,
+                             double fmax_hz) {
+  return average_band_generic(coh.freqs_hz, coh.coherence, fmin_hz, fmax_hz);
+}
+
+double average_band_value(const CoherenceSpectrum& spec,
+                          double fmin_hz,
+                          double fmax_hz) {
+  return average_band_generic(spec.freqs_hz, spec.values, fmin_hz, fmax_hz);
+}
+
+CoherenceMeasure parse_coherence_measure_token(const std::string& token) {
+  const std::string t = to_lower(trim(token));
+  if (t.empty() || t == "msc" || t == "coh" || t == "coherence") {
+    return CoherenceMeasure::MagnitudeSquared;
+  }
+  if (t == "imcoh" || t == "absimag" || t == "imag" || t == "imagcoh") {
+    return CoherenceMeasure::ImaginaryCoherencyAbs;
+  }
+  throw std::runtime_error("Unknown coherence measure: '" + token + "'. Use msc|imcoh");
 }
 
 } // namespace qeeg

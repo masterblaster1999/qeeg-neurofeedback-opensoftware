@@ -19,11 +19,18 @@ struct OnlineCoherenceOptions {
 
   // Welch parameters used for per-frame coherence estimation.
   WelchOptions welch;
+
+  // Which coherence-like measure to compute.
+  // Default matches historical behavior: magnitude-squared coherence.
+  CoherenceMeasure measure{CoherenceMeasure::MagnitudeSquared};
 };
 
 struct OnlineCoherenceFrame {
   // Time (seconds) at the end of the analysis window (relative to start of stream).
   double t_end_sec{0.0};
+
+  // Which coherence-like measure was computed for this frame.
+  CoherenceMeasure measure{CoherenceMeasure::MagnitudeSquared};
 
   std::vector<std::string> channel_names;
   std::vector<BandDefinition> bands;

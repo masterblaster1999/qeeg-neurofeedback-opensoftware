@@ -8,7 +8,7 @@
 
 namespace qeeg {
 
-static std::string key(const std::string& ch) { return to_lower(trim(ch)); }
+static std::string key(const std::string& ch) { return normalize_channel_name(ch); }
 
 namespace {
 
@@ -80,7 +80,11 @@ Montage Montage::builtin_standard_1020_19() {
   // NOTE: These 2D coordinates are intentionally simple and approximate (unit circle head model).
   // For accurate neurophysiology/clinical work, use digitized electrode locations or a vetted template montage.
   //
-  // Common 19-channel 10-20 labels: Fp1 Fp2 F7 F3 Fz F4 F8 T3 C3 Cz C4 T4 T5 P3 Pz P4 T6 O1 O2
+  // Common 19-channel 10-20 labels (modern):
+  // Fp1 Fp2 F7 F3 Fz F4 F8 T7 C3 Cz C4 T8 P7 P3 Pz P4 P8 O1 O2
+  //
+  // NOTE: Older naming conventions use T3/T4/T5/T6 in place of T7/T8/P7/P8.
+  // We normalize those aliases so either spelling matches.
   auto put = [&](const std::string& name, double x, double y) {
     m.pos_by_name_[key(name)] = Vec2{x, y};
   };
@@ -94,17 +98,17 @@ Montage Montage::builtin_standard_1020_19() {
   put("F4",   0.42,  0.55);
   put("F8",   0.92,  0.62);
 
-  put("T3",  -1.02,  0.00); // older name for T7
+  put("T7",  -1.02,  0.00);
   put("C3",  -0.52,  0.02);
   put("Cz",   0.00,  0.00);
   put("C4",   0.52,  0.02);
-  put("T4",   1.02,  0.00); // older name for T8
+  put("T8",   1.02,  0.00);
 
-  put("T5",  -0.92, -0.55); // older name for P7
+  put("P7",  -0.92, -0.55);
   put("P3",  -0.42, -0.52);
   put("Pz",   0.00, -0.56);
   put("P4",   0.42, -0.52);
-  put("T6",   0.92, -0.55); // older name for P8
+  put("P8",   0.92, -0.55);
 
   put("O1",  -0.50, -0.92);
   put("O2",   0.50, -0.92);

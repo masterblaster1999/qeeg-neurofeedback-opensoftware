@@ -1,6 +1,7 @@
 #include "qeeg/bandpower.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
+#include "qeeg/robust_stats.hpp"
 #include "qeeg/running_stats.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/welch_psd.hpp"
@@ -31,7 +32,15 @@ struct Args {
   std::string band_spec; // empty => default
   size_t nperseg{1024};
   double overlap{0.5};
+
+  // If enabled, compute relative bandpower (band / total within a range).
+  bool relative_power{false};
+  bool relative_range_specified{false};
+  double relative_fmin_hz{0.0};
+  double relative_fmax_hz{0.0};
+
   bool log10_power{false};
+  bool robust{false};
 
   // Optional preprocessing
   bool average_reference{false};
@@ -60,7 +69,11 @@ static void print_help() {
     << "  --bands SPEC            Band spec, e.g. 'delta:0.5-4,theta:4-7,alpha:8-12'\n"
     << "  --nperseg N             Welch segment length (default: 1024)\n"
     << "  --overlap FRAC          Welch overlap fraction in [0,1) (default: 0.5)\n"
+    << "  --relative              Compute relative power: band_power / total_power\n"
+    << "  --relative-range LO HI  Total-power integration range used for --relative.\n"
+    << "                         Default: [min_band_fmin, max_band_fmax] from --bands.\n"
     << "  --log10                 Accumulate log10(power) instead of raw power\n"
+    << "  --robust                Use median + MAD-derived scale (robust) instead of mean + std\n"
     << "  --average-reference     Apply common average reference across channels\n"
     << "  --notch HZ              Apply a notch filter at HZ (e.g., 50 or 60)\n"
     << "  --notch-q Q             Notch Q factor (default: 30)\n"
@@ -92,8 +105,17 @@ static Args parse_args(int argc, char** argv) {
       a.nperseg = static_cast<size_t>(to_int(argv[++i]));
     } else if (arg == "--overlap" && i + 1 < argc) {
       a.overlap = to_double(argv[++i]);
+    } else if (arg == "--relative") {
+      a.relative_power = true;
+    } else if (arg == "--relative-range" && i + 2 < argc) {
+      a.relative_power = true;
+      a.relative_range_specified = true;
+      a.relative_fmin_hz = to_double(argv[++i]);
+      a.relative_fmax_hz = to_double(argv[++i]);
     } else if (arg == "--log10") {
       a.log10_power = true;
+    } else if (arg == "--robust") {
+      a.robust = true;
     } else if (arg == "--average-reference") {
       a.average_reference = true;
     } else if (arg == "--notch" && i + 1 < argc) {
@@ -133,8 +155,9 @@ static void load_list_file(const std::string& path, std::vector<std::string>* ou
   }
 }
 
+template <typename T>
 static std::vector<std::pair<std::string, std::string>> sorted_keys(
-    const std::unordered_map<std::string, RunningStats>& stats) {
+    const std::unordered_map<std::string, T>& stats) {
   // stats map key is "band|channel" (lowercased). Convert to (channel, band) for output sorting.
   std::vector<std::pair<std::string, std::string>> keys;
   keys.reserve(stats.size());
@@ -180,6 +203,26 @@ int main(int argc, char** argv) {
     const std::vector<BandDefinition> bands = parse_band_spec(args.band_spec);
     if (bands.empty()) throw std::runtime_error("No bands specified");
 
+    // Determine total-power integration range for relative bandpower.
+    double rel_lo = 0.0;
+    double rel_hi = 0.0;
+    if (args.relative_power) {
+      if (args.relative_range_specified) {
+        rel_lo = args.relative_fmin_hz;
+        rel_hi = args.relative_fmax_hz;
+      } else {
+        rel_lo = bands[0].fmin_hz;
+        rel_hi = bands[0].fmax_hz;
+        for (const auto& b : bands) {
+          rel_lo = std::min(rel_lo, b.fmin_hz);
+          rel_hi = std::max(rel_hi, b.fmax_hz);
+        }
+      }
+      if (!(rel_hi > rel_lo)) {
+        throw std::runtime_error("--relative-range must satisfy LO < HI");
+      }
+    }
+
     PreprocessOptions popt;
     popt.average_reference = args.average_reference;
     popt.notch_hz = args.notch_hz;
@@ -193,7 +236,10 @@ int main(int argc, char** argv) {
     wopt.overlap_fraction = args.overlap;
 
     // Accumulate one sample per input file.
-    std::unordered_map<std::string, RunningStats> stats; // key: band|channel
+    // - default: mean/std via RunningStats
+    // - --robust: keep per-key vectors and compute median/MAD-derived scale at end
+    std::unordered_map<std::string, RunningStats> stats;               // key: band|channel
+    std::unordered_map<std::string, std::vector<double>> robust_vals;  // key: band|channel
 
     size_t n_ok = 0;
     for (const auto& path : inputs) {
@@ -223,13 +269,29 @@ int main(int argc, char** argv) {
       }
 
       const double eps = 1e-20;
+
+      std::vector<double> total_power;
+      if (args.relative_power) {
+        total_power.resize(rec.n_channels(), 0.0);
+        for (size_t c = 0; c < rec.n_channels(); ++c) {
+          total_power[c] = integrate_bandpower(psds[c], rel_lo, rel_hi);
+        }
+      }
+
       for (size_t b = 0; b < bands.size(); ++b) {
         for (size_t c = 0; c < rec.n_channels(); ++c) {
           double v = integrate_bandpower(psds[c], bands[b].fmin_hz, bands[b].fmax_hz);
+          if (args.relative_power) {
+            v = v / std::max(eps, total_power[c]);
+          }
           if (args.log10_power) v = std::log10(std::max(eps, v));
 
           const std::string key = to_lower(bands[b].name) + "|" + to_lower(rec.channel_names[c]);
-          stats[key].add(v);
+          if (args.robust) {
+            robust_vals[key].push_back(v);
+          } else {
+            stats[key].add(v);
+          }
         }
       }
 
@@ -248,27 +310,55 @@ int main(int argc, char** argv) {
     out << "# qeeg_reference_cli\n";
     out << "# n_files=" << n_ok << "\n";
     out << "# log10_power=" << (args.log10_power ? 1 : 0) << "\n";
+    out << "# relative_power=" << (args.relative_power ? 1 : 0) << "\n";
+    if (args.relative_power) {
+      out << "# relative_fmin_hz=" << rel_lo << "\n";
+      out << "# relative_fmax_hz=" << rel_hi << "\n";
+    }
+    out << "# robust=" << (args.robust ? 1 : 0) << "\n";
     out << "# welch_nperseg=" << args.nperseg << "\n";
     out << "# welch_overlap=" << args.overlap << "\n";
     out << "# band_spec=" << (args.band_spec.empty() ? std::string("<default>") : args.band_spec) << "\n";
     out << "# channel,band,mean,std,n\n";
 
-    const auto keys = sorted_keys(stats);
-    for (const auto& cb : keys) {
-      const std::string& ch = cb.first;
-      const std::string& band = cb.second;
-      const std::string key = band + "|" + ch;
+    if (args.robust) {
+      const auto keys = sorted_keys(robust_vals);
+      for (const auto& cb : keys) {
+        const std::string& ch = cb.first;
+        const std::string& band = cb.second;
+        const std::string key = band + "|" + ch;
 
-      auto it = stats.find(key);
-      if (it == stats.end()) continue;
-      const RunningStats& rs = it->second;
-      if (rs.n() < 2) continue; // need variance
-      const double mean = rs.mean();
-      const double stdv = rs.stddev_sample();
-      if (!std::isfinite(mean) || !std::isfinite(stdv) || !(stdv > 0.0)) continue;
+        auto it = robust_vals.find(key);
+        if (it == robust_vals.end()) continue;
+        const auto& v = it->second;
+        if (v.size() < 2) continue;
 
-      // Keep output compatible with load_reference_csv(): first 4 columns are channel,band,mean,std
-      out << ch << "," << band << "," << mean << "," << stdv << "," << rs.n() << "\n";
+        std::vector<double> tmp = v;
+        const double med = median_inplace(&tmp);
+        const double scale = robust_scale(v, med);
+        if (!std::isfinite(med) || !std::isfinite(scale) || !(scale > 0.0)) continue;
+
+        // Keep output compatible with load_reference_csv(): first 4 columns are channel,band,mean,std
+        out << ch << "," << band << "," << med << "," << scale << "," << v.size() << "\n";
+      }
+    } else {
+      const auto keys = sorted_keys(stats);
+      for (const auto& cb : keys) {
+        const std::string& ch = cb.first;
+        const std::string& band = cb.second;
+        const std::string key = band + "|" + ch;
+
+        auto it = stats.find(key);
+        if (it == stats.end()) continue;
+        const RunningStats& rs = it->second;
+        if (rs.n() < 2) continue; // need variance
+        const double mean = rs.mean();
+        const double stdv = rs.stddev_sample();
+        if (!std::isfinite(mean) || !std::isfinite(stdv) || !(stdv > 0.0)) continue;
+
+        // Keep output compatible with load_reference_csv(): first 4 columns are channel,band,mean,std
+        out << ch << "," << band << "," << mean << "," << stdv << "," << rs.n() << "\n";
+      }
     }
 
     std::cout << "Wrote reference: " << out_csv << "\n";

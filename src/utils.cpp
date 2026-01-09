@@ -148,6 +148,53 @@ std::string to_lower(std::string s) {
   return s;
 }
 
+static std::string strip_common_ref_suffix(std::string s) {
+  // Only remove "ref/reference" when it is clearly a suffix separated by a
+  // delimiter, to avoid clobbering legitimate channel names.
+  //
+  // Examples: "F3-REF", "F3_ref", "F3 reference".
+  const std::string t = trim(s);
+
+  // Try longest suffixes first.
+  const std::vector<std::string> suffixes = {
+      "-reference",
+      "_reference",
+      " reference",
+      "-ref",
+      "_ref",
+      " ref",
+  };
+  for (const auto& suf : suffixes) {
+    if (ends_with(t, suf) && t.size() > suf.size()) {
+      const std::string head = trim(t.substr(0, t.size() - suf.size()));
+      if (!head.empty()) return head;
+    }
+  }
+  return t;
+}
+
+std::string normalize_channel_name(std::string s) {
+  // NOTE: We keep this intentionally conservative and dependency-free.
+  // It is used for lookups and matching, not for displaying labels.
+
+  // Remove BOM defensively in case labels come from CSV headers.
+  s = strip_utf8_bom(std::move(s));
+  s = trim(s);
+  if (s.empty()) return s;
+
+  // Lowercase first so suffix checks are case-insensitive.
+  s = to_lower(std::move(s));
+  s = strip_common_ref_suffix(std::move(s));
+
+  // Common 10-20 legacy aliases.
+  // Older: T3 T4 T5 T6; Newer: T7 T8 P7 P8.
+  if (s == "t3") return "t7";
+  if (s == "t4") return "t8";
+  if (s == "t5") return "p7";
+  if (s == "t6") return "p8";
+  return s;
+}
+
 bool starts_with(const std::string& s, const std::string& prefix) {
   return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }

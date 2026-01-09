@@ -38,6 +38,19 @@ struct Args {
 
   bool export_psd{false};
 
+  // Apply log10 transform to bandpower values before writing CSV and/or computing z-scores.
+  // Useful for compatibility with reference files built via qeeg_reference_cli --log10.
+  bool log10_power{false};
+  bool log10_specified{false}; // internal: whether user passed --log10
+
+  // If enabled, compute relative bandpower values (band_power / total_power) before
+  // optionally applying log10 and/or z-scoring.
+  bool relative_power{false};
+  bool relative_specified{false};       // internal: whether user passed --relative/--relative-range
+  bool relative_range_specified{false}; // internal: whether user passed --relative-range
+  double relative_fmin_hz{0.0};
+  double relative_fmax_hz{0.0};
+
   // Output visualization
   bool annotate{false}; // draw head outline/electrodes + colorbar on topomaps
 
@@ -84,6 +97,10 @@ static void print_help() {
     << "  --bandpass LO HI        Apply a simple bandpass (highpass LO then lowpass HI)\n"
     << "  --zero-phase            Offline: forward-backward filtering (less phase distortion)\n"
     << "  --export-psd            Write psd.csv (freq + PSD per channel)\n"
+    << "  --log10                 Use log10(power) instead of raw bandpower (matches qeeg_reference_cli --log10)\n"
+    << "  --relative              Use relative power: band_power / total_power\n"
+    << "  --relative-range LO HI  Total-power integration range used for --relative.\n"
+    << "                         Default: [min_band_fmin, max_band_fmax] from --bands.\n"
     << "  --annotate              Annotate topomaps with head outline/electrodes + colorbar\n"
     << "  --demo                  Generate synthetic recording instead of reading file\n"
     << "  --seconds S             Duration for --demo (default: 10)\n"
@@ -138,6 +155,18 @@ static Args parse_args(int argc, char** argv) {
       a.zero_phase = true;
     } else if (arg == "--export-psd") {
       a.export_psd = true;
+    } else if (arg == "--log10") {
+      a.log10_power = true;
+      a.log10_specified = true;
+    } else if (arg == "--relative") {
+      a.relative_power = true;
+      a.relative_specified = true;
+    } else if (arg == "--relative-range" && i + 2 < argc) {
+      a.relative_power = true;
+      a.relative_specified = true;
+      a.relative_range_specified = true;
+      a.relative_fmin_hz = to_double(argv[++i]);
+      a.relative_fmax_hz = to_double(argv[++i]);
     } else if (arg == "--annotate") {
       a.annotate = true;
     } else if (arg == "--demo") {
@@ -349,6 +378,104 @@ int main(int argc, char** argv) {
       std::cout << "Loading reference: " << args.reference_path << "\n";
       ref = load_reference_csv(args.reference_path);
       have_ref = true;
+
+      // If the reference file contains metadata (written by qeeg_reference_cli),
+      // use it to avoid accidental scale mismatches.
+      if (ref.meta_log10_power_present) {
+        if (!args.log10_specified) {
+          args.log10_power = ref.meta_log10_power;
+          if (args.log10_power) {
+            std::cout << "Reference metadata: log10_power=1 (applying log10 transform to bandpower)\n";
+          }
+        } else if (args.log10_power != ref.meta_log10_power) {
+          std::cerr << "Warning: --log10 does not match reference metadata log10_power="
+                    << (ref.meta_log10_power ? 1 : 0)
+                    << ". Z-scores may be invalid.\n";
+        }
+      }
+
+      if (ref.meta_relative_power_present) {
+        if (!args.relative_specified) {
+          args.relative_power = ref.meta_relative_power;
+          if (args.relative_power) {
+            std::cout << "Reference metadata: relative_power=1 (computing relative bandpower)\n";
+          }
+        } else if (args.relative_power != ref.meta_relative_power) {
+          std::cerr << "Warning: --relative does not match reference metadata relative_power="
+                    << (ref.meta_relative_power ? 1 : 0)
+                    << ". Z-scores may be invalid.\n";
+        }
+      }
+
+      const bool ref_has_rel_range = ref.meta_relative_fmin_hz_present && ref.meta_relative_fmax_hz_present &&
+                                     (ref.meta_relative_fmax_hz > ref.meta_relative_fmin_hz);
+      if (args.relative_power && ref_has_rel_range) {
+        if (!args.relative_range_specified) {
+          args.relative_fmin_hz = ref.meta_relative_fmin_hz;
+          args.relative_fmax_hz = ref.meta_relative_fmax_hz;
+          std::cout << "Reference metadata: relative_range=[" << args.relative_fmin_hz
+                    << "," << args.relative_fmax_hz << "] Hz\n";
+        } else {
+          const double eps = 1e-9;
+          if (std::fabs(args.relative_fmin_hz - ref.meta_relative_fmin_hz) > eps ||
+              std::fabs(args.relative_fmax_hz - ref.meta_relative_fmax_hz) > eps) {
+            std::cerr << "Warning: --relative-range does not match reference metadata relative_range=["
+                      << ref.meta_relative_fmin_hz << "," << ref.meta_relative_fmax_hz
+                      << "] Hz. Z-scores may be invalid.\n";
+          }
+        }
+      }
+
+      if (ref.meta_robust_present) {
+        std::cout << "Reference metadata: robust=" << (ref.meta_robust ? 1 : 0) << "\n";
+      }
+    }
+
+    // Optional: apply relative transform to bandpowers.
+    // This must happen before optional log10 so that qeeg_reference_cli --relative --log10 matches.
+    if (args.relative_power) {
+      if (args.relative_range_specified && !(args.relative_fmax_hz > args.relative_fmin_hz)) {
+        throw std::runtime_error("--relative-range must satisfy LO < HI");
+      }
+
+      double rel_lo = args.relative_fmin_hz;
+      double rel_hi = args.relative_fmax_hz;
+      if (!(rel_hi > rel_lo)) {
+        // Default: use the span of the provided bands.
+        rel_lo = bands[0].fmin_hz;
+        rel_hi = bands[0].fmax_hz;
+        for (const auto& b : bands) {
+          rel_lo = std::min(rel_lo, b.fmin_hz);
+          rel_hi = std::max(rel_hi, b.fmax_hz);
+        }
+      }
+      if (!(rel_hi > rel_lo)) {
+        throw std::runtime_error("Relative power range invalid (need LO < HI)");
+      }
+
+      const double eps = 1e-20;
+      std::vector<double> total_power(rec.n_channels(), 0.0);
+      for (size_t c = 0; c < rec.n_channels(); ++c) {
+        total_power[c] = integrate_bandpower(psds[c], rel_lo, rel_hi);
+      }
+      for (size_t b = 0; b < bands.size(); ++b) {
+        for (size_t c = 0; c < rec.n_channels(); ++c) {
+          bandpower_matrix[b][c] = bandpower_matrix[b][c] / std::max(eps, total_power[c]);
+        }
+      }
+
+      std::cout << "Relative power: dividing each band by total power in [" << rel_lo
+                << "," << rel_hi << "] Hz\n";
+    }
+
+    // Optional: apply log10 transform to bandpowers.
+    if (args.log10_power) {
+      const double eps = 1e-20;
+      for (size_t b = 0; b < bands.size(); ++b) {
+        for (size_t c = 0; c < rec.n_channels(); ++c) {
+          bandpower_matrix[b][c] = std::log10(std::max(eps, bandpower_matrix[b][c]));
+        }
+      }
     }
 
     // Write bandpowers.csv

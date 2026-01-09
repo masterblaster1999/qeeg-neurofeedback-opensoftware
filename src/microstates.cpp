@@ -505,4 +505,54 @@ MicrostatesResult estimate_microstates(const EEGRecording& rec, const Microstate
   return out;
 }
 
+
+std::vector<MicrostateSegment> microstate_segments(const std::vector<int>& labels,
+                                                   const std::vector<double>& corr,
+                                                   const std::vector<double>& gfp,
+                                                   double fs_hz,
+                                                   bool include_undefined) {
+  if (fs_hz <= 0.0) throw std::runtime_error("microstate_segments: fs_hz must be > 0");
+  if (labels.size() != corr.size() || labels.size() != gfp.size()) {
+    throw std::runtime_error("microstate_segments: labels, corr, gfp must have the same length");
+  }
+
+  std::vector<MicrostateSegment> segs;
+  const size_t N = labels.size();
+  if (N == 0) return segs;
+
+  size_t i = 0;
+  while (i < N) {
+    const int lab = labels[i];
+    size_t j = i + 1;
+    double sum_corr = corr[i];
+    double sum_gfp = gfp[i];
+
+    while (j < N && labels[j] == lab) {
+      sum_corr += corr[j];
+      sum_gfp += gfp[j];
+      ++j;
+    }
+
+    const size_t len = j - i;
+    if (include_undefined || lab >= 0) {
+      MicrostateSegment s;
+      s.label = lab;
+      s.start_sample = i;
+      s.end_sample = j;
+      s.start_sec = static_cast<double>(i) / fs_hz;
+      s.end_sec = static_cast<double>(j) / fs_hz;
+      s.duration_sec = static_cast<double>(len) / fs_hz;
+      if (len > 0) {
+        s.mean_corr = sum_corr / static_cast<double>(len);
+        s.mean_gfp = sum_gfp / static_cast<double>(len);
+      }
+      segs.push_back(s);
+    }
+
+    i = j;
+  }
+
+  return segs;
+}
+
 } // namespace qeeg

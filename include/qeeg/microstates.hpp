@@ -86,6 +86,33 @@ struct MicrostatesResult {
   std::vector<std::vector<int>> transition_counts;
 };
 
+// A contiguous segment of samples assigned to the same microstate label.
+//
+// Notes:
+// - start/end samples use half-open indexing: [start_sample, end_sample).
+// - label is in [0,k) for valid microstates; -1 indicates undefined samples.
+struct MicrostateSegment {
+  int label{-1};
+  size_t start_sample{0};
+  size_t end_sample{0}; // exclusive
+  double start_sec{0.0};
+  double end_sec{0.0};
+  double duration_sec{0.0};
+  double mean_corr{0.0};
+  double mean_gfp{0.0};
+};
+
+// Convert per-sample microstate labels into contiguous segments.
+//
+// `labels`, `corr`, and `gfp` must have the same length (n_samples).
+// If include_undefined=false, segments with label < 0 are skipped.
+std::vector<MicrostateSegment> microstate_segments(const std::vector<int>& labels,
+                                                   const std::vector<double>& corr,
+                                                   const std::vector<double>& gfp,
+                                                   double fs_hz,
+                                                   bool include_undefined = false);
+
+
 // Compute Global Field Power (GFP) over time for a recording.
 // GFP is implemented as the per-sample standard deviation across channels.
 std::vector<double> compute_gfp(const EEGRecording& rec);

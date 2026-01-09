@@ -32,6 +32,22 @@ std::vector<std::string> split(const std::string& s, char delim);
 std::vector<std::string> split_csv_row(const std::string& row, char delim);
 std::string to_lower(std::string s);
 
+// Normalize an EEG channel label for robust matching.
+//
+// Intended use cases:
+// - match recording channel names to a montage
+// - match CLI-specified channel names to recording channel names
+//
+// Current normalization steps (best-effort, dependency-free):
+// - strip leading/trailing whitespace
+// - lowercase
+// - strip common reference suffixes like "-REF" / "_ref" / " reference" (when separated)
+// - map a few common 10-20 legacy aliases (e.g. T3->T7, T4->T8, T5->P7, T6->P8)
+//
+// This is intentionally conservative; it should not attempt aggressive parsing
+// that could cause surprising collisions.
+std::string normalize_channel_name(std::string s);
+
 bool starts_with(const std::string& s, const std::string& prefix);
 bool ends_with(const std::string& s, const std::string& suffix);
 

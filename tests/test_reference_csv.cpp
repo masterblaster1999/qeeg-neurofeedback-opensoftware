@@ -62,6 +62,45 @@ int main() {
 
   std::remove(path2.c_str());
 
+  // 3) Comment metadata parsing (written by qeeg_reference_cli).
+  const std::string path3 = "tmp_reference_meta.csv";
+  {
+    std::ofstream out(path3);
+    out << "# qeeg_reference_cli\n";
+    out << "# n_files=3\n";
+    out << "# log10_power=1\n";
+    out << "# relative_power=1\n";
+    out << "# relative_fmin_hz=1\n";
+    out << "# relative_fmax_hz=45\n";
+    out << "# robust=0\n";
+    out << "channel,band,mean,std\n";
+    out << "Cz,alpha,1.0,0.1\n";
+  }
+
+  {
+    ReferenceStats ref = load_reference_csv(path3);
+    assert(ref.mean.size() == 1);
+    assert(ref.stdev.size() == 1);
+
+    assert(ref.meta_n_files_present);
+    assert(ref.meta_n_files == 3);
+
+    assert(ref.meta_log10_power_present);
+    assert(ref.meta_log10_power == true);
+
+    assert(ref.meta_relative_power_present);
+    assert(ref.meta_relative_power == true);
+    assert(ref.meta_relative_fmin_hz_present);
+    assert(approx(ref.meta_relative_fmin_hz, 1.0));
+    assert(ref.meta_relative_fmax_hz_present);
+    assert(approx(ref.meta_relative_fmax_hz, 45.0));
+
+    assert(ref.meta_robust_present);
+    assert(ref.meta_robust == false);
+  }
+
+  std::remove(path3.c_str());
+
   std::cout << "test_reference_csv OK\n";
   return 0;
 }

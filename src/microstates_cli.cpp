@@ -36,6 +36,8 @@ struct Args {
   double min_peak_distance_ms{0.0};
   double min_duration_ms{0.0};
 
+  bool export_segments{false};
+
   bool polarity_invariant{true};
   bool demean_topography{true};
 
@@ -78,6 +80,7 @@ static void print_help() {
     << "  --min-peak-distance-ms M Minimum spacing between selected GFP peaks (default: 0)\n"
     << "  --min-duration-ms M      Minimum microstate segment duration (merge shorter) (default: 0)\n"
     << "  --no-polarity-invariant  Treat maps as signed (disable polarity invariance)\n"
+    << "  --export-segments         Write microstate_segments.csv (segment list)\n"
     << "  --no-demean              Do not subtract channel-mean from each topography\n"
     << "  --grid N                 Topomap grid size (default: 256)\n"
     << "  --interp METHOD          Topomap interpolation: idw|spline (default: idw)\n"
@@ -123,6 +126,8 @@ static Args parse_args(int argc, char** argv) {
       a.min_peak_distance_ms = to_double(argv[++i]);
     } else if (arg == "--min-duration-ms" && i + 1 < argc) {
       a.min_duration_ms = to_double(argv[++i]);
+    } else if (arg == "--export-segments") {
+      a.export_segments = true;
     } else if (arg == "--no-polarity-invariant") {
       a.polarity_invariant = false;
     } else if (arg == "--no-demean") {
@@ -284,6 +289,29 @@ int main(int argc, char** argv) {
       }
     }
 
+
+    // --- Optional: segments ---
+    if (a.export_segments) {
+      const auto segs = microstate_segments(r.labels, r.corr, r.gfp, rec.fs_hz, /*include_undefined=*/false);
+
+      std::ofstream f(a.outdir + "/microstate_segments.csv");
+      if (!f) throw std::runtime_error("Failed to open output CSV");
+      f << "segment_index,label,start_sec,end_sec,duration_sec,mean_corr,mean_gfp,start_sample,end_sample\n";
+      for (size_t si = 0; si < segs.size(); ++si) {
+        const auto& s = segs[si];
+        f << si
+          << "," << state_name(s.label)
+          << "," << s.start_sec
+          << "," << s.end_sec
+          << "," << s.duration_sec
+          << "," << s.mean_corr
+          << "," << s.mean_gfp
+          << "," << s.start_sample
+          << "," << s.end_sample
+          << "\n";
+      }
+    }
+
     // --- Transition matrix ---
     {
       std::ofstream f(a.outdir + "/microstate_transition_counts.csv");
@@ -299,6 +327,45 @@ int main(int argc, char** argv) {
           f << "," << c;
         }
         f << "\n";
+      }
+    }
+
+
+    // --- Transition probabilities (row-normalized) ---
+    {
+      std::ofstream f(a.outdir + "/microstate_transition_probs.csv");
+      if (!f) throw std::runtime_error("Failed to open output CSV");
+
+      f << "from\\to";
+      for (int k = 0; k < K; ++k) f << "," << state_name(k);
+      f << "\n";
+
+      for (int i = 0; i < K; ++i) {
+        f << state_name(i);
+        int row_sum = 0;
+        for (int j = 0; j < K; ++j) {
+          row_sum += r.transition_counts[static_cast<size_t>(i)][static_cast<size_t>(j)];
+        }
+        for (int j = 0; j < K; ++j) {
+          const int c = r.transition_counts[static_cast<size_t>(i)][static_cast<size_t>(j)];
+          const double p = (row_sum > 0) ? (static_cast<double>(c) / static_cast<double>(row_sum)) : 0.0;
+          f << "," << p;
+        }
+        f << "\n";
+      }
+    }
+
+    // --- Per-state stats (CSV) ---
+    {
+      std::ofstream f(a.outdir + "/microstate_state_stats.csv");
+      if (!f) throw std::runtime_error("Failed to open output CSV");
+      f << "microstate,coverage,mean_duration_sec,occurrence_per_sec\n";
+      for (int k = 0; k < K; ++k) {
+        f << state_name(k)
+          << "," << r.coverage[static_cast<size_t>(k)]
+          << "," << r.mean_duration_sec[static_cast<size_t>(k)]
+          << "," << r.occurrence_per_sec[static_cast<size_t>(k)]
+          << "\n";
       }
     }
 

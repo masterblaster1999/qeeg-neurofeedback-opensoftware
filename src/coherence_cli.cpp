@@ -27,6 +27,11 @@ struct Args {
   // Otherwise format: CH1:CH2 (several delimiters accepted).
   std::string pair_spec;
 
+  // Which coherence-like measure to report.
+  // - msc: magnitude-squared coherence (default)
+  // - imcoh: absolute imaginary part of coherency (Nolte-style)
+  std::string measure{"msc"};
+
   bool export_spectrum{false};
   bool average_reference{false};
 
@@ -56,6 +61,7 @@ static void print_help() {
     << "  --bands SPEC            Band spec, e.g. 'alpha:8-12,beta:13-30' (default: built-in EEG bands)\n"
     << "  --band NAME|FMIN-FMAX    Which band to report (default: alpha)\n"
     << "  --pair CH1:CH2          If set, compute only this pair (otherwise output a full matrix)\n"
+    << "  --measure msc|imcoh      Connectivity measure (default: msc)\n"
     << "  --export-spectrum        If --pair is used, also write coherence_spectrum.csv\n"
     << "  --average-reference      Apply common average reference across channels\n"
     << "  --notch HZ               Apply a notch filter at HZ (e.g., 50 or 60)\n"
@@ -84,6 +90,8 @@ static Args parse_args(int argc, char** argv) {
       a.band_name = argv[++i];
     } else if (arg == "--pair" && i + 1 < argc) {
       a.pair_spec = argv[++i];
+    } else if (arg == "--measure" && i + 1 < argc) {
+      a.measure = argv[++i];
     } else if (arg == "--export-spectrum") {
       a.export_spectrum = true;
     } else if (arg == "--average-reference") {
@@ -163,6 +171,18 @@ static std::pair<std::string,std::string> parse_pair(const std::string& s) {
   return {trim(parts[0]), trim(parts[1])};
 }
 
+static std::string stem_for_measure(CoherenceMeasure m) {
+  if (m == CoherenceMeasure::MagnitudeSquared) return "coherence";
+  if (m == CoherenceMeasure::ImaginaryCoherencyAbs) return "imcoh";
+  return "coherence";
+}
+
+static std::string column_for_measure(CoherenceMeasure m) {
+  if (m == CoherenceMeasure::MagnitudeSquared) return "coherence";
+  if (m == CoherenceMeasure::ImaginaryCoherencyAbs) return "imcoh";
+  return "coherence";
+}
+
 int main(int argc, char** argv) {
   try {
     const Args args = parse_args(argc, argv);
@@ -211,9 +231,14 @@ int main(int argc, char** argv) {
     const std::vector<BandDefinition> bands = parse_band_spec(args.band_spec);
     const BandDefinition band = resolve_band(bands, args.band_name);
 
+    const CoherenceMeasure measure = parse_coherence_measure_token(args.measure);
+    const std::string stem = stem_for_measure(measure);
+    const std::string col = column_for_measure(measure);
+
     std::cout << "Loaded recording: " << rec.n_channels() << " channels, "
               << rec.n_samples() << " samples, fs=" << rec.fs_hz << " Hz\n";
     std::cout << "Band: " << band.name << " (" << band.fmin_hz << "-" << band.fmax_hz << " Hz)\n";
+    std::cout << "Measure: " << coherence_measure_name(measure) << "\n";
 
     if (!args.pair_spec.empty()) {
       const auto pr_names = parse_pair(args.pair_spec);
@@ -223,29 +248,33 @@ int main(int argc, char** argv) {
       if (ib < 0) throw std::runtime_error("Channel not found: " + pr_names.second);
       if (ia == ib) throw std::runtime_error("--pair channels must be different");
 
-      const auto coh = welch_coherence(rec.data[static_cast<size_t>(ia)],
-                                      rec.data[static_cast<size_t>(ib)],
-                                      rec.fs_hz,
-                                      wopt);
-      const double mean_c = average_band_coherence(coh, band);
+      const CoherenceSpectrum spec = welch_coherence_spectrum(rec.data[static_cast<size_t>(ia)],
+                                                             rec.data[static_cast<size_t>(ib)],
+                                                             rec.fs_hz,
+                                                             wopt,
+                                                             measure);
 
-      std::cout << "Band-mean coherence(" << pr_names.first << "," << pr_names.second << ") = "
+      const double mean_c = average_band_value(spec, band);
+
+      std::cout << "Band-mean " << col << "(" << pr_names.first << "," << pr_names.second << ") = "
                 << mean_c << "\n";
 
       // Always write a summary.
       {
-        std::ofstream f(args.outdir + "/coherence_band.csv");
-        if (!f) throw std::runtime_error("Failed to write coherence_band.csv");
-        f << "band,channel_a,channel_b,coherence\n";
+        const std::string path = args.outdir + "/" + stem + "_band.csv";
+        std::ofstream f(path);
+        if (!f) throw std::runtime_error("Failed to write " + path);
+        f << "band,channel_a,channel_b," << col << "\n";
         f << band.name << "," << pr_names.first << "," << pr_names.second << "," << mean_c << "\n";
       }
 
       if (args.export_spectrum) {
-        std::ofstream f(args.outdir + "/coherence_spectrum.csv");
-        if (!f) throw std::runtime_error("Failed to write coherence_spectrum.csv");
-        f << "freq_hz,coherence\n";
-        for (size_t i = 0; i < coh.freqs_hz.size(); ++i) {
-          f << coh.freqs_hz[i] << "," << coh.coherence[i] << "\n";
+        const std::string path = args.outdir + "/" + stem + "_spectrum.csv";
+        std::ofstream f(path);
+        if (!f) throw std::runtime_error("Failed to write " + path);
+        f << "freq_hz," << col << "\n";
+        for (size_t i = 0; i < spec.freqs_hz.size(); ++i) {
+          f << spec.freqs_hz[i] << "," << spec.values[i] << "\n";
         }
       }
 
@@ -253,15 +282,15 @@ int main(int argc, char** argv) {
       return 0;
     }
 
-    // Matrix mode: compute band-mean coherence for all channel pairs.
+    // Matrix mode: compute band-mean measure for all channel pairs.
     const size_t C = rec.n_channels();
     std::vector<std::vector<double>> mat(C, std::vector<double>(C, 0.0));
     for (size_t i = 0; i < C; ++i) mat[i][i] = 1.0;
 
     for (size_t i = 0; i < C; ++i) {
       for (size_t j = i + 1; j < C; ++j) {
-        const auto coh = welch_coherence(rec.data[i], rec.data[j], rec.fs_hz, wopt);
-        const double v = average_band_coherence(coh, band);
+        const auto spec = welch_coherence_spectrum(rec.data[i], rec.data[j], rec.fs_hz, wopt, measure);
+        const double v = average_band_value(spec, band);
         const double c = std::isfinite(v) ? v : 0.0;
         mat[i][j] = c;
         mat[j][i] = c;
@@ -270,7 +299,7 @@ int main(int argc, char** argv) {
 
     // Write matrix.
     {
-      std::string fname = args.outdir + "/coherence_matrix_" + to_lower(band.name) + ".csv";
+      std::string fname = args.outdir + "/" + stem + "_matrix_" + to_lower(band.name) + ".csv";
       std::ofstream f(fname);
       if (!f) throw std::runtime_error("Failed to write " + fname);
 
@@ -290,9 +319,10 @@ int main(int argc, char** argv) {
 
     // Also write a flat edge list (useful for graph tooling).
     {
-      std::ofstream f(args.outdir + "/coherence_pairs.csv");
-      if (!f) throw std::runtime_error("Failed to write coherence_pairs.csv");
-      f << "channel_a,channel_b,coherence\n";
+      const std::string path = args.outdir + "/" + stem + "_pairs.csv";
+      std::ofstream f(path);
+      if (!f) throw std::runtime_error("Failed to write " + path);
+      f << "channel_a,channel_b," << col << "\n";
       for (size_t i = 0; i < C; ++i) {
         for (size_t j = i + 1; j < C; ++j) {
           f << rec.channel_names[i] << "," << rec.channel_names[j] << "," << mat[i][j] << "\n";

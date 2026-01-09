@@ -67,6 +67,34 @@ struct ReferenceStats {
   // key: band|channel (lowercased)
   std::unordered_map<std::string, double> mean;
   std::unordered_map<std::string, double> stdev;
+
+  // Optional metadata parsed from comment lines ("# key=value") if present in
+  // the reference CSV.
+  //
+  // qeeg_reference_cli writes (among others):
+  //   # log10_power=0/1
+  //   # relative_power=0/1
+  //   # relative_fmin_hz=LO
+  //   # relative_fmax_hz=HI
+  //   # robust=0/1
+  //   # n_files=N
+  bool meta_log10_power_present{false};
+  bool meta_log10_power{false};
+
+  bool meta_relative_power_present{false};
+  bool meta_relative_power{false};
+
+  bool meta_relative_fmin_hz_present{false};
+  double meta_relative_fmin_hz{0.0};
+
+  bool meta_relative_fmax_hz_present{false};
+  double meta_relative_fmax_hz{0.0};
+
+  bool meta_robust_present{false};
+  bool meta_robust{false};
+
+  bool meta_n_files_present{false};
+  std::size_t meta_n_files{0};
 };
 
 } // namespace qeeg

@@ -5,6 +5,7 @@
 #include "qeeg/online_coherence.hpp"
 #include "qeeg/online_artifacts.hpp"
 #include "qeeg/online_pac.hpp"
+#include "qeeg/nf_metric.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/wav_writer.hpp"
@@ -99,6 +100,7 @@ static void print_help() {
     << "  qeeg_nf_cli --input file.edf --outdir out_nf --metric alpha:Pz\n"
     << "  qeeg_nf_cli --input file.bdf --outdir out_nf --metric alpha/beta:Pz\n"
     << "  qeeg_nf_cli --input file.edf --outdir out_nf --metric coh:alpha:F3:F4\n"
+    << "  qeeg_nf_cli --input file.edf --outdir out_nf --metric imcoh:alpha:F3:F4\n"
     << "  qeeg_nf_cli --input file.edf --outdir out_nf --metric pac:theta:gamma:Cz\n"
     << "  qeeg_nf_cli --input file.edf --outdir out_nf --metric mvl:theta:gamma:Cz\n"
     << "  qeeg_nf_cli --demo --fs 250 --seconds 60 --outdir out_demo_nf\n\n"
@@ -108,7 +110,8 @@ static void print_help() {
     << "  --outdir DIR              Output directory (default: out_nf)\n"
     << "  --bands SPEC              Band spec, e.g. 'delta:0.5-4,theta:4-7,alpha:8-12'\n"
     << "  --metric SPEC             Metric: 'alpha:Pz' (bandpower), 'alpha/beta:Pz' (ratio),\n"
-    << "                           'coh:alpha:F3:F4' (magnitude-squared coherence),\n"
+    << "                           'coh:alpha:F3:F4' or 'msc:alpha:F3:F4' (magnitude-squared coherence),\n"
+    << "                           'imcoh:alpha:F3:F4' (imaginary coherency),\n"
     << "                           'pac:PHASE:AMP:CH' (Tort MI), or 'mvl:PHASE:AMP:CH'\n"
     << "  --window S                Sliding window seconds (default: 2.0)\n"
     << "  --update S                Update interval seconds (default: 0.25)\n"
@@ -125,7 +128,7 @@ static void print_help() {
     << "  --bandpass LO HI           Apply a simple bandpass (highpass LO then lowpass HI)\n"
     << "  --chunk S                 File playback chunk seconds (default: 0.10)\n"
     << "  --export-bandpowers        Write bandpower_timeseries.csv (bandpower/ratio modes)\n"
-    << "  --export-coherence         Write coherence_timeseries.csv (coherence mode)\n"
+    << "  --export-coherence         Write coherence_timeseries.csv or imcoh_timeseries.csv (coherence mode)\n"
     << "  --artifact-gate            Suppress reward/adaptation during detected artifacts\n"
     << "  --artifact-ptp-z Z         Artifact threshold: peak-to-peak robust z (<=0 disables; default: 6)\n"
     << "  --artifact-rms-z Z         Artifact threshold: RMS robust z (<=0 disables; default: 6)\n"
@@ -516,112 +519,6 @@ static EEGRecording make_demo_recording(const Montage& montage, double fs_hz, do
   return rec;
 }
 
-struct MetricSpec {
-  enum class Type { Band, Ratio, Coherence, Pac };
-  Type type{Type::Band};
-
-  // Band (and coherence) selection.
-  std::string band;
-
-  // Ratio bands.
-  std::string band_num;
-  std::string band_den;
-
-  // Band/ratio channel.
-  std::string channel;
-
-  // Coherence pair.
-  std::string channel_a;
-  std::string channel_b;
-
-  // PAC (phase-amplitude coupling)
-  PacMethod pac_method{PacMethod::ModulationIndex};
-  std::string phase_band;
-  std::string amp_band;
-};
-
-static MetricSpec parse_metric_spec(const std::string& s) {
-  // Supported:
-  //  - alpha:Pz
-  //  - alpha/beta:Pz
-  //  - band:alpha:Pz
-  //  - ratio:alpha:beta:Pz
-  //  - coh:alpha:F3:F4
-  //  - coherence:alpha:F3:F4
-  //  - pac:theta:gamma:Cz  (Tort MI)
-  //  - mvl:theta:gamma:Cz  (mean vector length)
-  const auto parts = split(trim(s), ':');
-  if (parts.empty()) throw std::runtime_error("--metric: empty spec");
-
-  // Long-form
-  if (parts.size() >= 1) {
-    const std::string head = to_lower(trim(parts[0]));
-    if (head == "band") {
-      if (parts.size() != 3) throw std::runtime_error("--metric band: expects band:NAME:CHANNEL");
-      MetricSpec m;
-      m.type = MetricSpec::Type::Band;
-      m.band = trim(parts[1]);
-      m.channel = trim(parts[2]);
-      return m;
-    }
-    if (head == "ratio") {
-      if (parts.size() != 4) throw std::runtime_error("--metric ratio: expects ratio:NUM:DEN:CHANNEL");
-      MetricSpec m;
-      m.type = MetricSpec::Type::Ratio;
-      m.band_num = trim(parts[1]);
-      m.band_den = trim(parts[2]);
-      m.channel = trim(parts[3]);
-      return m;
-    }
-    if (head == "coh" || head == "coherence") {
-      if (parts.size() != 4) throw std::runtime_error("--metric coh: expects coh:BAND:CH_A:CH_B");
-      MetricSpec m;
-      m.type = MetricSpec::Type::Coherence;
-      m.band = trim(parts[1]);
-      m.channel_a = trim(parts[2]);
-      m.channel_b = trim(parts[3]);
-      return m;
-    }
-    if (head == "pac" || head == "pacmi") {
-      if (parts.size() != 4) throw std::runtime_error("--metric pac: expects pac:PHASE:AMP:CHANNEL");
-      MetricSpec m;
-      m.type = MetricSpec::Type::Pac;
-      m.pac_method = PacMethod::ModulationIndex;
-      m.phase_band = trim(parts[1]);
-      m.amp_band = trim(parts[2]);
-      m.channel = trim(parts[3]);
-      return m;
-    }
-    if (head == "mvl" || head == "pacmvl") {
-      if (parts.size() != 4) throw std::runtime_error("--metric mvl: expects mvl:PHASE:AMP:CHANNEL");
-      MetricSpec m;
-      m.type = MetricSpec::Type::Pac;
-      m.pac_method = PacMethod::MeanVectorLength;
-      m.phase_band = trim(parts[1]);
-      m.amp_band = trim(parts[2]);
-      m.channel = trim(parts[3]);
-      return m;
-    }
-  }
-
-  // Short-form (bandpower or ratio)
-  if (parts.size() != 2) {
-    throw std::runtime_error("--metric: expected 'alpha:Pz', 'alpha/beta:Pz', 'coh:alpha:F3:F4', or 'pac:theta:gamma:Cz'");
-  }
-  MetricSpec m;
-  const std::string left = trim(parts[0]);
-  m.channel = trim(parts[1]);
-  const auto slash = left.find('/');
-  if (slash == std::string::npos) {
-    m.type = MetricSpec::Type::Band;
-    m.band = left;
-  } else {
-    m.type = MetricSpec::Type::Ratio;
-    m.band_num = trim(left.substr(0, slash));
-    m.band_den = trim(left.substr(slash + 1));
-  }
-  return m;
-}
 
 static int find_channel_index(const std::vector<std::string>& channels, const std::string& name) {
   const std::string target = to_lower(trim(name));
@@ -666,13 +563,13 @@ static BandDefinition resolve_band_token(const std::vector<BandDefinition>& band
 }
 
 static double compute_metric_band_or_ratio(const OnlineBandpowerFrame& fr,
-                                          const MetricSpec& spec,
+                                          const NfMetricSpec& spec,
                                           int ch_idx,
                                           int b_idx,
                                           int b_num,
                                           int b_den) {
   const size_t c = static_cast<size_t>(ch_idx);
-  if (spec.type == MetricSpec::Type::Band) {
+  if (spec.type == NfMetricSpec::Type::Band) {
     return fr.powers[static_cast<size_t>(b_idx)][c];
   }
   // Ratio
@@ -787,7 +684,7 @@ int main(int argc, char** argv) {
     StreamingPreprocessor pre(rec.n_channels(), rec.fs_hz, popt);
 
     const std::vector<BandDefinition> bands = parse_band_spec(args.band_spec);
-    const MetricSpec metric = parse_metric_spec(args.metric_spec);
+    const NfMetricSpec metric = parse_nf_metric_spec(args.metric_spec);
 
     // Output
     std::ofstream out(args.outdir + "/nf_feedback.csv");
@@ -799,12 +696,12 @@ int main(int argc, char** argv) {
     if (do_artifacts) {
       out << ",artifact_ready,artifact,bad_channels";
     }
-    if (metric.type == MetricSpec::Type::Band) {
+    if (metric.type == NfMetricSpec::Type::Band) {
       out << ",band,channel";
-    } else if (metric.type == MetricSpec::Type::Ratio) {
+    } else if (metric.type == NfMetricSpec::Type::Ratio) {
       out << ",band_num,band_den,channel";
-    } else if (metric.type == MetricSpec::Type::Coherence) {
-      out << ",band,channel_a,channel_b";
+    } else if (metric.type == NfMetricSpec::Type::Coherence) {
+      out << ",band,channel_a,channel_b,measure";
     } else {
       out << ",phase_band,amp_band,channel,method";
     }
@@ -864,7 +761,7 @@ int main(int argc, char** argv) {
     const size_t chunk_samples = std::max<size_t>(1, sec_to_samples(args.chunk_seconds, rec.fs_hz));
     std::vector<std::vector<float>> block(rec.n_channels());
 
-    if (metric.type == MetricSpec::Type::Coherence) {
+    if (metric.type == NfMetricSpec::Type::Coherence) {
       // Resolve pair indices from the recording.
       const int ia = find_channel_index(rec.channel_names, metric.channel_a);
       const int ib = find_channel_index(rec.channel_names, metric.channel_b);
@@ -877,6 +774,7 @@ int main(int argc, char** argv) {
       opt.update_seconds = args.update_seconds;
       opt.welch.nperseg = args.nperseg;
       opt.welch.overlap_fraction = args.overlap;
+      opt.measure = metric.coherence_measure;
 
       OnlineWelchCoherence eng(rec.channel_names, rec.fs_hz, bands, {{ia, ib}}, opt);
 
@@ -884,8 +782,9 @@ int main(int argc, char** argv) {
       int b_idx = -1;
 
       if (args.export_coherence) {
-        out_coh.open(args.outdir + "/coherence_timeseries.csv");
-        if (!out_coh) throw std::runtime_error("Failed to write coherence_timeseries.csv");
+        const std::string coh_stem = (metric.coherence_measure == CoherenceMeasure::MagnitudeSquared) ? "coherence" : "imcoh";
+        out_coh.open(args.outdir + "/" + coh_stem + "_timeseries.csv");
+        if (!out_coh) throw std::runtime_error("Failed to write " + coh_stem + "_timeseries.csv");
         out_coh << "t_end_sec";
         const std::string pair_name = metric.channel_a + "_" + metric.channel_b;
         for (const auto& b : bands) {
@@ -978,7 +877,8 @@ int main(int argc, char** argv) {
                   << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
                   << "," << af.bad_channel_count;
             }
-            out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
+            out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
+                << "," << coherence_measure_name(metric.coherence_measure);
             out << "\n";
             continue;
           }
@@ -1003,7 +903,8 @@ int main(int argc, char** argv) {
                 << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
                 << "," << af.bad_channel_count;
           }
-          out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
+          out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
+                << "," << coherence_measure_name(metric.coherence_measure);
           out << "\n";
         }
       }
@@ -1013,7 +914,7 @@ int main(int argc, char** argv) {
       return 0;
     }
 
-    if (metric.type == MetricSpec::Type::Pac) {
+    if (metric.type == NfMetricSpec::Type::Pac) {
       const int ic = find_channel_index(rec.channel_names, metric.channel);
       if (ic < 0) throw std::runtime_error("Metric channel not found in recording: " + metric.channel);
 
@@ -1192,7 +1093,7 @@ int main(int argc, char** argv) {
         if (ch_idx < 0) {
           ch_idx = find_channel_index(fr.channel_names, metric.channel);
           if (ch_idx < 0) throw std::runtime_error("Metric channel not found in recording: " + metric.channel);
-          if (metric.type == MetricSpec::Type::Band) {
+          if (metric.type == NfMetricSpec::Type::Band) {
             b_idx = find_band_index(fr.bands, metric.band);
             if (b_idx < 0) throw std::runtime_error("Metric band not found: " + metric.band);
           } else {
@@ -1246,7 +1147,7 @@ int main(int argc, char** argv) {
                 << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
                 << "," << af.bad_channel_count;
           }
-          if (metric.type == MetricSpec::Type::Band) {
+          if (metric.type == NfMetricSpec::Type::Band) {
             out << "," << metric.band << "," << metric.channel;
           } else {
             out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
@@ -1275,7 +1176,7 @@ int main(int argc, char** argv) {
               << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
               << "," << af.bad_channel_count;
         }
-        if (metric.type == MetricSpec::Type::Band) {
+        if (metric.type == NfMetricSpec::Type::Band) {
           out << "," << metric.band << "," << metric.channel;
         } else {
           out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;

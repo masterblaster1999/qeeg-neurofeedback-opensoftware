@@ -6,13 +6,20 @@
 
 namespace qeeg {
 
-// Phase Locking Value (PLV)
+// Phase-based connectivity measures
 //
-// PLV is a phase-based connectivity metric defined as the magnitude of the
-// mean unit phasor of the instantaneous phase difference between two signals:
-//   PLV = | (1/N) * sum_t exp(i * (phi_x(t) - phi_y(t))) |
+// This module currently provides:
+//   - PLV: Phase Locking Value
+//   - PLI: Phase Lag Index
+//   - wPLI: Weighted Phase Lag Index
 //
-// Returns values in [0, 1] (higher => more consistent phase difference).
+// All measures are computed from a narrow-band analytic signal per channel:
+//   bandpass -> Hilbert (FFT-based) -> complex analytic signal z(t)
+//
+// Notes:
+// - PLV is sensitive to zero-lag coupling (which can be inflated by field spread / volume conduction).
+// - PLI/wPLI are based on the sign / magnitude of the *imaginary* component of the cross-spectrum,
+//   which suppresses purely zero-lag interactions.
 
 struct PlvOptions {
   // If true, use forward-backward (zero-phase) filtering for the internal
@@ -41,5 +48,46 @@ std::vector<std::vector<double>> compute_plv_matrix(const std::vector<std::vecto
                                                     double fs_hz,
                                                     const BandDefinition& band,
                                                     const PlvOptions& opt = {});
+
+// Phase Lag Index (PLI)
+//
+// PLI measures the consistency of the *sign* of the imaginary component of the
+// analytic cross-product:
+//   PLI = | mean_t sign( Im( z_x(t) * conj(z_y(t)) ) ) |
+//
+// Returns values in [0, 1]. 0 means symmetric lead/lag (or purely zero-lag);
+// 1 means a perfectly consistent non-zero phase lead/lag.
+double compute_pli(const std::vector<float>& x,
+                   const std::vector<float>& y,
+                   double fs_hz,
+                   const BandDefinition& band,
+                   const PlvOptions& opt = {});
+
+// Weighted Phase Lag Index (wPLI)
+//
+// wPLI weights each sample by the magnitude of the imaginary component, which
+// can improve robustness to noise relative to PLI:
+//   wPLI = | sum_t Im( z_x(t) * conj(z_y(t)) ) | / sum_t | Im( z_x(t) * conj(z_y(t)) ) |
+//
+// Returns values in [0, 1]. If the denominator is ~0 (e.g., purely zero-lag),
+// the function returns 0.
+double compute_wpli(const std::vector<float>& x,
+                    const std::vector<float>& y,
+                    double fs_hz,
+                    const BandDefinition& band,
+                    const PlvOptions& opt = {});
+
+// Compute symmetric PLI / wPLI matrices for a multi-channel recording.
+//
+// The diagonal is set to 0 (self-coupling is not meaningful for these metrics).
+std::vector<std::vector<double>> compute_pli_matrix(const std::vector<std::vector<float>>& channels,
+                                                    double fs_hz,
+                                                    const BandDefinition& band,
+                                                    const PlvOptions& opt = {});
+
+std::vector<std::vector<double>> compute_wpli_matrix(const std::vector<std::vector<float>>& channels,
+                                                     double fs_hz,
+                                                     const BandDefinition& band,
+                                                     const PlvOptions& opt = {});
 
 } // namespace qeeg

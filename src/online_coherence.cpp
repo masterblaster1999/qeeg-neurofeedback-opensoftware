@@ -130,6 +130,7 @@ OnlineCoherenceFrame OnlineWelchCoherence::compute_frame() const {
   fr.bands = bands_;
   fr.pairs = pairs_;
   fr.pair_names = pair_names_;
+  fr.measure = opt_.measure;
   fr.t_end_sec = static_cast<double>(total_samples_) / fs_hz_;
 
   // Extract windowed signals once.
@@ -144,13 +145,14 @@ OnlineCoherenceFrame OnlineWelchCoherence::compute_frame() const {
   for (size_t p = 0; p < pairs_.size(); ++p) {
     const int ia = pairs_[p].first;
     const int ib = pairs_[p].second;
-    const auto coh = welch_coherence(windowed[static_cast<size_t>(ia)],
-                                    windowed[static_cast<size_t>(ib)],
-                                    fs_hz_,
-                                    opt_.welch);
+    const auto spec = welch_coherence_spectrum(windowed[static_cast<size_t>(ia)],
+                                               windowed[static_cast<size_t>(ib)],
+                                               fs_hz_,
+                                               opt_.welch,
+                                               opt_.measure);
 
     for (size_t b = 0; b < bands_.size(); ++b) {
-      const double v = average_band_coherence(coh, bands_[b]);
+      const double v = average_band_value(spec, bands_[b]);
       fr.coherences[b][p] = std::isfinite(v) ? v : 0.0;
     }
   }

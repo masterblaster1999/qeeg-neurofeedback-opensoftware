@@ -1,4 +1,5 @@
 #include "qeeg/annotations.hpp"
+#include "qeeg/baseline.hpp"
 #include "qeeg/bandpower.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -32,6 +34,13 @@ struct Args {
   // Epoch extraction
   double offset_sec{0.0};
   double window_sec{0.0}; // if >0, override event duration
+
+  // Optional baseline normalization (per-event, per-channel, per-band).
+  // If baseline_sec > 0, we compute bandpower on a baseline window that ends
+  // at (epoch_start_sec - baseline_gap_sec).
+  double baseline_sec{0.0};
+  double baseline_gap_sec{0.0};
+  std::string baseline_mode{"rel"}; // ratio|rel|logratio|db
 
   // Event selection
   std::string event_glob;
@@ -61,7 +70,9 @@ static void print_help() {
     << "Outputs:\n"
     << "  events.csv\n"
     << "  epoch_bandpowers.csv (long format: one row per event x channel x band)\n"
-    << "  epoch_bandpowers_summary.csv (mean across processed epochs)\n\n"
+    << "  epoch_bandpowers_summary.csv (mean across processed epochs)\n"
+    << "  (optional) epoch_bandpowers_norm.csv (baseline-normalized values; when --baseline is used)\n"
+    << "  (optional) epoch_bandpowers_norm_summary.csv (mean baseline-normalized values; when --baseline is used)\n\n"
     << "Options:\n"
     << "  --input PATH             Input EDF/BDF/CSV (CSV requires --fs)\n"
     << "  --fs HZ                  Sampling rate for CSV\n"
@@ -72,6 +83,9 @@ static void print_help() {
     << "  --overlap FRAC           Welch overlap fraction in [0,1) (default: 0.5)\n"
     << "  --offset SEC             Epoch start offset relative to event onset (default: 0)\n"
     << "  --window SEC             Fixed epoch window length. If omitted, uses event duration.\n"
+    << "  --baseline SEC           Baseline duration ending at epoch start (default: 0; disabled)\n"
+    << "  --baseline-gap SEC       Gap between baseline end and epoch start (default: 0)\n"
+    << "  --baseline-mode MODE     Baseline normalization: ratio|rel|logratio|db (default: rel)\n"
     << "  --event-glob PATTERN      Only keep events whose text matches PATTERN (* and ? wildcards)\n"
     << "  --event-regex REGEX       Alias for --event-glob (NOTE: this is a glob, not a full regex)\n"
     << "  --event-contains STR      Only keep events whose text contains STR\n"
@@ -109,6 +123,12 @@ static Args parse_args(int argc, char** argv) {
       a.offset_sec = to_double(argv[++i]);
     } else if (arg == "--window" && i + 1 < argc) {
       a.window_sec = to_double(argv[++i]);
+    } else if (arg == "--baseline" && i + 1 < argc) {
+      a.baseline_sec = to_double(argv[++i]);
+    } else if (arg == "--baseline-gap" && i + 1 < argc) {
+      a.baseline_gap_sec = to_double(argv[++i]);
+    } else if (arg == "--baseline-mode" && i + 1 < argc) {
+      a.baseline_mode = argv[++i];
     } else if ((arg == "--event-glob" || arg == "--event-regex") && i + 1 < argc) {
       a.event_glob = argv[++i];
     } else if (arg == "--event-contains" && i + 1 < argc) {
@@ -335,6 +355,26 @@ int main(int argc, char** argv) {
     };
     std::unordered_map<std::string, Acc> accum; // key = channel|band
 
+    const bool do_baseline = (a.baseline_sec > 0.0);
+    BaselineNormMode baseline_mode = BaselineNormMode::RelativeChange;
+    if (do_baseline) {
+      if (a.baseline_gap_sec < 0.0) {
+        throw std::runtime_error("--baseline-gap must be >= 0");
+      }
+      if (!parse_baseline_norm_mode(a.baseline_mode, &baseline_mode)) {
+        throw std::runtime_error("Invalid --baseline-mode: " + a.baseline_mode + " (expected ratio|rel|logratio|db)");
+      }
+    }
+
+    const std::string baseline_mode_str = baseline_mode_name(baseline_mode);
+
+    std::ofstream fnorm;
+    std::unordered_map<std::string, Acc> accum_norm; // key = channel|band
+    if (do_baseline) {
+      fnorm.open(a.outdir + "/epoch_bandpowers_norm.csv");
+      fnorm << "event_id,onset_sec,duration_sec,epoch_start_sec,epoch_end_sec,baseline_start_sec,baseline_end_sec,text,channel,band,epoch_power,baseline_power,mode,norm_value\n";
+    }
+
     const double fs = rec.fs_hz;
     const size_t total_samples = rec.n_samples();
     const double total_dur = (fs > 0.0) ? (static_cast<double>(total_samples) / fs) : 0.0;
@@ -366,6 +406,24 @@ int main(int argc, char** argv) {
       const size_t i1 = std::min(total_samples, time_to_index_ceil(end_c, fs));
       if (i1 <= i0 + 1) continue;
 
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+      double baseline_start_c = 0.0;
+      double baseline_end_c = 0.0;
+      size_t ib0 = 0;
+      size_t ib1 = 0;
+      bool baseline_valid = false;
+      if (do_baseline) {
+        const double baseline_end = start_c - a.baseline_gap_sec;
+        const double baseline_start = baseline_end - a.baseline_sec;
+        baseline_start_c = std::max(0.0, baseline_start);
+        baseline_end_c = std::min(total_dur, std::max(0.0, baseline_end));
+        if (baseline_end_c > baseline_start_c) {
+          ib0 = time_to_index_floor(baseline_start_c, fs);
+          ib1 = std::min(total_samples, time_to_index_ceil(baseline_end_c, fs));
+          baseline_valid = (ib1 > ib0 + 1);
+        }
+      }
+
       // For each channel: Welch PSD + integrate bands.
       for (size_t ch = 0; ch < rec.channel_names.size(); ++ch) {
         std::vector<float> seg;
@@ -374,6 +432,19 @@ int main(int argc, char** argv) {
         if (seg.empty()) continue;
 
         const PsdResult psd = welch_psd(seg, fs, wopt);
+
+        PsdResult psd_baseline;
+        bool have_baseline = false;
+        if (do_baseline && baseline_valid) {
+          std::vector<float> seg_base;
+          seg_base.assign(rec.data[ch].begin() + static_cast<std::ptrdiff_t>(ib0),
+                          rec.data[ch].begin() + static_cast<std::ptrdiff_t>(ib1));
+          if (seg_base.size() > 1) {
+            psd_baseline = welch_psd(seg_base, fs, wopt);
+            have_baseline = true;
+          }
+        }
+
         for (const auto& b : bands) {
           const double p = integrate_bandpower(psd, b.fmin_hz, b.fmax_hz);
           fb << ei << "," << ev.onset_sec << "," << ev.duration_sec << "," << start_c << "," << end_c << ","
@@ -383,6 +454,25 @@ int main(int argc, char** argv) {
           Acc& ac = accum[key];
           ac.sum += p;
           ac.n += 1;
+
+          if (do_baseline) {
+            double p_base = nan;
+            double norm = nan;
+            if (have_baseline) {
+              p_base = integrate_bandpower(psd_baseline, b.fmin_hz, b.fmax_hz);
+              norm = baseline_normalize(p, p_base, baseline_mode);
+            }
+            fnorm << ei << "," << ev.onset_sec << "," << ev.duration_sec << "," << start_c << "," << end_c
+                  << "," << baseline_start_c << "," << baseline_end_c << "," << csv_escape(ev.text) << ","
+                  << rec.channel_names[ch] << "," << b.name << "," << p << "," << p_base << "," << baseline_mode_str
+                  << "," << norm << "\n";
+
+            if (std::isfinite(norm)) {
+              Acc& an = accum_norm[key];
+              an.sum += norm;
+              an.n += 1;
+            }
+          }
         }
       }
 
@@ -408,10 +498,34 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Optional baseline-normalized summary CSV
+    if (do_baseline) {
+      std::ofstream fsu(a.outdir + "/epoch_bandpowers_norm_summary.csv");
+      fsu << "channel,band,mode,mean_value,n_epochs\n";
+
+      std::vector<std::string> keys;
+      keys.reserve(accum_norm.size());
+      for (const auto& kv : accum_norm) keys.push_back(kv.first);
+      std::sort(keys.begin(), keys.end());
+      for (const auto& k : keys) {
+        const auto& ac = accum_norm[k];
+        if (ac.n == 0) continue;
+        const auto parts = split(k, '|');
+        const std::string ch = (parts.size() >= 1) ? parts[0] : k;
+        const std::string band = (parts.size() >= 2) ? parts[1] : "";
+        fsu << ch << "," << band << "," << baseline_mode_str << "," << (ac.sum / static_cast<double>(ac.n))
+            << "," << ac.n << "\n";
+      }
+    }
+
     std::cout << "Loaded " << rec.channel_names.size() << " channels, fs=" << rec.fs_hz << " Hz\n";
     std::cout << "Found " << events.size() << " events (exported to events.csv)\n";
     std::cout << "Processed " << n_used_events << " matching events\n";
     std::cout << "Wrote epoch_bandpowers.csv and epoch_bandpowers_summary.csv to: " << a.outdir << "\n";
+    if (do_baseline) {
+      std::cout << "Wrote epoch_bandpowers_norm.csv and epoch_bandpowers_norm_summary.csv (mode="
+                << baseline_mode_str << ") to: " << a.outdir << "\n";
+    }
 
     return 0;
   } catch (const std::exception& e) {

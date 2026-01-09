@@ -25,7 +25,7 @@ A small, dependency-light **C++17** project that:
   - Optional preprocessing: common average reference (CAR), IIR notch, simple bandpass; offline CLIs can run forward-backward (zero-phase) filtering
 
 - **Topomap**
-  - Built-in approximate **10–20 19-channel** 2D layout
+  - Built-in approximate **10–20 19-channel** 2D layout (supports both modern **T7/T8/P7/P8** and legacy **T3/T4/T5/T6** labels)
   - Optional montage CSV file: `name,x,y` (unit circle coordinates)
   - Inverse-distance weighting (IDW) **or** Perrin-style **spherical spline** interpolation onto a grid
 
@@ -140,6 +140,34 @@ than raw power):
 ./build/qeeg_reference_cli --list recordings.txt --outdir out_ref --log10
 ```
 
+When using a reference built with `--log10`, compute maps on the same scale.
+You can either pass `--log10` to `qeeg_map_cli`, or rely on the reference
+metadata (if present) to auto-enable log10 mode when `--reference` is used.
+
+Optional: compute stats over **relative bandpower** (band / total power within
+a frequency range). This yields dimensionless fractions and can help reduce
+between-subject amplitude differences:
+
+```bash
+./build/qeeg_reference_cli --list recordings.txt --outdir out_ref --relative --relative-range 1 45
+```
+
+When using a reference built with `--relative`, compute maps on the same scale.
+You can either pass `--relative` (and the same `--relative-range`) to
+`qeeg_map_cli`, or rely on the reference metadata (if present) to auto-enable
+relative mode when `--reference` is used.
+
+You can combine `--relative` and `--log10` (log10 is applied *after* the
+relative normalization).
+
+Optional: build a more **robust** reference (median + MAD-derived scale) instead
+of mean/std (still written as `mean,std` columns for compatibility with
+`--reference`):
+
+```bash
+./build/qeeg_reference_cli --list recordings.txt --outdir out_ref --robust
+```
+
 ### Optional preprocessing (CAR + filters)
 
 All CLIs support `--average-reference`. In addition:
@@ -226,10 +254,15 @@ When OSC is enabled, the CLI also emits:
 - `${prefix}/artifact` (int32 0/1)
 - `${prefix}/artifact_bad_channels` (int32)
 
-Coherence neurofeedback example:
+Coherence neurofeedback examples:
 
 ```bash
+# Magnitude-squared coherence (MSC)
 ./build/qeeg_nf_cli --input path/to/recording.edf --outdir out_nf_coh --metric coh:alpha:F3:F4 \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 --export-coherence
+
+# Imaginary coherency (abs(imag(coherency)))
+./build/qeeg_nf_cli --input path/to/recording.edf --outdir out_nf_imcoh --metric imcoh:alpha:F3:F4 \
   --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 --export-coherence
 ```
 
@@ -248,7 +281,7 @@ PAC neurofeedback examples:
 Outputs:
 - `nf_feedback.csv` — time series of metric, threshold and reward
 - (optional) `bandpower_timeseries.csv` — all bands/channels per update (bandpower mode)
-- (optional) `coherence_timeseries.csv` — all bands for the chosen pair per update (coherence mode)
+- (optional) `coherence_timeseries.csv` or `imcoh_timeseries.csv` — all bands for the chosen pair per update (coherence/imcoh mode)
 - (optional) `artifact_gate_timeseries.csv` — artifact gate aligned to NF updates (when `--export-artifacts`)
 - (optional) `nf_reward.wav` — a simple reward-tone audio track (mono PCM16). Use `--audio-wav nf_reward.wav`.
 
@@ -260,18 +293,39 @@ Compute an **alpha-band** coherence matrix for all channel pairs:
 ./build/qeeg_coherence_cli --input path/to/recording.edf --outdir out_coh --band alpha
 ```
 
+Compute the **absolute imaginary part of coherency** ("imcoh") to reduce
+spurious zero-lag coupling (often attributed to volume conduction / field
+spread):
+
+```bash
+./build/qeeg_coherence_cli --input path/to/recording.edf --outdir out_imcoh --band alpha --measure imcoh
+```
+
 Compute **one pair** (and optionally export the full spectrum):
 
 ```bash
 ./build/qeeg_coherence_cli --input path/to/recording.edf --outdir out_pair --band alpha --pair F3:F4 --export-spectrum
 ```
 
-### 7b) Connectivity: phase locking value (PLV)
+### 7b) Connectivity: phase-based (PLV / PLI / wPLI)
 
-Compute a **PLV** matrix (phase-based connectivity) for all channel pairs:
+Compute phase-based connectivity for all channel pairs.
+
+Available measures:
+- `plv` (default): Phase Locking Value (sensitive to zero-lag coupling)
+- `pli`: Phase Lag Index (counts consistent non-zero lag)
+- `wpli`: Weighted Phase Lag Index (PLI weighted by the magnitude of the imaginary component; often more robust to noise)
+
+Compute a **PLV** matrix for all channel pairs:
 
 ```bash
 ./build/qeeg_plv_cli --input path/to/recording.edf --outdir out_plv --band alpha
+```
+
+Compute a **wPLI** matrix (often used to reduce spurious zero-lag coupling):
+
+```bash
+./build/qeeg_plv_cli --input path/to/recording.edf --outdir out_wpli --band alpha --measure wpli
 ```
 
 Compute **one pair**:
@@ -336,12 +390,24 @@ bandpower features per event/epoch:
 # Use a fixed 1.0s window starting 0.2s after each matching event
 ./build/qeeg_epoch_cli --input path/to/recording.edf --outdir out_epochs \
   --event-glob "*Stim*" --offset 0.2 --window 1.0
+
+# Optional: baseline-normalize epoch bandpowers relative to a pre-epoch baseline.
+# The baseline window ends at the epoch start; add --baseline-gap to leave a small gap.
+# Available modes:
+#  - ratio    : epoch / baseline
+#  - rel      : (epoch - baseline) / baseline
+#  - logratio : log10(epoch / baseline)
+#  - db       : 10*log10(epoch / baseline)
+./build/qeeg_epoch_cli --input path/to/recording.edf --outdir out_epochs_norm \
+  --event-glob "*Stim*" --offset 0.2 --window 1.0 --baseline 1.0 --baseline-gap 0.1 --baseline-mode db
 ```
 
 Outputs:
 - `events.csv` — exported event list
 - `epoch_bandpowers.csv` — long-format table of (event × channel × band)
 - `epoch_bandpowers_summary.csv` — mean power per channel/band across processed epochs
+- (optional) `epoch_bandpowers_norm.csv` — baseline-normalized values (when `--baseline` is used)
+- (optional) `epoch_bandpowers_norm_summary.csv` — mean baseline-normalized values (when `--baseline` is used)
 
 ### 11) Artifact window detection (first pass)
 
@@ -388,12 +454,15 @@ The CLI also writes a small helper file `iaf_band_spec.txt` containing a
 simple **IAF-relative band spec** you can pass into other CLIs that accept
 `--bands` (e.g., `qeeg_nf_cli`, `qeeg_map_cli`).
 
+Tip: you can also point `--bands` to a text file by prefixing the path with `@`
+(one band per line or comma-separated), e.g. `--bands @out_iaf/iaf_band_spec.txt`.
+
 ```bash
 # Example: compute IAF, then run NF using IAF-relative alpha band
 ./build/qeeg_iaf_cli --input recording.edf --outdir out_iaf
 
 ./build/qeeg_nf_cli --input recording.edf --outdir out_nf \
-  --bands "$(cat out_iaf/iaf_band_spec.txt)" --metric alpha:Pz
+  --bands @out_iaf/iaf_band_spec.txt --metric alpha:Pz
 ```
 
 ### 13) EEG microstates (first pass)
@@ -415,6 +484,9 @@ Outputs:
 - `topomap_microstate_<state>.bmp` — template topomap per microstate
 - `microstate_timeseries.csv` — per-sample label + GFP + correlation to template
 - `microstate_transition_counts.csv` — segment-to-segment transition count matrix
+- `microstate_transition_probs.csv` — segment-to-segment transition **probabilities** (row-normalized from the count matrix)
+- `microstate_state_stats.csv` — per-state coverage, mean duration, and occurrence rate (CSV)
+- `microstate_segments.csv` — optional segment list (enabled with `--export-segments`)
 - `microstate_summary.txt` — parameters + Global Explained Variance (GEV) and per-state coverage/duration/occurrence
 
 ### Topomap interpolation
