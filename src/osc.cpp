@@ -35,6 +35,18 @@ static void append_u32_be(std::vector<uint8_t>* out, uint32_t v) {
   out->push_back(static_cast<uint8_t>((v >> 0) & 0xFF));
 }
 
+static void append_u64_be(std::vector<uint8_t>* out, uint64_t v) {
+  if (!out) return;
+  out->push_back(static_cast<uint8_t>((v >> 56) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 48) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 40) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 32) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 0) & 0xFF));
+}
+
 static void append_i32_be(std::vector<uint8_t>* out, int32_t v) {
   append_u32_be(out, static_cast<uint32_t>(v));
 }
@@ -107,6 +119,49 @@ std::vector<uint8_t> OscMessage::to_bytes() const {
   append_padded_string(&out, address_);
   append_padded_string(&out, typetags_);
   out.insert(out.end(), args_.begin(), args_.end());
+
+  while ((out.size() % 4) != 0) out.push_back(0);
+  return out;
+}
+
+OscBundle::OscBundle(uint64_t timetag) : timetag_(timetag) {}
+
+void OscBundle::set_timetag(uint64_t timetag) {
+  timetag_ = timetag;
+}
+
+void OscBundle::set_timetag_immediate() {
+  timetag_ = 1;
+}
+
+void OscBundle::clear() {
+  elements_.clear();
+}
+
+void OscBundle::add_message(const OscMessage& msg) {
+  elements_.push_back(msg.to_bytes());
+}
+
+void OscBundle::add_bytes(const std::vector<uint8_t>& element) {
+  if (!element.empty() && (element.size() % 4) != 0) {
+    throw std::runtime_error("OscBundle: element size must be a multiple of 4 bytes");
+  }
+  elements_.push_back(element);
+}
+
+std::vector<uint8_t> OscBundle::to_bytes() const {
+  std::vector<uint8_t> out;
+  out.reserve(16 + elements_.size() * 32);
+
+  // OSC bundle header.
+  append_padded_string(&out, "#bundle");
+  append_u64_be(&out, timetag_);
+
+  // Elements: [u32 size][element bytes]
+  for (const auto& el : elements_) {
+    append_u32_be(&out, static_cast<uint32_t>(el.size()));
+    out.insert(out.end(), el.begin(), el.end());
+  }
 
   while ((out.size() % 4) != 0) out.push_back(0);
   return out;
@@ -210,6 +265,10 @@ std::string OscUdpClient::last_error() const {
 
 bool OscUdpClient::send(const OscMessage& msg) {
   return send_bytes(msg.to_bytes());
+}
+
+bool OscUdpClient::send(const OscBundle& bundle) {
+  return send_bytes(bundle.to_bytes());
 }
 
 bool OscUdpClient::send_bytes(const std::vector<uint8_t>& bytes) {

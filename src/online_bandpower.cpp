@@ -42,6 +42,11 @@ static size_t sec_to_samples(double sec, double fs_hz) {
   return static_cast<size_t>(std::llround(sec * fs_hz));
 }
 
+static bool user_specified_range(double fmin_hz, double fmax_hz) {
+  // Keep the sentinel simple and ABI-friendly: (0,0) means "unspecified".
+  return (fmin_hz != 0.0 || fmax_hz != 0.0);
+}
+
 OnlineWelchBandpower::OnlineWelchBandpower(std::vector<std::string> channel_names,
                                            double fs_hz,
                                            std::vector<BandDefinition> bands,
@@ -52,13 +57,26 @@ OnlineWelchBandpower::OnlineWelchBandpower(std::vector<std::string> channel_name
       opt_(opt) {
   if (channel_names_.empty()) throw std::runtime_error("OnlineWelchBandpower: need at least 1 channel");
   if (fs_hz_ <= 0.0) throw std::runtime_error("OnlineWelchBandpower: fs_hz must be > 0");
+  if (!(opt_.window_seconds > 0.0)) throw std::runtime_error("OnlineWelchBandpower: window_seconds must be > 0");
+  if (!(opt_.update_seconds > 0.0)) throw std::runtime_error("OnlineWelchBandpower: update_seconds must be > 0");
   if (bands_.empty()) bands_ = default_eeg_bands();
+
+  if (opt_.relative_power && user_specified_range(opt_.relative_fmin_hz, opt_.relative_fmax_hz)) {
+    if (opt_.relative_fmin_hz < 0.0) {
+      throw std::runtime_error("OnlineWelchBandpower: relative_fmin_hz must be >= 0");
+    }
+    if (!(opt_.relative_fmax_hz > opt_.relative_fmin_hz)) {
+      throw std::runtime_error("OnlineWelchBandpower: relative range must satisfy fmin < fmax");
+    }
+  }
 
   window_samples_ = sec_to_samples(opt_.window_seconds, fs_hz_);
   if (window_samples_ < 8) window_samples_ = 8;
 
   update_samples_ = sec_to_samples(opt_.update_seconds, fs_hz_);
   if (update_samples_ < 1) update_samples_ = 1;
+  // Match OnlineWelchCoherence behavior: if update interval > window, clamp to window.
+  if (update_samples_ > window_samples_) update_samples_ = window_samples_;
 
   rings_.reserve(channel_names_.size());
   for (size_t c = 0; c < channel_names_.size(); ++c) {
@@ -71,8 +89,32 @@ OnlineBandpowerFrame OnlineWelchBandpower::compute_frame() const {
   fr.t_end_sec = static_cast<double>(total_samples_) / fs_hz_;
   fr.channel_names = channel_names_;
   fr.bands = bands_;
+
+  fr.relative_power = opt_.relative_power;
+  fr.log10_power = opt_.log10_power;
+
+  double rel_lo = 0.0;
+  double rel_hi = 0.0;
+  if (opt_.relative_power) {
+    if (user_specified_range(opt_.relative_fmin_hz, opt_.relative_fmax_hz)) {
+      rel_lo = opt_.relative_fmin_hz;
+      rel_hi = opt_.relative_fmax_hz;
+    } else {
+      // Default: cover the full band range.
+      rel_lo = bands_.front().fmin_hz;
+      rel_hi = bands_.front().fmax_hz;
+      for (const auto& b : bands_) {
+        rel_lo = std::min(rel_lo, b.fmin_hz);
+        rel_hi = std::max(rel_hi, b.fmax_hz);
+      }
+    }
+    fr.relative_fmin_hz = rel_lo;
+    fr.relative_fmax_hz = rel_hi;
+  }
+
   fr.powers.assign(bands_.size(), std::vector<double>(channel_names_.size(), 0.0));
 
+  const double eps = 1e-20;
   std::vector<float> window;
   window.reserve(window_samples_);
 
@@ -81,8 +123,21 @@ OnlineBandpowerFrame OnlineWelchBandpower::compute_frame() const {
     if (window.empty()) throw std::runtime_error("OnlineWelchBandpower: internal window extraction failed");
 
     const PsdResult psd = welch_psd(window, fs_hz_, opt_.welch);
+
+    double total_power = 1.0;
+    if (opt_.relative_power) {
+      total_power = integrate_bandpower(psd, rel_lo, rel_hi);
+    }
+
     for (size_t b = 0; b < bands_.size(); ++b) {
-      fr.powers[b][c] = integrate_bandpower(psd, bands_[b].fmin_hz, bands_[b].fmax_hz);
+      double v = integrate_bandpower(psd, bands_[b].fmin_hz, bands_[b].fmax_hz);
+      if (opt_.relative_power) {
+        v = v / std::max(eps, total_power);
+      }
+      if (opt_.log10_power) {
+        v = std::log10(std::max(eps, v));
+      }
+      fr.powers[b][c] = v;
     }
   }
 

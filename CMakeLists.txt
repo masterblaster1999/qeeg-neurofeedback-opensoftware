@@ -216,6 +216,14 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_nf_metric_spec PRIVATE qeeg)
   add_test(NAME qeeg_test_nf_metric_spec COMMAND qeeg_test_nf_metric_spec)
 
+  add_executable(qeeg_test_nf_threshold tests/test_nf_threshold.cpp)
+  target_link_libraries(qeeg_test_nf_threshold PRIVATE qeeg)
+  add_test(NAME qeeg_test_nf_threshold COMMAND qeeg_test_nf_threshold)
+
+  add_executable(qeeg_test_nf_metric_eval tests/test_nf_metric_eval.cpp)
+  target_link_libraries(qeeg_test_nf_metric_eval PRIVATE qeeg)
+  add_test(NAME qeeg_test_nf_metric_eval COMMAND qeeg_test_nf_metric_eval)
+
   add_executable(qeeg_test_band_spec_file tests/test_band_spec_file.cpp)
   target_link_libraries(qeeg_test_band_spec_file PRIVATE qeeg)
   add_test(NAME qeeg_test_band_spec_file COMMAND qeeg_test_band_spec_file)

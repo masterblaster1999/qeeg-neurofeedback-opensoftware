@@ -6,6 +6,8 @@
 #include "qeeg/online_artifacts.hpp"
 #include "qeeg/online_pac.hpp"
 #include "qeeg/nf_metric.hpp"
+#include "qeeg/nf_metric_eval.hpp"
+#include "qeeg/nf_threshold.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/wav_writer.hpp"
@@ -13,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -49,8 +52,19 @@ struct Args {
   size_t nperseg{512};
   double overlap{0.5};
 
+  // Bandpower scaling options (bandpower/ratio metrics only)
+  // - --relative: band_power / total_power within a frequency range
+  // - --log10: apply log10(max(eps, value)) after any optional relative normalization
+  bool log10_power{false};
+  bool relative_power{false};
+  double relative_fmin_hz{0.0};
+  double relative_fmax_hz{0.0};
+
   // Neurofeedback threshold params
+  // Initial threshold is estimated from the first --baseline seconds unless overridden by --threshold.
   double baseline_seconds{10.0};
+  double initial_threshold{std::numeric_limits<double>::quiet_NaN()}; // NaN => use baseline
+  RewardDirection reward_direction{RewardDirection::Above};
   double target_reward_rate{0.6};
   double adapt_eta{0.10};
   double reward_rate_window_seconds{5.0};
@@ -117,7 +131,13 @@ static void print_help() {
     << "  --update S                Update interval seconds (default: 0.25)\n"
     << "  --nperseg N               Welch segment length (default: 512)\n"
     << "  --overlap FRAC            Welch overlap fraction in [0,1) (default: 0.5)\n"
+    << "  --log10                   Use log10(power) instead of raw bandpower (bandpower/ratio metrics only)\n"
+    << "  --relative                Use relative power: band_power / total_power (bandpower/ratio metrics only)\n"
+    << "  --relative-range LO HI    Total-power integration range used for --relative.\n"
+    << "                           Default: [min_band_fmin, max_band_fmax] from --bands.\n"
     << "  --baseline S              Baseline duration seconds for initial threshold (default: 10)\n"
+    << "  --threshold X             Set an explicit initial threshold (skips baseline threshold estimation)\n"
+    << "  --reward-direction DIR    Reward direction: above|below (default: above)\n"
     << "  --target-rate R           Target reward rate in (0,1) (default: 0.6)\n"
     << "  --eta E                   Adaptation speed (default: 0.10)\n"
     << "  --rate-window S           Reward-rate window seconds (default: 5)\n"
@@ -144,7 +164,7 @@ static void print_help() {
     << "  --osc-host HOST            Optional: OSC/UDP destination host (default: 127.0.0.1)\n"
     << "  --osc-port PORT            Optional: OSC/UDP destination port (0 disables; e.g. 9000)\n"
     << "  --osc-prefix PATH          OSC address prefix (default: /qeeg)\n"
-    << "  --osc-mode MODE            OSC mode: state|split (default: state)\n"
+    << "  --osc-mode MODE            OSC mode: state|split|bundle (default: state)\n"
     << "  --pac-bins N              PAC: #phase bins for MI (default: 18)\n"
     << "  --pac-trim FRAC           PAC: edge trim fraction per window (default: 0.10)\n"
     << "  --pac-zero-phase          PAC: use zero-phase bandpass filters (default: off)\n"
@@ -178,8 +198,24 @@ static Args parse_args(int argc, char** argv) {
       a.nperseg = static_cast<size_t>(to_int(argv[++i]));
     } else if (arg == "--overlap" && i + 1 < argc) {
       a.overlap = to_double(argv[++i]);
+    } else if (arg == "--log10") {
+      a.log10_power = true;
+    } else if (arg == "--relative") {
+      a.relative_power = true;
+    } else if (arg == "--relative-range" && i + 2 < argc) {
+      a.relative_power = true;
+      a.relative_fmin_hz = to_double(argv[++i]);
+      a.relative_fmax_hz = to_double(argv[++i]);
     } else if (arg == "--baseline" && i + 1 < argc) {
       a.baseline_seconds = to_double(argv[++i]);
+    } else if (arg == "--threshold" && i + 1 < argc) {
+      a.initial_threshold = to_double(argv[++i]);
+    } else if (arg == "--reward-direction" && i + 1 < argc) {
+      a.reward_direction = parse_reward_direction(argv[++i]);
+    } else if (arg == "--reward-below") {
+      a.reward_direction = RewardDirection::Below;
+    } else if (arg == "--reward-above") {
+      a.reward_direction = RewardDirection::Above;
     } else if (arg == "--target-rate" && i + 1 < argc) {
       a.target_reward_rate = to_double(argv[++i]);
     } else if (arg == "--eta" && i + 1 < argc) {
@@ -260,6 +296,32 @@ static std::string resolve_out_path(const std::string& outdir, const std::string
   }
   return path_or_name;
 }
+
+static std::string json_escape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20) {
+          char buf[7];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(uc));
+          out += buf;
+        } else {
+          out.push_back(c);
+        }
+      } break;
+    }
+  }
+  return out;
+}
+
 
 static void write_reward_tone_wav_if_requested(const Args& args,
                                               const std::vector<int>& reward_flags) {
@@ -348,6 +410,16 @@ static void osc_send_info(OscUdpClient* osc, const std::string& prefix, const Ar
     OscMessage m2(prefix + "/fs");
     m2.add_float32(static_cast<float>(fs_hz));
     osc->send(m2);
+
+    OscMessage m3(prefix + "/reward_direction");
+    m3.add_string(reward_direction_name(args.reward_direction));
+    osc->send(m3);
+
+    if (std::isfinite(args.initial_threshold)) {
+      OscMessage m4(prefix + "/threshold_init");
+      m4.add_float32(static_cast<float>(args.initial_threshold));
+      osc->send(m4);
+    }
   } catch (...) {
     // best-effort
   }
@@ -389,6 +461,37 @@ static void osc_send_state(OscUdpClient* osc,
       mht.add_int32(have_threshold);
       osc->send(mht);
 
+      return;
+    }
+
+    if (mode == "bundle") {
+      OscBundle b;
+
+      OscMessage mt(prefix + "/time");
+      mt.add_float32(static_cast<float>(t_end_sec));
+      b.add_message(mt);
+
+      OscMessage mm(prefix + "/metric");
+      mm.add_float32(static_cast<float>(metric));
+      b.add_message(mm);
+
+      OscMessage mth(prefix + "/threshold");
+      mth.add_float32(static_cast<float>(threshold));
+      b.add_message(mth);
+
+      OscMessage mr(prefix + "/reward");
+      mr.add_int32(reward);
+      b.add_message(mr);
+
+      OscMessage mrr(prefix + "/reward_rate");
+      mrr.add_float32(static_cast<float>(reward_rate));
+      b.add_message(mrr);
+
+      OscMessage mht(prefix + "/have_threshold");
+      mht.add_int32(have_threshold);
+      b.add_message(mht);
+
+      osc->send(b);
       return;
     }
 
@@ -570,13 +673,9 @@ static double compute_metric_band_or_ratio(const OnlineBandpowerFrame& fr,
                                           int b_den) {
   const size_t c = static_cast<size_t>(ch_idx);
   if (spec.type == NfMetricSpec::Type::Band) {
-    return fr.powers[static_cast<size_t>(b_idx)][c];
+    return nf_eval_metric_band_or_ratio(fr, spec, c, static_cast<size_t>(b_idx), 0, 0);
   }
-  // Ratio
-  const double eps = 1e-12;
-  const double num = fr.powers[static_cast<size_t>(b_num)][c];
-  const double den = fr.powers[static_cast<size_t>(b_den)][c];
-  return (num + eps) / (den + eps);
+  return nf_eval_metric_band_or_ratio(fr, spec, c, 0, static_cast<size_t>(b_num), static_cast<size_t>(b_den));
 }
 
 static double median(std::vector<double> v) {
@@ -612,6 +711,14 @@ int main(int argc, char** argv) {
     if (args.adapt_eta < 0.0) {
       throw std::runtime_error("--eta must be >= 0");
     }
+    if (args.relative_power && (args.relative_fmin_hz != 0.0 || args.relative_fmax_hz != 0.0)) {
+      if (args.relative_fmin_hz < 0.0) {
+        throw std::runtime_error("--relative-range LO must be >= 0");
+      }
+      if (!(args.relative_fmax_hz > args.relative_fmin_hz)) {
+        throw std::runtime_error("--relative-range must satisfy LO < HI");
+      }
+    }
     if (args.artifact_min_bad_channels < 1) {
       throw std::runtime_error("--artifact-min-bad-ch must be >= 1");
     }
@@ -632,6 +739,41 @@ int main(int argc, char** argv) {
     std::cout << "Loaded recording: " << rec.n_channels() << " channels, "
               << rec.n_samples() << " samples, fs=" << rec.fs_hz << " Hz\n";
 
+    // Convenience: write run parameters to JSON for easy downstream parsing.
+    {
+      const std::string meta_path = args.outdir + "/nf_run_meta.json";
+      std::ofstream meta(meta_path);
+      if (!meta) {
+        std::cerr << "Warning: failed to write " << meta_path << "\n";
+      } else {
+        meta << "{\n";
+        meta << "  \"demo\": " << (args.demo ? "true" : "false") << ",\n";
+        meta << "  \"input_path\": \"" << json_escape(args.input_path) << "\",\n";
+        meta << "  \"fs_hz\": " << rec.fs_hz << ",\n";
+        meta << "  \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
+        meta << "  \"band_spec\": \"" << json_escape(args.band_spec) << "\",\n";
+        meta << "  \"reward_direction\": \"" << reward_direction_name(args.reward_direction) << "\",\n";
+        meta << "  \"threshold_init\": ";
+        if (std::isfinite(args.initial_threshold)) meta << args.initial_threshold;
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"baseline_seconds\": " << args.baseline_seconds << ",\n";
+        meta << "  \"target_reward_rate\": " << args.target_reward_rate << ",\n";
+        meta << "  \"adapt_eta\": " << args.adapt_eta << ",\n";
+        meta << "  \"reward_rate_window_seconds\": " << args.reward_rate_window_seconds << ",\n";
+        meta << "  \"window_seconds\": " << args.window_seconds << ",\n";
+        meta << "  \"update_seconds\": " << args.update_seconds << ",\n";
+        meta << "  \"nperseg\": " << args.nperseg << ",\n";
+        meta << "  \"log10_power\": " << (args.log10_power ? "true" : "false") << ",\n";
+        meta << "  \"relative_power\": " << (args.relative_power ? "true" : "false") << ",\n";
+        meta << "  \"relative_fmin_hz\": " << args.relative_fmin_hz << ",\n";
+        meta << "  \"relative_fmax_hz\": " << args.relative_fmax_hz << ",\n";
+        meta << "  \"overlap\": " << args.overlap << "\n";
+        meta << "}\n";
+      }
+    }
+
+
 
     // Optional OSC output for integration with external tools (UDP is best-effort / unreliable).
     std::unique_ptr<OscUdpClient> osc_client;
@@ -643,8 +785,8 @@ int main(int argc, char** argv) {
       if (args.osc_port < 0 || args.osc_port > 65535) {
         throw std::runtime_error("--osc-port must be 0 (disable) or in [1, 65535]");
       }
-      if (osc_mode != "state" && osc_mode != "split") {
-        throw std::runtime_error("--osc-mode must be 'state' or 'split'");
+      if (osc_mode != "state" && osc_mode != "split" && osc_mode != "bundle") {
+        throw std::runtime_error("--osc-mode must be 'state', 'split' or 'bundle'");
       }
       osc_prefix = normalize_osc_prefix(args.osc_prefix);
       osc_client = std::make_unique<OscUdpClient>(args.osc_host, args.osc_port);
@@ -686,6 +828,11 @@ int main(int argc, char** argv) {
     const std::vector<BandDefinition> bands = parse_band_spec(args.band_spec);
     const NfMetricSpec metric = parse_nf_metric_spec(args.metric_spec);
 
+    if ((args.log10_power || args.relative_power) &&
+        (metric.type != NfMetricSpec::Type::Band && metric.type != NfMetricSpec::Type::Ratio)) {
+      throw std::runtime_error("--log10 / --relative are only supported for bandpower and ratio metrics");
+    }
+
     // Output
     std::ofstream out(args.outdir + "/nf_feedback.csv");
     if (!out) throw std::runtime_error("Failed to write nf_feedback.csv");
@@ -713,8 +860,9 @@ int main(int argc, char** argv) {
     // Thresholding state
     std::vector<double> baseline_values;
     baseline_values.reserve(256);
-    bool have_threshold = false;
-    double threshold = std::numeric_limits<double>::quiet_NaN();
+    bool have_threshold = std::isfinite(args.initial_threshold);
+    double threshold = have_threshold ? args.initial_threshold
+                                     : std::numeric_limits<double>::quiet_NaN();
 
     const size_t rate_window_frames = std::max<size_t>(
       1,
@@ -883,14 +1031,14 @@ int main(int argc, char** argv) {
             continue;
           }
 
-          const bool reward = (val > threshold);
+          const bool reward = is_reward(val, threshold, args.reward_direction);
           audio_reward_flags.push_back(reward ? 1 : 0);
           reward_hist.push_back(reward ? 1 : 0);
           while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
           const double rr = reward_rate();
 
           if (!args.no_adaptation && args.adapt_eta > 0.0) {
-            threshold *= std::exp(args.adapt_eta * (rr - args.target_reward_rate));
+            threshold = adapt_threshold(threshold, rr, args.target_reward_rate, args.adapt_eta, args.reward_direction);
           }
 
           osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
@@ -1005,14 +1153,14 @@ int main(int argc, char** argv) {
             continue;
           }
 
-          const bool reward = (val > threshold);
+          const bool reward = is_reward(val, threshold, args.reward_direction);
           audio_reward_flags.push_back(reward ? 1 : 0);
           reward_hist.push_back(reward ? 1 : 0);
           while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
           const double rr = reward_rate();
 
           if (!args.no_adaptation && args.adapt_eta > 0.0) {
-            threshold *= std::exp(args.adapt_eta * (rr - args.target_reward_rate));
+            threshold = adapt_threshold(threshold, rr, args.target_reward_rate, args.adapt_eta, args.reward_direction);
           }
 
           osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
@@ -1042,6 +1190,10 @@ int main(int argc, char** argv) {
     opt.update_seconds = args.update_seconds;
     opt.welch.nperseg = args.nperseg;
     opt.welch.overlap_fraction = args.overlap;
+    opt.relative_power = args.relative_power;
+    opt.relative_fmin_hz = args.relative_fmin_hz;
+    opt.relative_fmax_hz = args.relative_fmax_hz;
+    opt.log10_power = args.log10_power;
 
     OnlineWelchBandpower eng(rec.channel_names, rec.fs_hz, bands, opt);
 
@@ -1156,14 +1308,14 @@ int main(int argc, char** argv) {
           continue;
         }
 
-        const bool reward = (val > threshold);
+        const bool reward = is_reward(val, threshold, args.reward_direction);
         audio_reward_flags.push_back(reward ? 1 : 0);
         reward_hist.push_back(reward ? 1 : 0);
         while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
         const double rr = reward_rate();
 
         if (!args.no_adaptation && args.adapt_eta > 0.0) {
-          threshold *= std::exp(args.adapt_eta * (rr - args.target_reward_rate));
+          threshold = adapt_threshold(threshold, rr, args.target_reward_rate, args.adapt_eta, args.reward_direction);
         }
 
         osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,

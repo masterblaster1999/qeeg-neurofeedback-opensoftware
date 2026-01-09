@@ -19,6 +19,22 @@ struct OnlineBandpowerOptions {
 
   // Welch PSD parameters used per frame.
   WelchOptions welch;
+
+  // If enabled, output relative bandpower:
+  //   band_power / total_power
+  // where total_power is integrated over [relative_fmin_hz, relative_fmax_hz].
+  //
+  // If relative_power=true and both relative_fmin_hz and relative_fmax_hz are 0,
+  // the integration range defaults to:
+  //   [min(band.fmin_hz), max(band.fmax_hz)] across the requested bands.
+  bool relative_power{false};
+  double relative_fmin_hz{0.0};
+  double relative_fmax_hz{0.0};
+
+  // If enabled, apply a log10 transform to the output values:
+  //   log10(max(eps, value))
+  // This matches the behavior used by qeeg_reference_cli for reference building.
+  bool log10_power{false};
 };
 
 struct OnlineBandpowerFrame {
@@ -28,6 +44,12 @@ struct OnlineBandpowerFrame {
   // Fixed metadata per frame (copied for convenience).
   std::vector<std::string> channel_names;
   std::vector<BandDefinition> bands;
+
+  // Normalization / transform metadata for interpreting `powers`.
+  bool relative_power{false};
+  double relative_fmin_hz{0.0};
+  double relative_fmax_hz{0.0};
+  bool log10_power{false};
 
   // Bandpower matrix: powers[band_index][channel_index]
   std::vector<std::vector<double>> powers;

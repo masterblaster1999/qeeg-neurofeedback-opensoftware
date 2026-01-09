@@ -54,6 +54,44 @@ int main() {
     expect_bytes(bytes, 8, { 'h', 'i', 0, 0 });
   }
 
+  // Bundle test: #bundle <timetag> [size][message]...
+  {
+    OscMessage a("/a");
+    a.add_int32(1);
+
+    OscMessage b("/b");
+    b.add_string("hi");
+
+    OscBundle bundle; // default timetag = 1 ("immediately")
+    bundle.add_message(a);
+    bundle.add_message(b);
+
+    const std::vector<uint8_t> bytes = bundle.to_bytes();
+
+    // Bundle layout:
+    //  - "#bundle\0" (8 bytes)
+    //  - timetag (8 bytes, big-endian)
+    //  - element 1: u32 size + message bytes
+    //  - element 2: u32 size + message bytes
+
+    // Both messages are 12 bytes here, so total = 8 + 8 + (4+12)*2 = 48.
+    assert(bytes.size() == 48);
+    assert((bytes.size() % 4) == 0);
+
+    expect_bytes(bytes, 0,  { '#', 'b', 'u', 'n', 'd', 'l', 'e', 0 });
+    expect_bytes(bytes, 8,  { 0, 0, 0, 0, 0, 0, 0, 1 });
+
+    // Element 1 size (12)
+    expect_bytes(bytes, 16, { 0, 0, 0, 12 });
+    // Element 1 message (/a ,i 1)
+    expect_bytes(bytes, 20, { '/', 'a', 0, 0, ',', 'i', 0, 0, 0, 0, 0, 1 });
+
+    // Element 2 size (12)
+    expect_bytes(bytes, 32, { 0, 0, 0, 12 });
+    // Element 2 message (/b ,s "hi")
+    expect_bytes(bytes, 36, { '/', 'b', 0, 0, ',', 's', 0, 0, 'h', 'i', 0, 0 });
+  }
+
   std::cout << "All tests passed.\n";
   return 0;
 }

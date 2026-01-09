@@ -192,7 +192,8 @@ Examples:
 
 This CLI simulates a real-time neurofeedback loop by:
 - computing a metric on a sliding window (Welch PSD)
-- setting an initial threshold from a baseline period
+- setting an initial threshold from a baseline period (or explicitly via `--threshold`)
+- optionally rewarding when the metric is **above** or **below** the threshold (`--reward-direction`)
 - optionally adapting the threshold to maintain a target reward rate
 
 Supported metrics:
@@ -206,6 +207,23 @@ Supported metrics:
 ./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
   --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6
 ```
+
+Optional: scale bandpower values (bandpower/ratio metrics only)
+
+- `--relative` uses relative bandpower: `band_power / total_power`
+- `--relative-range LO HI` sets the total-power integration range for `--relative`
+- `--log10` applies `log10(power)` after any optional relative normalization
+
+Example:
+
+```bash
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+  --relative --relative-range 1 45 --log10
+```
+
+Note: when `--log10` is used with a ratio metric like `alpha/beta:Pz`, the CLI reports
+`log10(alpha/beta)` (difference of log10 bandpowers).
 
 Optional: write a simple reward-tone WAV you can play back or feed into another system:
 
@@ -228,10 +246,15 @@ If you want to drive external software (e.g., Max/MSP, Pure Data, TouchOSC), you
 Messages sent:
 - `${prefix}/metric_spec` (string) — once at startup
 - `${prefix}/fs` (float32) — once at startup
+- `${prefix}/reward_direction` (string) — once at startup (`above` or `below`)
+- `${prefix}/threshold_init` (float32) — once at startup if `--threshold` is provided
 - `${prefix}/state` (float32 t_end_sec, float32 metric, float32 threshold, int32 reward, float32 reward_rate, int32 have_threshold) — every update
 
 If you use `--osc-mode split`, `qeeg_nf_cli` sends multiple addresses per update:
 `${prefix}/time`, `${prefix}/metric`, `${prefix}/threshold`, `${prefix}/reward`, `${prefix}/reward_rate`, `${prefix}/have_threshold`.
+
+If you use `--osc-mode bundle`, the split-style messages are sent inside **one OSC bundle** per update
+(still over UDP).
 
 Note: UDP delivery is **best-effort**; packets may be dropped or reordered.
 
