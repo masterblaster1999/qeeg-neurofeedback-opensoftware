@@ -47,4 +47,21 @@ private:
   double constant_{0.0};       // constant term d
 };
 
+// Compute interpolation weights for evaluating a spherical spline at a query point.
+//
+// Given sample values v[i] at positions_unit[i], this returns weights w[i] such that:
+//
+//   f(q_unit) ~= sum_i w[i] * v[i]
+//
+// This is useful for time-series interpolation: you can compute w once per missing
+// channel (geometry-only), then apply it to every time sample.
+//
+// Notes:
+// - positions_unit must contain at least 3 points.
+// - The returned weights correspond to the same Perrin-style spherical spline
+//   kernel used by SphericalSplineInterpolator.
+std::vector<double> spherical_spline_weights(const std::vector<Vec3>& positions_unit,
+                                             const Vec3& q_unit,
+                                             const SphericalSplineOptions& opt = {});
+
 } // namespace qeeg

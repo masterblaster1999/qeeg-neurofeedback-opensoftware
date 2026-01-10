@@ -41,7 +41,8 @@ std::string to_lower(std::string s);
 // Current normalization steps (best-effort, dependency-free):
 // - strip leading/trailing whitespace
 // - lowercase
-// - strip common reference suffixes like "-REF" / "_ref" / " reference" (when separated)
+// - strip common reference suffixes like "-REF" / "_ref" / " reference"
+// - tolerate common leading modality tokens like "EEG" (e.g., "EEG Fp1-Ref")
 // - map a few common 10-20 legacy aliases (e.g. T3->T7, T4->T8, T5->P7, T6->P8)
 //
 // This is intentionally conservative; it should not attempt aggressive parsing

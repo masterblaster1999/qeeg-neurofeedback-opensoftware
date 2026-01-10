@@ -200,4 +200,70 @@ ArtifactDetectionResult detect_artifacts(const EEGRecording& rec, const Artifact
   return out;
 }
 
+std::vector<size_t> artifact_bad_counts_per_channel(const ArtifactDetectionResult& res) {
+  const size_t n_ch = res.channel_names.size();
+  std::vector<size_t> counts(n_ch, 0);
+
+  for (const auto& w : res.windows) {
+    const size_t m = std::min(n_ch, w.channels.size());
+    for (size_t ch = 0; ch < m; ++ch) {
+      if (w.channels[ch].bad) {
+        ++counts[ch];
+      }
+    }
+  }
+  return counts;
+}
+
+std::vector<ArtifactSegment> artifact_bad_segments(const ArtifactDetectionResult& res,
+                                                   double merge_gap_seconds) {
+  if (!(merge_gap_seconds > 0.0)) merge_gap_seconds = 0.0;
+  const size_t n_ch = res.channel_names.size();
+  std::vector<ArtifactSegment> segs;
+
+  for (size_t wi = 0; wi < res.windows.size(); ++wi) {
+    const auto& w = res.windows[wi];
+    if (!w.bad) continue;
+
+    const double ws = w.t_start_sec;
+    const double we = w.t_end_sec;
+
+    const bool start_new = segs.empty() || (ws > (segs.back().t_end_sec + merge_gap_seconds));
+
+    if (start_new) {
+      ArtifactSegment s;
+      s.t_start_sec = ws;
+      s.t_end_sec = we;
+      s.first_window = wi;
+      s.last_window = wi;
+      s.window_count = 1;
+      s.max_bad_channels = w.bad_channel_count;
+      s.bad_windows_per_channel.assign(n_ch, 0);
+
+      const size_t m = std::min(n_ch, w.channels.size());
+      for (size_t ch = 0; ch < m; ++ch) {
+        if (w.channels[ch].bad) ++s.bad_windows_per_channel[ch];
+      }
+
+      segs.push_back(std::move(s));
+    } else {
+      auto& s = segs.back();
+      s.t_end_sec = std::max(s.t_end_sec, we);
+      s.last_window = wi;
+      s.window_count += 1;
+      s.max_bad_channels = std::max(s.max_bad_channels, w.bad_channel_count);
+      if (s.bad_windows_per_channel.size() != n_ch) {
+        s.bad_windows_per_channel.assign(n_ch, 0);
+      }
+
+      const size_t m = std::min(n_ch, w.channels.size());
+      for (size_t ch = 0; ch < m; ++ch) {
+        if (w.channels[ch].bad) ++s.bad_windows_per_channel[ch];
+      }
+    }
+  }
+
+  return segs;
+}
+
 } // namespace qeeg

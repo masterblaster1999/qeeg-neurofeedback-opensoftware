@@ -64,6 +64,29 @@ int main() {
   }
   assert(saw_bad_ch0);
 
+  // New helpers: per-channel counts and merged bad segments.
+  const auto ch_counts = artifact_bad_counts_per_channel(res);
+  assert(ch_counts.size() == rec.n_channels());
+  assert(ch_counts[0] > 0);
+  assert(ch_counts[0] >= ch_counts[1]);
+
+  const auto segs = artifact_bad_segments(res);
+  assert(!segs.empty());
+
+  bool covers_spike_time = false;
+  for (const auto& s : segs) {
+    if (s.t_start_sec <= 5.0 && s.t_end_sec >= 5.0) {
+      covers_spike_time = true;
+      // The injected artifact was only in channel 0.
+      if (s.bad_windows_per_channel.size() >= 2) {
+        assert(s.bad_windows_per_channel[0] > 0);
+        assert(s.bad_windows_per_channel[0] >= s.bad_windows_per_channel[1]);
+      }
+      break;
+    }
+  }
+  assert(covers_spike_time);
+
   std::cout << "Artifact detection test passed. Bad windows: " << res.total_bad_windows << "\n";
   return 0;
 }

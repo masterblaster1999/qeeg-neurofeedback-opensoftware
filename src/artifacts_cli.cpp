@@ -29,6 +29,10 @@ struct Args {
   double kurtosis_z{6.0};
   size_t min_bad_channels{1};
 
+  // How much of a time gap (in seconds) to allow when merging overlapping
+  // bad windows into contiguous artifact segments.
+  double merge_gap_sec{0.0};
+
   bool average_reference{false};
 
   // Optional preprocessing filters
@@ -56,6 +60,7 @@ static void print_help() {
     << "  --rms-z Z               RMS robust z threshold (default: 6; <=0 disables)\n"
     << "  --kurtosis-z Z          Kurtosis robust z threshold (default: 6; <=0 disables)\n"
     << "  --min-bad-channels N    Mark window bad if >=N channels are flagged (default: 1)\n"
+    << "  --merge-gap SEC         Merge bad windows with gaps <=SEC into segments (default: 0)\n"
     << "  --average-reference      Apply common average reference across channels\n"
     << "  --notch HZ               Apply a notch filter at HZ (e.g., 50 or 60)\n"
     << "  --notch-q Q              Notch Q factor (default: 30)\n"
@@ -91,6 +96,8 @@ static Args parse_args(int argc, char** argv) {
       a.kurtosis_z = to_double(argv[++i]);
     } else if (arg == "--min-bad-channels" && i + 1 < argc) {
       a.min_bad_channels = static_cast<size_t>(to_int(argv[++i]));
+    } else if (arg == "--merge-gap" && i + 1 < argc) {
+      a.merge_gap_sec = to_double(argv[++i]);
     } else if (arg == "--average-reference") {
       a.average_reference = true;
     } else if (arg == "--notch" && i + 1 < argc) {
@@ -118,6 +125,20 @@ static std::string join_bad_channels(const std::vector<std::string>& names,
     if (!first) oss << ";";
     first = false;
     oss << names[i];
+  }
+  return oss.str();
+}
+
+static std::string join_bad_channel_counts(const std::vector<std::string>& names,
+                                           const std::vector<size_t>& counts) {
+  std::ostringstream oss;
+  bool first = true;
+  const size_t m = std::min(names.size(), counts.size());
+  for (size_t i = 0; i < m; ++i) {
+    if (counts[i] == 0) continue;
+    if (!first) oss << ";";
+    first = false;
+    oss << names[i] << ":" << counts[i];
   }
   return oss.str();
 }
@@ -179,6 +200,9 @@ int main(int argc, char** argv) {
 
     const ArtifactDetectionResult res = detect_artifacts(rec, aopt);
 
+    const auto ch_bad_counts = artifact_bad_counts_per_channel(res);
+    const auto segments = artifact_bad_segments(res, args.merge_gap_sec);
+
     // Write per-window summary.
     {
       std::ofstream f(args.outdir + "/artifact_windows.csv");
@@ -234,11 +258,40 @@ int main(int argc, char** argv) {
       f << "windows_total: " << res.windows.size() << "\n";
       f << "windows_bad: " << res.total_bad_windows << "\n";
       f << "bad_fraction: " << frac << "\n";
+      f << "segments: " << segments.size() << "\n";
+    }
+
+    // Write per-channel summary.
+    {
+      std::ofstream f(args.outdir + "/artifact_channel_summary.csv");
+      const double total = static_cast<double>(res.windows.size());
+      f << "channel,bad_window_count,bad_window_fraction\n";
+      for (size_t ch = 0; ch < res.channel_names.size() && ch < ch_bad_counts.size(); ++ch) {
+        const double frac = (total > 0.0) ? (static_cast<double>(ch_bad_counts[ch]) / total) : 0.0;
+        f << res.channel_names[ch] << "," << ch_bad_counts[ch] << "," << frac << "\n";
+      }
+    }
+
+    // Write merged segments.
+    {
+      std::ofstream f(args.outdir + "/artifact_segments.csv");
+      f << "segment_index,t_start_sec,t_end_sec,duration_sec,first_window,last_window,windows,max_bad_channels,bad_channel_counts\n";
+      for (size_t si = 0; si < segments.size(); ++si) {
+        const auto& s = segments[si];
+        const double dur = std::max(0.0, s.t_end_sec - s.t_start_sec);
+        f << si << "," << s.t_start_sec << "," << s.t_end_sec << "," << dur
+          << "," << s.first_window << "," << s.last_window
+          << "," << s.window_count << "," << s.max_bad_channels
+          << "," << join_bad_channel_counts(res.channel_names, s.bad_windows_per_channel)
+          << "\n";
+      }
     }
 
     std::cout << "Wrote artifact report to: " << args.outdir << "\n";
     std::cout << "  - artifact_windows.csv\n";
     std::cout << "  - artifact_channels.csv\n";
+    std::cout << "  - artifact_channel_summary.csv\n";
+    std::cout << "  - artifact_segments.csv\n";
     std::cout << "  - artifact_summary.txt\n";
     return 0;
   } catch (const std::exception& e) {

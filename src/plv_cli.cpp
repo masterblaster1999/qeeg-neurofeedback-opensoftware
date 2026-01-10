@@ -35,6 +35,7 @@ struct Args {
   //   plv  : Phase Locking Value
   //   pli  : Phase Lag Index
   //   wpli : Weighted Phase Lag Index
+  //   wpli2_debiased : Debiased estimator of squared wPLI
   std::string measure{"plv"};
 
   // PLV estimator options
@@ -52,7 +53,7 @@ struct Args {
 
 static void print_help() {
   std::cout
-      << "qeeg_plv_cli (phase connectivity; PLV / PLI / wPLI)\n\n"
+      << "qeeg_plv_cli (phase connectivity; PLV / PLI / wPLI / wPLI2_debiased)\n\n"
       << "Usage:\n"
       << "  qeeg_plv_cli --input file.edf --outdir out --band alpha\n"
       << "  qeeg_plv_cli --input file.edf --outdir out --band alpha --pair F3:F4\n"
@@ -63,7 +64,7 @@ static void print_help() {
       << "  --outdir DIR             Output directory (default: out_plv)\n"
       << "  --bands SPEC             Band spec, e.g. 'alpha:8-12,beta:13-30' (default: built-in EEG bands)\n"
       << "  --band NAME|FMIN-FMAX     Which band to report (default: alpha)\n"
-      << "  --measure plv|pli|wpli    Which measure to compute (default: plv)\n"
+      << "  --measure plv|pli|wpli|wpli2_debiased    Which measure to compute (default: plv)\n"
       << "  --pair CH1:CH2           If set, compute only this pair (otherwise output a full matrix)\n"
       << "  --trim FRAC              Edge trim fraction per channel window in [0,0.49] (default: 0.10)\n"
       << "  --plv-zero-phase         Use zero-phase filtering for the PLV internal bandpass (default)\n"
@@ -127,7 +128,8 @@ static std::string normalize_measure(const std::string& m) {
   if (key == "plv") return "plv";
   if (key == "pli") return "pli";
   if (key == "wpli" || key == "w-pli" || key == "w_pli") return "wpli";
-  throw std::runtime_error("Unknown --measure: '" + m + "' (expected: plv|pli|wpli)");
+  if (key == "wpli2_debiased" || key == "wpli_debiased" || key == "dwpli" || key == "wpli2") return "wpli2_debiased";
+  throw std::runtime_error("Unknown --measure: '" + m + "' (expected: plv|pli|wpli|wpli2_debiased)");
 }
 
 static int find_channel_index(const std::vector<std::string>& channels, const std::string& name) {
@@ -271,6 +273,12 @@ int main(int argc, char** argv) {
                          rec.fs_hz,
                          band,
                          opt);
+      } else if (measure == "wpli2_debiased") {
+        v = compute_wpli2_debiased(rec.data[static_cast<size_t>(ia)],
+                                   rec.data[static_cast<size_t>(ib)],
+                                   rec.fs_hz,
+                                   band,
+                                   opt);
       }
 
       std::cout << measure << "(" << pr_names.first << "," << pr_names.second << ") = " << v << "\n";
@@ -296,6 +304,8 @@ int main(int argc, char** argv) {
       mat0 = compute_pli_matrix(rec.data, rec.fs_hz, band, opt);
     } else if (measure == "wpli") {
       mat0 = compute_wpli_matrix(rec.data, rec.fs_hz, band, opt);
+    } else if (measure == "wpli2_debiased") {
+      mat0 = compute_wpli2_debiased_matrix(rec.data, rec.fs_hz, band, opt);
     }
     const size_t C = rec.n_channels();
     if (mat0.size() != C) throw std::runtime_error("PLV: unexpected matrix size");

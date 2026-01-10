@@ -51,10 +51,12 @@ int main() {
     std::ofstream f(path, std::ios::binary);
     assert(static_cast<bool>(f));
 
-    const int num_signals = 2;
+    // Include a low-rate peripheral channel to ensure the reader can handle mixed sampling rates.
+    // This mirrors common BioTrace+ / NeXus exports (EEG/ExG + peripherals + annotations).
+    const int num_signals = 4;
     const int num_records = 1;
     const double record_duration = 1.0;
-    const int samples_per_record = 4;
+    const std::vector<int> samples_per_record = {4, 4, 1, 4}; // EEG, ExG, GSR(peripheral), Annotations
     const int header_bytes = 256 + 256 * num_signals;
 
     // Fixed header (256 bytes total)
@@ -72,61 +74,92 @@ int main() {
     // Per-signal header arrays (256 bytes per signal)
     // labels (16)
     f << pad("EEG Fz", 16);
+    f << pad("ExG 1", 16);
+    f << pad("GSR", 16);
     f << pad("EDF Annotations", 16);
 
     // transducer (80)
-    f << pad("", 80) << pad("", 80);
+    for (int i = 0; i < num_signals; ++i) f << pad("", 80);
+
     // phys dim (8)
-    f << pad("uV", 8) << pad("", 8);
+    f << pad("uV", 8);  // EEG
+    f << pad("uV", 8);  // ExG
+    f << pad("uS", 8);  // GSR (peripheral)
+    f << pad("", 8);    // annotations
 
     // phys min/max (8 each)
     // Use integer strings (to_double can parse them) so they fit the 8-byte EDF/BDF field.
-    f << fmt_int(-8388608, 8) << fmt_int(-8388608, 8);
-    f << fmt_int(8388607, 8) << fmt_int(8388607, 8);
+    for (int i = 0; i < num_signals; ++i) f << fmt_int(-8388608, 8);
+    for (int i = 0; i < num_signals; ++i) f << fmt_int(8388607, 8);
 
     // dig min/max (8 each)
-    f << fmt_int(-8388608, 8) << fmt_int(-8388608, 8);
-    f << fmt_int(8388607, 8) << fmt_int(8388607, 8);
+    for (int i = 0; i < num_signals; ++i) f << fmt_int(-8388608, 8);
+    for (int i = 0; i < num_signals; ++i) f << fmt_int(8388607, 8);
 
     // prefilter (80)
-    f << pad("", 80) << pad("", 80);
+    for (int i = 0; i < num_signals; ++i) f << pad("", 80);
 
     // samples per record (8)
-    f << fmt_int(samples_per_record, 8) << fmt_int(samples_per_record, 8);
+    for (int i = 0; i < num_signals; ++i) f << fmt_int(samples_per_record[i], 8);
 
     // reserved (32)
-    f << pad("", 32) << pad("", 32);
+    for (int i = 0; i < num_signals; ++i) f << pad("", 32);
 
     // Sanity check header size
     const auto pos = f.tellp();
     assert(pos == header_bytes);
 
-    // Data record: signal 0 samples then signal 1 samples
+    // Data record: signal 0 samples then signal 1 samples, ...
     const std::vector<int32_t> eeg = {-100, 0, 100, -200};
+    const std::vector<int32_t> exg = {1, 2, 3, 4};
+
     for (int32_t v : eeg) write_i24_le(f, v);
-    for (int i = 0; i < samples_per_record; ++i) write_i24_le(f, 0);
+    for (int32_t v : exg) write_i24_le(f, v);
+    write_i24_le(f, 7); // one low-rate peripheral sample
+
+    // Annotation samples: keep empty/zero for this test.
+    for (int i = 0; i < samples_per_record[3]; ++i) write_i24_le(f, 0);
   }
 
   // 1) Direct BDFReader
   {
     BDFReader r;
     EEGRecording rec = r.read(path);
-    assert(rec.n_channels() == 1);
-    assert(rec.channel_names.size() == 1);
+
+    // The mixed-rate peripheral channel should be resampled and kept.
+    assert(rec.n_channels() == 3);
+    assert(rec.channel_names.size() == 3);
     assert(rec.channel_names[0] == "Fz");
+    assert(rec.channel_names[1] == "ExG1");
+    assert(rec.channel_names[2] == "GSR");
     assert(rec.fs_hz == 4.0);
+
     assert(rec.data[0].size() == 4);
+    assert(rec.data[1].size() == 4);
+    assert(rec.data[2].size() == 4);
+
     assert(rec.data[0][0] == -100.0f);
     assert(rec.data[0][1] == 0.0f);
     assert(rec.data[0][2] == 100.0f);
     assert(rec.data[0][3] == -200.0f);
+
+    assert(rec.data[1][0] == 1.0f);
+    assert(rec.data[1][1] == 2.0f);
+    assert(rec.data[1][2] == 3.0f);
+    assert(rec.data[1][3] == 4.0f);
+
+    for (float v : rec.data[2]) {
+      assert(v == 7.0f);
+    }
   }
 
   // 2) read_recording_auto dispatch by extension
   {
     EEGRecording rec = read_recording_auto(path, /*fs_hz_for_csv=*/0.0);
-    assert(rec.n_channels() == 1);
+    assert(rec.n_channels() == 3);
     assert(rec.channel_names[0] == "Fz");
+    assert(rec.channel_names[1] == "ExG1");
+    assert(rec.channel_names[2] == "GSR");
     assert(rec.fs_hz == 4.0);
   }
 

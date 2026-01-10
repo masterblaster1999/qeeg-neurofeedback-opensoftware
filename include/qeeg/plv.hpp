@@ -12,6 +12,7 @@ namespace qeeg {
 //   - PLV: Phase Locking Value
 //   - PLI: Phase Lag Index
 //   - wPLI: Weighted Phase Lag Index
+//   - wPLI2 (debiased): Debiased estimator of squared wPLI
 //
 // All measures are computed from a narrow-band analytic signal per channel:
 //   bandpass -> Hilbert (FFT-based) -> complex analytic signal z(t)
@@ -77,6 +78,24 @@ double compute_wpli(const std::vector<float>& x,
                     const BandDefinition& band,
                     const PlvOptions& opt = {});
 
+// Debiased estimator of **squared** wPLI.
+//
+// This implements the common debiasing described by Vinck et al. (2011) and
+// used in toolboxes like FieldTrip ("wpli_debiased") and MNE
+// ("wpli2_debiased").
+//
+// It estimates wPLI^2 and can be more stable across small sample sizes.
+//
+// Notes:
+// - The raw estimator can yield small negative values due to the bias
+//   correction; this implementation clamps to [0, 1] for convenience.
+// - If the denominator is ~0 (e.g., purely zero-lag), the function returns 0.
+double compute_wpli2_debiased(const std::vector<float>& x,
+                              const std::vector<float>& y,
+                              double fs_hz,
+                              const BandDefinition& band,
+                              const PlvOptions& opt = {});
+
 // Compute symmetric PLI / wPLI matrices for a multi-channel recording.
 //
 // The diagonal is set to 0 (self-coupling is not meaningful for these metrics).
@@ -89,5 +108,13 @@ std::vector<std::vector<double>> compute_wpli_matrix(const std::vector<std::vect
                                                      double fs_hz,
                                                      const BandDefinition& band,
                                                      const PlvOptions& opt = {});
+
+// Compute a symmetric matrix of debiased squared wPLI.
+//
+// The diagonal is set to 0 (self-coupling is not meaningful for this metric).
+std::vector<std::vector<double>> compute_wpli2_debiased_matrix(const std::vector<std::vector<float>>& channels,
+                                                               double fs_hz,
+                                                               const BandDefinition& band,
+                                                               const PlvOptions& opt = {});
 
 } // namespace qeeg

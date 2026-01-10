@@ -4,6 +4,7 @@
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
+#include "qeeg/pattern.hpp"
 #include "qeeg/welch_psd.hpp"
 
 #include <algorithm>
@@ -12,6 +13,8 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -42,8 +45,10 @@ struct Args {
   double baseline_gap_sec{0.0};
   std::string baseline_mode{"rel"}; // ratio|rel|logratio|db
 
-  // Event selection
+  // Event selection (choose at most one; if multiple are specified, the last one wins)
   std::string event_glob;
+  std::string event_regex;
+  std::optional<std::regex> event_regex_compiled;
   std::string event_contains;
   bool case_sensitive{false};
   bool include_empty_text{false};
@@ -87,7 +92,7 @@ static void print_help() {
     << "  --baseline-gap SEC       Gap between baseline end and epoch start (default: 0)\n"
     << "  --baseline-mode MODE     Baseline normalization: ratio|rel|logratio|db (default: rel)\n"
     << "  --event-glob PATTERN      Only keep events whose text matches PATTERN (* and ? wildcards)\n"
-    << "  --event-regex REGEX       Alias for --event-glob (NOTE: this is a glob, not a full regex)\n"
+    << "  --event-regex REGEX       Only keep events whose text matches REGEX (ECMAScript; std::regex_search)\n"
     << "  --event-contains STR      Only keep events whose text contains STR\n"
     << "  --case-sensitive          Make --event-contains matching case-sensitive\n"
     << "  --include-empty           Include events with empty text (not recommended)\n"
@@ -129,10 +134,21 @@ static Args parse_args(int argc, char** argv) {
       a.baseline_gap_sec = to_double(argv[++i]);
     } else if (arg == "--baseline-mode" && i + 1 < argc) {
       a.baseline_mode = argv[++i];
-    } else if ((arg == "--event-glob" || arg == "--event-regex") && i + 1 < argc) {
+    } else if (arg == "--event-glob" && i + 1 < argc) {
       a.event_glob = argv[++i];
+      a.event_regex.clear();
+      a.event_regex_compiled.reset();
+      a.event_contains.clear();
+    } else if ((arg == "--event-regex" || arg == "--event-re") && i + 1 < argc) {
+      a.event_regex = argv[++i];
+      a.event_glob.clear();
+      a.event_contains.clear();
+      a.event_regex_compiled.reset();
     } else if (arg == "--event-contains" && i + 1 < argc) {
       a.event_contains = argv[++i];
+      a.event_glob.clear();
+      a.event_regex.clear();
+      a.event_regex_compiled.reset();
     } else if (arg == "--case-sensitive") {
       a.case_sensitive = true;
     } else if (arg == "--include-empty") {
@@ -156,6 +172,10 @@ static Args parse_args(int argc, char** argv) {
       throw std::runtime_error("Unknown or incomplete argument: " + arg);
     }
   }
+  if (!a.event_regex.empty()) {
+    a.event_regex_compiled = compile_regex(a.event_regex, a.case_sensitive);
+  }
+
   return a;
 }
 
@@ -231,46 +251,12 @@ static std::vector<AnnotationEvent> load_events_csv(const std::string& path) {
   return out;
 }
 
-static bool wildcard_match(const std::string& text_in, const std::string& pattern_in, bool case_sensitive) {
-  // Simple glob-style matching supporting:
-  //  - '*' : matches any sequence (including empty)
-  //  - '?' : matches exactly one character
-  std::string text = text_in;
-  std::string pattern = pattern_in;
-  if (!case_sensitive) {
-    text = to_lower(std::move(text));
-    pattern = to_lower(std::move(pattern));
-  }
-
-  size_t t = 0;
-  size_t p = 0;
-  size_t star = std::string::npos;
-  size_t match = 0;
-
-  while (t < text.size()) {
-    if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == text[t])) {
-      ++t;
-      ++p;
-    } else if (p < pattern.size() && pattern[p] == '*') {
-      star = p;
-      ++p;
-      match = t;
-    } else if (star != std::string::npos) {
-      p = star + 1;
-      ++match;
-      t = match;
-    } else {
-      return false;
-    }
-  }
-
-  while (p < pattern.size() && pattern[p] == '*') ++p;
-  return p == pattern.size();
-}
-
 static bool event_text_matches(const AnnotationEvent& ev, const Args& a) {
   if (!a.include_empty_text && trim(ev.text).empty()) return false;
 
+  if (a.event_regex_compiled.has_value()) {
+    return std::regex_search(ev.text, *a.event_regex_compiled);
+  }
   if (!a.event_glob.empty()) {
     return wildcard_match(ev.text, a.event_glob, a.case_sensitive);
   }

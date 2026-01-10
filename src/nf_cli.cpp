@@ -624,9 +624,9 @@ static EEGRecording make_demo_recording(const Montage& montage, double fs_hz, do
 
 
 static int find_channel_index(const std::vector<std::string>& channels, const std::string& name) {
-  const std::string target = to_lower(trim(name));
+  const std::string target = normalize_channel_name(name);
   for (size_t i = 0; i < channels.size(); ++i) {
-    if (to_lower(channels[i]) == target) return static_cast<int>(i);
+    if (normalize_channel_name(channels[i]) == target) return static_cast<int>(i);
   }
   return -1;
 }

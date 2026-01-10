@@ -41,8 +41,13 @@ struct EEGRecording {
   double fs_hz{0.0};                             // sampling rate
   std::vector<std::vector<float>> data;          // data[ch][sample] in physical units (e.g. microvolts)
 
-  // Optional event/annotation list (EDF+/BDF+ "Annotations" signal). Empty for CSV inputs
-  // and for EDF/BDF that contain no annotations.
+  // Optional event/annotation list (EDF+/BDF+ "Annotations" signal).
+  //
+  // For CSV/ASCII inputs, this is typically empty unless the CSV contains a
+  // marker/event column that is detected by CSVReader.
+  //
+  // For EDF/BDF inputs, this list is empty when the file contains no
+  // annotations.
   std::vector<AnnotationEvent> events;
 
   size_t n_channels() const { return data.size(); }

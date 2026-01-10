@@ -200,6 +200,71 @@ double compute_wpli(const std::vector<float>& x,
   return wpli;
 }
 
+double compute_wpli2_debiased(const std::vector<float>& x,
+                              const std::vector<float>& y,
+                              double fs_hz,
+                              const BandDefinition& band,
+                              const PlvOptions& opt) {
+  validate_band(band, fs_hz);
+  if (opt.edge_trim_fraction < 0.0 || opt.edge_trim_fraction >= 0.5) {
+    throw std::runtime_error("compute_wpli2_debiased: edge_trim_fraction must be in [0, 0.49]");
+  }
+
+  const size_t n = std::min(x.size(), y.size());
+  if (n < 4) return std::numeric_limits<double>::quiet_NaN();
+
+  std::vector<float> x0(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(n));
+  std::vector<float> y0(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(n));
+
+  const auto zx = analytic_band(x0, fs_hz, band, opt.zero_phase);
+  const auto zy = analytic_band(y0, fs_hz, band, opt.zero_phase);
+  const size_t m = std::min(zx.size(), zy.size());
+  if (m < 4) return std::numeric_limits<double>::quiet_NaN();
+
+  const size_t trim = edge_trim_samples(m, opt.edge_trim_fraction);
+  const size_t i0 = trim;
+  const size_t i1 = (m > trim ? (m - trim) : 0);
+  if (i1 <= i0 + 1) return std::numeric_limits<double>::quiet_NaN();
+
+  // Debiased estimator of squared wPLI (Vinck et al., 2011; FieldTrip).
+  //
+  // Using observations im_k = Im(zx[k] * conj(zy[k])):
+  //   wpli2_debiased = ( (sum im_k)^2 - sum im_k^2 ) / ( (sum |im_k|)^2 - sum im_k^2 )
+  //
+  // This can yield small negative values due to the bias correction; we clamp to [0, 1].
+  double sum_im = 0.0;
+  double sum_abs = 0.0;
+  double sum_sq = 0.0;
+  size_t cnt = 0;
+
+  for (size_t i = i0; i < i1; ++i) {
+    const auto& a = zx[i];
+    const auto& b = zy[i];
+    if (!std::isfinite(a.real()) || !std::isfinite(a.imag()) || !std::isfinite(b.real()) || !std::isfinite(b.imag())) {
+      continue;
+    }
+    const double im = (a * std::conj(b)).imag();
+    if (!std::isfinite(im)) continue;
+    sum_im += im;
+    sum_abs += std::fabs(im);
+    sum_sq += im * im;
+    ++cnt;
+  }
+
+  if (cnt < 2) return std::numeric_limits<double>::quiet_NaN();
+
+  const double denom = (sum_abs * sum_abs) - sum_sq;
+  const double eps = 1e-20;
+  if (!(denom > eps)) return 0.0;
+
+  const double numer = (sum_im * sum_im) - sum_sq;
+  double wpli2 = numer / denom;
+  if (!std::isfinite(wpli2)) return std::numeric_limits<double>::quiet_NaN();
+  if (wpli2 < 0.0) wpli2 = 0.0;
+  if (wpli2 > 1.0) wpli2 = 1.0;
+  return wpli2;
+}
+
 std::vector<std::vector<double>> compute_plv_matrix(const std::vector<std::vector<float>>& channels,
                                                     double fs_hz,
                                                     const BandDefinition& band,
@@ -418,6 +483,76 @@ std::vector<std::vector<double>> compute_wpli_matrix(const std::vector<std::vect
 
       out[i][j] = wpli;
       out[j][i] = wpli;
+    }
+  }
+
+  return out;
+}
+
+std::vector<std::vector<double>> compute_wpli2_debiased_matrix(const std::vector<std::vector<float>>& channels,
+                                                               double fs_hz,
+                                                               const BandDefinition& band,
+                                                               const PlvOptions& opt) {
+  validate_band(band, fs_hz);
+  if (opt.edge_trim_fraction < 0.0 || opt.edge_trim_fraction >= 0.5) {
+    throw std::runtime_error("compute_wpli2_debiased_matrix: edge_trim_fraction must be in [0, 0.49]");
+  }
+
+  const size_t n_ch = channels.size();
+  std::vector<std::vector<double>> out(n_ch, std::vector<double>(n_ch, std::numeric_limits<double>::quiet_NaN()));
+  if (n_ch == 0) return out;
+
+  std::vector<std::vector<std::complex<double>>> z;
+  size_t i0 = 0;
+  size_t L = 0;
+  build_analytic_channels(channels, fs_hz, band, opt, &z, &i0, &L);
+  if (L < 2 || z.size() != n_ch) return out;
+
+  for (size_t i = 0; i < n_ch; ++i) {
+    out[i][i] = 0.0;
+  }
+
+  const double eps = 1e-20;
+
+  for (size_t i = 0; i < n_ch; ++i) {
+    for (size_t j = i + 1; j < n_ch; ++j) {
+      double sum_im = 0.0;
+      double sum_abs = 0.0;
+      double sum_sq = 0.0;
+      size_t cnt = 0;
+
+      for (size_t k = 0; k < L; ++k) {
+        const auto& a = z[i][i0 + k];
+        const auto& b = z[j][i0 + k];
+        if (!std::isfinite(a.real()) || !std::isfinite(a.imag()) || !std::isfinite(b.real()) || !std::isfinite(b.imag())) {
+          continue;
+        }
+        const double im = (a * std::conj(b)).imag();
+        if (!std::isfinite(im)) continue;
+        sum_im += im;
+        sum_abs += std::fabs(im);
+        sum_sq += im * im;
+        ++cnt;
+      }
+
+      double wpli2 = std::numeric_limits<double>::quiet_NaN();
+      if (cnt >= 2) {
+        const double denom = (sum_abs * sum_abs) - sum_sq;
+        if (denom > eps) {
+          const double numer = (sum_im * sum_im) - sum_sq;
+          wpli2 = numer / denom;
+          if (!std::isfinite(wpli2)) wpli2 = std::numeric_limits<double>::quiet_NaN();
+          if (std::isfinite(wpli2)) {
+            if (wpli2 < 0.0) wpli2 = 0.0;
+            if (wpli2 > 1.0) wpli2 = 1.0;
+          }
+        } else {
+          wpli2 = 0.0;
+        }
+      }
+
+      out[i][j] = wpli2;
+      out[j][i] = wpli2;
     }
   }
 

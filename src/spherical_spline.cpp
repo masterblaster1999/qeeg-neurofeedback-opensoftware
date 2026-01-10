@@ -217,4 +217,82 @@ double SphericalSplineInterpolator::evaluate(const Vec3& q_unit) const {
   return s;
 }
 
+std::vector<double> spherical_spline_weights(const std::vector<Vec3>& positions_unit,
+                                             const Vec3& q_unit,
+                                             const SphericalSplineOptions& opt) {
+  if (positions_unit.size() < 3) {
+    throw std::runtime_error("spherical_spline_weights: need at least 3 points");
+  }
+  if (opt.n_terms < 5) {
+    throw std::runtime_error("spherical_spline_weights: n_terms too small (>=5 recommended)");
+  }
+  if (opt.m < 1) {
+    throw std::runtime_error("spherical_spline_weights: m must be >= 1");
+  }
+  if (opt.lambda < 0.0) {
+    throw std::runtime_error("spherical_spline_weights: lambda must be >= 0");
+  }
+
+  // Normalize sample positions.
+  const size_t K = positions_unit.size();
+  std::vector<Vec3> pos;
+  pos.reserve(K);
+  for (const auto& p : positions_unit) {
+    const Vec3 u = normalize_vec3(p);
+    if (u.x == 0.0 && u.y == 0.0 && u.z == 0.0) {
+      throw std::runtime_error("spherical_spline_weights: zero-length position vector");
+    }
+    pos.push_back(u);
+  }
+  const Vec3 q = normalize_vec3(q_unit);
+  if (q.x == 0.0 && q.y == 0.0 && q.z == 0.0) {
+    throw std::runtime_error("spherical_spline_weights: zero-length query vector");
+  }
+
+  const int N = static_cast<int>(K) + 1; // augmented system size
+  std::vector<double> M(static_cast<size_t>(N) * static_cast<size_t>(N), 0.0);
+
+  auto idx = [N](int r, int c) { return r * N + c; };
+
+  // Build M = [G 1; 1^T 0]
+  for (int i = 0; i < static_cast<int>(K); ++i) {
+    for (int j = 0; j < static_cast<int>(K); ++j) {
+      const double x = dot3(pos[static_cast<size_t>(i)], pos[static_cast<size_t>(j)]);
+      double gij = kernel_g(x, opt.n_terms, opt.m);
+      if (i == j) gij += opt.lambda;
+      M[static_cast<size_t>(idx(i, j))] = gij;
+    }
+    M[static_cast<size_t>(idx(i, static_cast<int>(K)))] = 1.0;
+  }
+  for (int j = 0; j < static_cast<int>(K); ++j) {
+    M[static_cast<size_t>(idx(static_cast<int>(K), j))] = 1.0;
+  }
+  M[static_cast<size_t>(idx(static_cast<int>(K), static_cast<int>(K)))] = 0.0;
+
+  // Weights satisfy:
+  //   w_full^T = [g(q,p_i), 1] * M^{-1}
+  // Equivalently, solve M^T x = u where u = [g(q,p_i), 1]^T,
+  // then w = x[0:K].
+
+  // Build A = M^T
+  std::vector<double> A(static_cast<size_t>(N) * static_cast<size_t>(N), 0.0);
+  for (int r = 0; r < N; ++r) {
+    for (int c = 0; c < N; ++c) {
+      A[static_cast<size_t>(idx(r, c))] = M[static_cast<size_t>(idx(c, r))];
+    }
+  }
+
+  // RHS u
+  std::vector<double> u(static_cast<size_t>(N), 0.0);
+  for (size_t i = 0; i < K; ++i) {
+    const double x = dot3(q, pos[i]);
+    u[i] = kernel_g(x, opt.n_terms, opt.m);
+  }
+  u[K] = 1.0;
+
+  std::vector<double> x = solve_linear_system_gauss(std::move(A), std::move(u), N);
+  x.resize(K); // drop the extra coefficient
+  return x;
+}
+
 } // namespace qeeg

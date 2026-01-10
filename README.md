@@ -58,7 +58,54 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
+## Install (optional)
+
+You can optionally install the **qeeg** library and the CLI tools:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+cmake --install build --prefix <install-prefix>
+```
+
+To consume the library from another CMake project:
+
+```cmake
+find_package(qeeg CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE qeeg::qeeg)
+```
+
 ## Usage
+
+### 0) Inspect a recording (quick summary)
+
+```bash
+# Print sampling rate / sizes + a basic data scan (non-finite counts + global min/max)
+./build/qeeg_info_cli --input path/to/recording.edf
+
+# Print channel list + first few EDF+/BDF+ annotation events
+./build/qeeg_info_cli --input path/to/recording.edf --channels --events
+
+# Machine-readable JSON (useful for scripts)
+./build/qeeg_info_cli --input path/to/recording.edf --json --channels --events
+```
+
+Tip: for very large files, you can skip scanning samples with `--no-scan`, or request
+per-channel stats with `--per-channel` (limited by `--max-channels`).
+
+### 0b) Check 50/60 Hz line-noise (choose a notch frequency)
+
+If you don't know whether your recording is contaminated by **50 Hz** or **60 Hz** power-line
+interference (common when receiving exports from other labs/regions), you can run:
+
+```bash
+./build/qeeg_quality_cli --input path/to/recording.edf
+
+# JSON (script-friendly)
+./build/qeeg_quality_cli --input path/to/recording.edf --json
+```
+
+Then pass `--notch 50` or `--notch 60` to the analysis CLIs as needed.
 
 ### 1) Run a demo (synthetic data)
 
@@ -72,14 +119,168 @@ cmake --build build --config Release
 ./build/qeeg_map_cli --input path/to/recording.edf --outdir out_edf
 ```
 
+
+### 2b) BioTrace+ / NeXus 10 MKII
+
+If you record with Mind Media BioTrace+ (e.g., a NeXus-10 MKII), export sessions to **EDF/EDF+** (recommended) or **BDF/BDF+** and use the exported file as input here.
+
+This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral channels at lower sampling rates (skin conductance, respiration, temperature, etc.), the reader will keep all non-annotation channels and resample them to the highest EEG/ExG-like sampling rate (best effort). Voltage-like channels exported in mV or V are converted to microvolts. If you only want EEG/ExG channels, drop peripherals with a channel-map (new=DROP).
+
+**Notes on BioTrace+ export formats**
+- The `.bcd` / `.mbd` formats are BioTrace+/NeXus session containers/backups and are **not supported** here.
+  Export to EDF/BDF or ASCII from BioTrace+ first.
+- BioTrace+ ASCII exports are often saved as `.txt` / `.tsv` / `.asc`; these are treated like CSV inputs in this project.
+
+**Trigger/event channels (important for some BDF recordings)**
+
+Some recordings store event codes as a dedicated numeric channel (for example `TRIG`, `STI 014`, or a BioSemi-style `Status` channel) rather than an EDF+/BDF+ annotations signal. If no annotations are present, this project will now attempt a conservative auto-detection and convert trigger transitions into `events`.
+
+That means tools like `qeeg_convert_cli --events-out ...` and `qeeg_export_bids_cli` can still emit an events file even when the original recording had no EDF+/BDF+ annotations.
+
+```bash
+./build/qeeg_info_cli --input path/to/biotrace_export.edf
+./build/qeeg_map_cli  --input path/to/biotrace_export.edf --outdir out_biotrace
+```
+
+**Optional: normalize/export to a simple CSV (and rename channels)**
+
+```bash
+# Convert an ASCII export (e.g. .txt) to a clean CSV and generate a channel-map template
+./build/qeeg_convert_cli --input path/to/session.txt --output session.csv --channel-map-template channel_map.csv
+
+# Edit channel_map.csv (e.g., map ExG1->C3, ExG2->C4, set new=DROP to remove channels),
+# then apply it during conversion (works for EDF/BDF too)
+./build/qeeg_convert_cli --input path/to/session.edf --output session_mapped.csv --channel-map channel_map.csv --events-out events.csv
+```
+
+**Optional: export to EDF (round-trip friendly)**
+
+```bash
+# Export a cleaned-up EDF (e.g., after channel remapping).
+# For CSV/ASCII inputs, pass --fs unless there is a time column that can be inferred.
+./build/qeeg_export_edf_cli --input session.csv --output session.edf --fs 256 --channel-map channel_map.csv --events-out events.csv
+
+# If you want to avoid EDF padding, you can write a single datarecord:
+./build/qeeg_export_edf_cli --input session.edf --output session_one_record.edf --record-duration 0
+```
+
+**Optional: export to BDF (.bdf, 24-bit) / BDF+ (with annotations)**
+
+If you want to preserve 24-bit dynamic range (BioSemi-style BDF), you can export any supported input to
+`.bdf`. When the input contains events and you do not pass `--plain-bdf`, the tool emits a BDF+ annotation
+channel (`BDF Annotations`).
+
+```bash
+# Export to BDF (24-bit). Events are embedded as BDF+ annotations by default.
+./build/qeeg_export_bdf_cli --input session.edf --output session.bdf --events-out events.csv
+
+# Force classic BDF (no embedded annotations channel):
+./build/qeeg_export_bdf_cli --input session.edf --output session_plain.bdf --plain-bdf
+```
+
+**Optional: export to BrainVision (.vhdr/.vmrk/.eeg)**
+
+Some EEG tools prefer the BrainVision Core Data Format (a 3-file set: header `.vhdr`, marker `.vmrk`, and binary `.eeg`).
+You can export any supported input to BrainVision:
+
+```bash
+# Write a BrainVision set: session.vhdr, session.vmrk, session.eeg
+./build/qeeg_export_brainvision_cli --input session.edf --output session.vhdr
+
+# INT_16 output (smaller files) with fixed 0.1 uV resolution
+./build/qeeg_export_brainvision_cli --input session.edf --output session_int16.vhdr --int16 --int16-resolution 0.1
+```
+
+You can also **use a BrainVision header (`.vhdr`) as an input** to any CLI (the reader will automatically load the referenced `.eeg` and `.vmrk` files):
+
+```bash
+./build/qeeg_info_cli --input session.vhdr --channels --events
+./build/qeeg_map_cli  --input session.vhdr --outdir out_bv
+```
+
+
+
+**Optional: export to a BIDS EEG folder layout**
+
+If you want to organize exports for other tools that expect the
+[Brain Imaging Data Structure (BIDS)](https://bids-specification.readthedocs.io/) EEG layout, you can use:
+
+```bash
+# Writes: <out-dir>/sub-01/[ses-01/]eeg/sub-01[_ses-01]_task-rest[_acq-...][_run-...]_eeg.edf
+# plus: *_eeg.json, *_channels.tsv, and (if events exist) *_events.tsv/json.
+# Also creates <out-dir>/dataset_description.json if missing.
+./build/qeeg_export_bids_cli --input session.edf --out-dir my_bids --sub 01 --task rest --ses 01   --format edf --eeg-reference Cz
+
+# BrainVision output variant (.vhdr/.vmrk/.eeg)
+./build/qeeg_export_bids_cli --input session.edf --out-dir my_bids --sub 01 --task rest --ses 01   --format brainvision --eeg-reference Cz
+```
+
+### 2c) Preprocess (CAR / notch / bandpass) and export a cleaned EDF or CSV
+
+If you want to apply quick, dependency-light preprocessing before running qEEG features (or before
+sharing data with other tools), use `qeeg_preprocess_cli`.
+
+It can also **auto-detect 50/60 Hz line-noise** and choose a notch frequency when you don’t know
+the export settings.
+
+```bash
+# Auto-notch + simple EEG bandpass, then write EDF+ (events preserved)
+./build/qeeg_preprocess_cli --input session.edf --output session_clean.edf \
+  --auto-notch --bandpass 1 40 --average-reference --zero-phase \
+  --events-out session_clean_events.csv
+
+# Or write a cleaned CSV instead
+./build/qeeg_preprocess_cli --input session.edf --output session_clean.csv --auto-notch --bandpass 1 40
+```
+
+### 2d) Channel QC: find bad channels and optionally drop/interpolate
+
+If your exports include disconnected electrodes (flat lines) or very noisy channels, you can run:
+
+```bash
+./build/qeeg_channel_qc_cli --input session.edf --outdir out_qc
+```
+
+This writes:
+- `channel_qc.csv` — per-channel summary metrics + flags
+- `bad_channels.txt` — one channel name per line
+- `qc_summary.txt` — parameters + actions taken
+
+**Drop** bad channels (no montage required):
+
+```bash
+./build/qeeg_channel_qc_cli --input session.edf --outdir out_qc_drop \
+  --drop-bad --output session_dropbad.edf
+```
+
+**Interpolate** bad channels using Perrin-style **spherical spline** interpolation.
+This requires electrode positions (a montage). If your channels are standard 10-20 names
+(or you've remapped them using `--channel-map`), the builtin 19ch montage is used by default.
+
+```bash
+./build/qeeg_channel_qc_cli --input session.edf --outdir out_qc_interp \
+  --interpolate --output session_interpolated.edf
+
+# Or provide your own montage CSV (name,x,y):
+./build/qeeg_channel_qc_cli --input session.edf --outdir out_qc_interp \
+  --montage my_montage.csv --interpolate --output session_interpolated.edf
+```
+
+Tip: If you want this to behave well for BioTrace+/NeXus exports, first drop non-EEG/ExG
+channels with a channel-map (set new=DROP). Then run interpolation only on your EEG montage.
+
 ### 3) Run on CSV
 
 CSV format:
 - first row: channel names (or: `time,<ch1>,<ch2>,...`)
 - each following row: one sample per column
 - if the first column is `time`/`time_ms` (seconds or milliseconds), `--fs` can be omitted
+- if a column is named like `marker`, `event`, or `trigger`, it is treated as an **event/marker stream**
+  and converted into `EEGRecording::events` (useful for `qeeg_info_cli --events`, `qeeg_epoch_cli`,
+  and `qeeg_convert_cli --events-out`)
 - commas inside quoted fields are supported (e.g., `time_ms;"Ch,1,2";"Ch,3,4"`)
 - comma/semicolon/tab delimiters are auto-detected from the header row
+- for semicolon/tab-delimited exports, European numeric formats like `1,23` and `1.234,56` are supported
 
 ```bash
 ./build/qeeg_map_cli --input examples/sample_data_sine.csv --fs 250 --outdir out_csv
@@ -338,6 +539,7 @@ Available measures:
 - `plv` (default): Phase Locking Value (sensitive to zero-lag coupling)
 - `pli`: Phase Lag Index (counts consistent non-zero lag)
 - `wpli`: Weighted Phase Lag Index (PLI weighted by the magnitude of the imaginary component; often more robust to noise)
+- `wpli2_debiased`: Debiased estimator of **squared** wPLI (wPLI^2), which can reduce small-sample bias
 
 Compute a **PLV** matrix for all channel pairs:
 
@@ -349,6 +551,12 @@ Compute a **wPLI** matrix (often used to reduce spurious zero-lag coupling):
 
 ```bash
 ./build/qeeg_plv_cli --input path/to/recording.edf --outdir out_wpli --band alpha --measure wpli
+```
+
+Compute a **debiased wPLI^2** matrix:
+
+```bash
+./build/qeeg_plv_cli --input path/to/recording.edf --outdir out_wpli2_debiased --band alpha --measure wpli2_debiased
 ```
 
 Compute **one pair**:
@@ -410,6 +618,10 @@ bandpower features per event/epoch:
 # Use the event duration (if present in the annotation) and keep only events containing "Stim"
 ./build/qeeg_epoch_cli --input path/to/recording.edf --outdir out_epochs --event-contains Stim
 
+# Or use a real regular expression (ECMAScript):
+./build/qeeg_epoch_cli --input path/to/recording.edf --outdir out_epochs --event-regex "Stim.*"
+
+
 # Use a fixed 1.0s window starting 0.2s after each matching event
 ./build/qeeg_epoch_cli --input path/to/recording.edf --outdir out_epochs \
   --event-glob "*Stim*" --offset 0.2 --window 1.0
@@ -452,6 +664,35 @@ Example:
 ./build/qeeg_artifacts_cli --input path/to/recording.edf --outdir out_artifacts_filtered \
   --window 1.0 --step 0.5 --baseline 10 --average-reference --notch 50 --bandpass 1 45 --zero-phase
 ```
+
+### 11b) Extract clean segments from artifact detection
+
+If you want to **extract contiguous “good” segments** (the complement of the detected bad windows), use:
+
+```bash
+# Generate bad_segments.csv + good_segments.csv + clean_summary.txt
+./build/qeeg_clean_cli --input path/to/recording.edf --outdir out_clean \
+  --window 1.0 --step 0.5 --baseline 10 --ptp-z 6 --rms-z 6 --kurtosis-z 6 \
+  --merge-gap 0.0 --pad 0.25 --min-good 2.0
+
+# Optional: export each good segment to its own CSV file
+./build/qeeg_clean_cli --input path/to/recording.edf --outdir out_clean \
+  --pad 0.25 --min-good 2.0 --export-csv
+
+# Optional: export each good segment to EDF (still writes events sidecar CSV per segment)
+./build/qeeg_clean_cli --input path/to/recording.edf --outdir out_clean \
+  --pad 0.25 --min-good 2.0 --export-edf --record-duration 1.0
+
+# You can also apply light preprocessing before scoring
+./build/qeeg_clean_cli --input path/to/recording.edf --outdir out_clean_filtered \
+  --average-reference --notch 50 --bandpass 1 45 --zero-phase \
+  --pad 0.25 --min-good 2.0 --export-csv
+```
+
+Notes:
+- `--pad` expands bad segments on each side (useful to avoid edge contamination).
+- When exporting segments, events are filtered to those overlapping the segment and their onset times
+  are shifted so each segment starts at `t=0`.
 
 ### 12) Individual Alpha Frequency (IAF) / alpha peak estimation
 

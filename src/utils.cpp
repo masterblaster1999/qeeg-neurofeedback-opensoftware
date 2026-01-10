@@ -12,6 +12,10 @@ static inline bool is_space(char c) {
   return std::isspace(static_cast<unsigned char>(c)) != 0;
 }
 
+static inline bool is_alnum(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) != 0;
+}
+
 std::string trim(const std::string& s) {
   size_t b = 0;
   while (b < s.size() && is_space(s[b])) ++b;
@@ -148,31 +152,6 @@ std::string to_lower(std::string s) {
   return s;
 }
 
-static std::string strip_common_ref_suffix(std::string s) {
-  // Only remove "ref/reference" when it is clearly a suffix separated by a
-  // delimiter, to avoid clobbering legitimate channel names.
-  //
-  // Examples: "F3-REF", "F3_ref", "F3 reference".
-  const std::string t = trim(s);
-
-  // Try longest suffixes first.
-  const std::vector<std::string> suffixes = {
-      "-reference",
-      "_reference",
-      " reference",
-      "-ref",
-      "_ref",
-      " ref",
-  };
-  for (const auto& suf : suffixes) {
-    if (ends_with(t, suf) && t.size() > suf.size()) {
-      const std::string head = trim(t.substr(0, t.size() - suf.size()));
-      if (!head.empty()) return head;
-    }
-  }
-  return t;
-}
-
 std::string normalize_channel_name(std::string s) {
   // NOTE: We keep this intentionally conservative and dependency-free.
   // It is used for lookups and matching, not for displaying labels.
@@ -182,17 +161,54 @@ std::string normalize_channel_name(std::string s) {
   s = trim(s);
   if (s.empty()) return s;
 
-  // Lowercase first so suffix checks are case-insensitive.
+  // Lowercase first so prefix/suffix checks are case-insensitive.
   s = to_lower(std::move(s));
-  s = strip_common_ref_suffix(std::move(s));
+
+  // Many EEG formats (notably EDF) store labels like "EEG Fp1-REF".
+  // For robust matching against montages and CLI user input, we build an
+  // alphanumeric-only key and then strip common modality prefixes/suffixes.
+  std::string t;
+  t.reserve(s.size());
+  for (char c : s) {
+    if (is_alnum(c)) t.push_back(c);
+  }
+  if (t.empty()) return t;
+
+  // Strip common leading modality tokens.
+  // Order matters: strip longer prefixes first.
+  //
+  // NOTE: Some devices use labels like "EEG1"/"EEG2" (digits immediately after the prefix).
+  // In those cases we *do not* strip the prefix, since it would collapse distinct channels
+  // down to bare digits and break matching/uniqueness.
+  const std::vector<std::string> prefixes = {"seeg", "ieeg", "eeg"};
+  for (const auto& p : prefixes) {
+    if (starts_with(t, p) && t.size() > p.size()) {
+      const char next = t[p.size()];
+      if (std::isalpha(static_cast<unsigned char>(next)) != 0) {
+        t = t.substr(p.size());
+      }
+      break;
+    }
+  }
+
+  // Strip common reference suffixes.
+  const std::vector<std::string> suffixes = {"reference", "ref"};
+  for (const auto& suf : suffixes) {
+    if (ends_with(t, suf) && t.size() > suf.size()) {
+      t = t.substr(0, t.size() - suf.size());
+      break;
+    }
+  }
+
+  if (t.empty()) return t;
 
   // Common 10-20 legacy aliases.
   // Older: T3 T4 T5 T6; Newer: T7 T8 P7 P8.
-  if (s == "t3") return "t7";
-  if (s == "t4") return "t8";
-  if (s == "t5") return "p7";
-  if (s == "t6") return "p8";
-  return s;
+  if (t == "t3") return "t7";
+  if (t == "t4") return "t8";
+  if (t == "t5") return "p7";
+  if (t == "t6") return "p8";
+  return t;
 }
 
 bool starts_with(const std::string& s, const std::string& prefix) {

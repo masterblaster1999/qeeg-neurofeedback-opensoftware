@@ -55,6 +55,14 @@ int main() {
   assert(builtin.has("F3-REF"));
   assert(builtin.get("F3-REF", &pref));
 
+  // Many EDF recordings include a leading modality token like "EEG".
+  // That should also match the montage.
+  Vec2 pref_eeg;
+  assert(builtin.has("EEG F3-REF"));
+  assert(builtin.get("EEG F3-REF", &pref_eeg));
+  assert(approx(pref_eeg.x, pref.x));
+  assert(approx(pref_eeg.y, pref.y));
+
   // Custom montage files should also be alias-tolerant.
   const std::string path = "tmp_montage_alias.csv";
   {

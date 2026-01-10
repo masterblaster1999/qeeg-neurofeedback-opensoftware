@@ -156,9 +156,9 @@ static Args parse_args(int argc, char** argv) {
 static int find_channel_index(const std::vector<std::string>& channels, const std::string& name) {
   if (channels.empty()) return -1;
   if (trim(name).empty()) return 0;
-  const std::string target = to_lower(trim(name));
+  const std::string target = normalize_channel_name(name);
   for (size_t i = 0; i < channels.size(); ++i) {
-    if (to_lower(channels[i]) == target) return static_cast<int>(i);
+    if (normalize_channel_name(channels[i]) == target) return static_cast<int>(i);
   }
   return -1;
 }

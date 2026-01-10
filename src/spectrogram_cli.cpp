@@ -130,9 +130,9 @@ static int find_channel_index(const std::vector<std::string>& names, const std::
   if (names.empty()) return -1;
   if (want.empty()) return 0;
 
-  std::string lw = to_lower(want);
+  const std::string lw = normalize_channel_name(want);
   for (size_t i = 0; i < names.size(); ++i) {
-    if (to_lower(names[i]) == lw) return static_cast<int>(i);
+    if (normalize_channel_name(names[i]) == lw) return static_cast<int>(i);
   }
 
   // Accept numeric index (0-based or 1-based) for convenience.

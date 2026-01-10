@@ -189,9 +189,9 @@ static Montage load_montage(const std::string& spec) {
 
 static int find_channel_index(const std::vector<std::string>& names, const std::string& want) {
   if (names.empty()) return -1;
-  std::string lw = to_lower(want);
+  const std::string lw = normalize_channel_name(want);
   for (size_t i = 0; i < names.size(); ++i) {
-    if (to_lower(names[i]) == lw) return static_cast<int>(i);
+    if (normalize_channel_name(names[i]) == lw) return static_cast<int>(i);
   }
   return -1;
 }
