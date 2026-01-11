@@ -10,6 +10,7 @@ namespace qeeg {
 // Small robust statistics helpers used across the project.
 //
 // - median_inplace(): O(n) average time via nth_element (modifies the input vector)
+// - quantile_inplace(): O(n) average time via nth_element (modifies the input vector)
 // - robust_scale(): median absolute deviation (MAD) scaled to be consistent with
 //   the standard deviation for Gaussian data, with a fallback to sample standard
 //   deviation when the MAD is ~0.
@@ -26,6 +27,45 @@ inline double median_inplace(std::vector<double>* v) {
     med = 0.5 * (med + *max_it);
   }
   return med;
+}
+
+// Linearly-interpolated empirical quantile.
+//
+// - q is clamped to [0,1].
+// - q=0 returns min, q=1 returns max.
+// - For 0<q<1, uses linear interpolation between the two nearest order statistics
+//   at index q*(n-1).
+//
+// This is intended for robust threshold initialization and other lightweight uses.
+// It is not meant to be a full featured statistics package.
+inline double quantile_inplace(std::vector<double>* v, double q) {
+  if (!v || v->empty()) return 0.0;
+
+  if (!std::isfinite(q)) q = 0.5;
+  if (q < 0.0) q = 0.0;
+  if (q > 1.0) q = 1.0;
+
+  const size_t n = v->size();
+  if (n == 1) return (*v)[0];
+
+  const double idx = q * static_cast<double>(n - 1);
+  const size_t lo = static_cast<size_t>(std::floor(idx));
+  const size_t hi = static_cast<size_t>(std::ceil(idx));
+
+  std::nth_element(v->begin(), v->begin() + static_cast<std::ptrdiff_t>(lo), v->end());
+  const double a = (*v)[lo];
+  if (hi == lo) return a;
+
+  std::nth_element(v->begin(), v->begin() + static_cast<std::ptrdiff_t>(hi), v->end());
+  const double b = (*v)[hi];
+
+  const double t = idx - static_cast<double>(lo);
+  return a + (b - a) * t;
+}
+
+inline double quantile(const std::vector<double>& values, double q) {
+  std::vector<double> tmp = values;
+  return quantile_inplace(&tmp, q);
 }
 
 inline double robust_scale(const std::vector<double>& values, double med) {

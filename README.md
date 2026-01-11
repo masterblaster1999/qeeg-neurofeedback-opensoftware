@@ -93,6 +93,29 @@ target_link_libraries(my_app PRIVATE qeeg::qeeg)
 Tip: for very large files, you can skip scanning samples with `--no-scan`, or request
 per-channel stats with `--per-channel` (limited by `--max-channels`).
 
+### 0c) Quick trace plot (SVG)
+
+If you want a fast, shareable view of raw (or lightly filtered) EEG, you can render a
+stacked time-series trace plot to a single SVG file:
+
+```bash
+# Plot a 10s window (default) from the first 8 channels
+./build/qeeg_trace_plot_cli --input path/to/recording.edf --outdir out_traces
+
+# Pick channels explicitly (names are case-insensitive; indices also accepted)
+./build/qeeg_trace_plot_cli --input path/to/recording.edf --outdir out_traces --channels Cz,Fz,Pz
+
+# Plot a specific time window and add basic filtering
+./build/qeeg_trace_plot_cli --input path/to/recording.edf --outdir out_traces \
+  --start 30 --duration 15 --notch 50 --bandpass 1 40 --zero-phase
+
+# Auto-scale each channel row (useful when channels have very different amplitudes)
+./build/qeeg_trace_plot_cli --input path/to/recording.edf --outdir out_traces --autoscale
+```
+
+The SVG includes optional vertical markers for EDF+/BDF+ annotations/events (disable with
+`--no-events`).
+
 ### 0b) Check 50/60 Hz line-noise (choose a notch frequency)
 
 If you don't know whether your recording is contaminated by **50 Hz** or **60 Hz** power-line
@@ -214,6 +237,18 @@ If you want to organize exports for other tools that expect the
 # BrainVision output variant (.vhdr/.vmrk/.eeg)
 ./build/qeeg_export_bids_cli --input session.edf --out-dir my_bids --sub 01 --task rest --ses 01   --format brainvision --eeg-reference Cz
 ```
+
+If your recording has trigger/annotation codes, you can optionally add extra columns to `*_events.tsv`:
+
+```bash
+# Add:
+#  - sample: event onset in samples (derived from onset * SamplingFrequency)
+#  - value: integer event code when the annotation text is numeric
+./build/qeeg_export_bids_cli --input session.edf --out-dir my_bids --sub 01 --task rest --ses 01 \
+  --format edf --eeg-reference Cz --events-sample --events-sample-base 0 --events-value
+```
+
+(When you add extra columns, they should be described in the accompanying `*_events.json`; this tool writes that description automatically.)
 
 ### 2c) Preprocess (CAR / notch / bandpass) and export a cleaned EDF or CSV
 
@@ -394,6 +429,9 @@ Examples:
 This CLI simulates a real-time neurofeedback loop by:
 - computing a metric on a sliding window (Welch PSD)
 - setting an initial threshold from a baseline period (or explicitly via `--threshold`)
+  - by default, the baseline threshold is an empirical quantile chosen to approximately
+    match `--target-rate` at initialization (above => q=1-R, below => q=R). Use
+    `--baseline-quantile 0.5` to force median behavior.
 - optionally rewarding when the metric is **above** or **below** the threshold (`--reward-direction`)
 - optionally adapting the threshold to maintain a target reward rate
 

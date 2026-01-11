@@ -3,6 +3,7 @@
 #include "qeeg/utils.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -240,40 +241,150 @@ void write_bids_channels_tsv(const std::string& path,
   }
 }
 
-void write_bids_events_tsv(const std::string& path, const std::vector<AnnotationEvent>& events) {
-  if (path.empty()) throw std::runtime_error("BIDS: events.tsv path is empty");
+static bool parse_int64_strict(const std::string& s, long long* out) {
+  const std::string t = trim(s);
+  if (t.empty()) return false;
 
-  std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
-  if (!f) throw std::runtime_error("Failed to write: " + path);
+  size_t i = 0;
+  if (t[0] == '+' || t[0] == '-') {
+    i = 1;
+    if (i >= t.size()) return false;
+  }
 
-  // Required columns: onset, duration.
-  // We add trial_type using the annotation text.
-  f << "onset\tduration\ttrial_type\n";
-  f << std::setprecision(12);
+  for (; i < t.size(); ++i) {
+    if (std::isdigit(static_cast<unsigned char>(t[i])) == 0) return false;
+  }
 
-  for (const auto& ev : events) {
-    const double onset = ev.onset_sec;
-    const double dur = (ev.duration_sec < 0.0) ? 0.0 : ev.duration_sec;
-    std::string trial_type = ev.text.empty() ? "n/a" : ev.text;
-
-    f << onset << "\t" << dur << "\t" << tsv_sanitize(trial_type) << "\n";
+  try {
+    *out = std::stoll(t);
+    return true;
+  } catch (const std::exception&) {
+    return false;
   }
 }
 
-void write_bids_events_json(const std::string& path) {
-  if (path.empty()) throw std::runtime_error("BIDS: events.json path is empty");
+void write_bids_events_tsv(const std::string& path,
+                          const std::vector<AnnotationEvent>& events,
+                          const BidsEventsTsvOptions& opts,
+                          double fs_hz) {
+  if (path.empty()) throw std::runtime_error("BIDS: events.tsv path is empty");
+
+  if (opts.include_sample && !(opts.sample_index_base == 0 || opts.sample_index_base == 1)) {
+    throw std::runtime_error("BIDS: sample_index_base must be 0 or 1");
+  }
 
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
 
-  f << "{\n";
-  f << "  \"trial_type\": {\n";
-  f << "    \"LongName\": \"Event label\",\n";
-  f << "    \"Description\": \"Annotation text carried over from the source recording.\"\n";
-  f << "  }\n";
-  f << "}\n";
+  // Required columns: onset, duration (in this order).
+  // We optionally include trial_type/sample/value after that.
+  f << "onset\tduration";
+  if (opts.include_trial_type) f << "\ttrial_type";
+  if (opts.include_sample) f << "\tsample";
+  if (opts.include_value) f << "\tvalue";
+  f << "\n";
+
+  f << std::setprecision(12);
+
+  // BIDS recommends sorting by onset.
+  std::vector<AnnotationEvent> sorted = events;
+  std::sort(sorted.begin(), sorted.end(), [](const AnnotationEvent& a, const AnnotationEvent& b) {
+    return a.onset_sec < b.onset_sec;
+  });
+
+  for (const auto& ev : sorted) {
+    const double onset = ev.onset_sec;
+    const double dur = (ev.duration_sec < 0.0) ? 0.0 : ev.duration_sec;
+    const std::string label = ev.text.empty() ? "n/a" : ev.text;
+
+    f << onset << "\t" << dur;
+
+    if (opts.include_trial_type) {
+      f << "\t" << tsv_sanitize(label);
+    }
+
+    if (opts.include_sample) {
+      if (fs_hz > 0.0) {
+        const long long sample0 = static_cast<long long>(std::llround(onset * fs_hz));
+        f << "\t" << (sample0 + static_cast<long long>(opts.sample_index_base));
+      } else {
+        f << "\t" << "n/a";
+      }
+    }
+
+    if (opts.include_value) {
+      long long v = 0;
+      if (parse_int64_strict(label, &v)) {
+        f << "\t" << v;
+      } else {
+        f << "\t" << "n/a";
+      }
+    }
+
+    f << "\n";
+  }
 }
 
+void write_bids_events_json(const std::string& path, const BidsEventsTsvOptions& opts) {
+  if (path.empty()) throw std::runtime_error("BIDS: events.json path is empty");
+
+  if (opts.include_sample && !(opts.sample_index_base == 0 || opts.sample_index_base == 1)) {
+    throw std::runtime_error("BIDS: sample_index_base must be 0 or 1");
+  }
+
+  std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
+  if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  auto write_entry = [&](const std::string& key,
+                         const std::string& long_name,
+                         const std::string& desc,
+                         const std::string& units,
+                         bool& wrote_any) {
+    if (wrote_any) f << ",\n";
+    f << "  \"" << json_escape(key) << "\": {\n";
+    f << "    \"LongName\": \"" << json_escape(long_name) << "\",\n";
+    f << "    \"Description\": \"" << json_escape(desc) << "\"";
+    if (!units.empty()) {
+      f << ",\n    \"Units\": \"" << json_escape(units) << "\"";
+    }
+    f << "\n  }";
+    wrote_any = true;
+  };
+
+  f << "{\n";
+  bool wrote_any = false;
+
+  if (opts.include_trial_type) {
+    write_entry("trial_type",
+                "Event label",
+                "Annotation text carried over from the source recording.",
+                "",
+                wrote_any);
+  }
+
+  if (opts.include_sample) {
+    const std::string base_desc = (opts.sample_index_base == 0)
+        ? "Sample indices are 0-based (sample 0 is the first stored sample)."
+        : "Sample indices are 1-based (sample 1 is the first stored sample).";
+
+    write_entry("sample",
+                "Event onset sample",
+                "Event onset expressed in samples of the accompanying raw data file. "
+                "Computed as round(onset * SamplingFrequency). " + base_desc,
+                "samples",
+                wrote_any);
+  }
+
+  if (opts.include_value) {
+    write_entry("value",
+                "Event code",
+                "Integer event code parsed from the annotation text when it is a plain integer; otherwise 'n/a'.",
+                "",
+                wrote_any);
+  }
+
+  f << "\n}\n";
+}
 void write_bids_eeg_json(const std::string& path,
                         const EEGRecording& rec,
                         const BidsEegJsonMetadata& meta) {

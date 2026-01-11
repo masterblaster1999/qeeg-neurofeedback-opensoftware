@@ -8,6 +8,7 @@
 #include "qeeg/nf_metric.hpp"
 #include "qeeg/nf_metric_eval.hpp"
 #include "qeeg/nf_threshold.hpp"
+#include "qeeg/robust_stats.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/wav_writer.hpp"
@@ -63,6 +64,11 @@ struct Args {
   // Neurofeedback threshold params
   // Initial threshold is estimated from the first --baseline seconds unless overridden by --threshold.
   double baseline_seconds{10.0};
+  // Optional: quantile in [0,1] used to derive the initial threshold from baseline values.
+  // If not set, defaults to an "auto" quantile that roughly matches --target-rate:
+  //   - RewardDirection::Above: q = 1 - target_rate
+  //   - RewardDirection::Below: q = target_rate
+  double baseline_quantile{std::numeric_limits<double>::quiet_NaN()};
   double initial_threshold{std::numeric_limits<double>::quiet_NaN()}; // NaN => use baseline
   RewardDirection reward_direction{RewardDirection::Above};
   double target_reward_rate{0.6};
@@ -136,6 +142,9 @@ static void print_help() {
     << "  --relative-range LO HI    Total-power integration range used for --relative.\n"
     << "                           Default: [min_band_fmin, max_band_fmax] from --bands.\n"
     << "  --baseline S              Baseline duration seconds for initial threshold (default: 10)\n"
+    << "  --baseline-quantile Q     Baseline quantile in [0,1] for initial threshold.\n"
+    << "                           Default: auto (matches --target-rate): above=>1-R, below=>R.\n"
+    << "                           Set Q=0.5 to force median behavior.\n"
     << "  --threshold X             Set an explicit initial threshold (skips baseline threshold estimation)\n"
     << "  --reward-direction DIR    Reward direction: above|below (default: above)\n"
     << "  --target-rate R           Target reward rate in (0,1) (default: 0.6)\n"
@@ -208,6 +217,8 @@ static Args parse_args(int argc, char** argv) {
       a.relative_fmax_hz = to_double(argv[++i]);
     } else if (arg == "--baseline" && i + 1 < argc) {
       a.baseline_seconds = to_double(argv[++i]);
+    } else if (arg == "--baseline-quantile" && i + 1 < argc) {
+      a.baseline_quantile = to_double(argv[++i]);
     } else if (arg == "--threshold" && i + 1 < argc) {
       a.initial_threshold = to_double(argv[++i]);
     } else if (arg == "--reward-direction" && i + 1 < argc) {
@@ -678,17 +689,41 @@ static double compute_metric_band_or_ratio(const OnlineBandpowerFrame& fr,
   return nf_eval_metric_band_or_ratio(fr, spec, c, 0, static_cast<size_t>(b_num), static_cast<size_t>(b_den));
 }
 
-static double median(std::vector<double> v) {
-  if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
-  const size_t n = v.size();
-  const size_t mid = n / 2;
-  std::nth_element(v.begin(), v.begin() + mid, v.end());
-  double m = v[mid];
-  if ((n % 2) == 0) {
-    std::nth_element(v.begin(), v.begin() + (mid - 1), v.end());
-    m = 0.5 * (m + v[mid - 1]);
+static double clamp01(double x) {
+  if (!std::isfinite(x)) return 0.5;
+  if (x < 0.0) return 0.0;
+  if (x > 1.0) return 1.0;
+  return x;
+}
+
+// Pick the baseline quantile used to derive the initial threshold from baseline values.
+//
+// If the user explicitly passes --baseline-quantile Q, we use it.
+// Otherwise, we choose an "auto" quantile that approximately matches the desired
+// reward rate at initialization:
+//   - reward above => P(x > thr) ~ R => thr ~ F^{-1}(1-R)
+//   - reward below => P(x < thr) ~ R => thr ~ F^{-1}(R)
+static double baseline_quantile_used(const Args& args) {
+  if (std::isfinite(args.baseline_quantile)) return clamp01(args.baseline_quantile);
+  const double q = (args.reward_direction == RewardDirection::Above)
+                     ? (1.0 - args.target_reward_rate)
+                     : args.target_reward_rate;
+  return clamp01(q);
+}
+
+static double initial_threshold_from_baseline(const Args& args,
+                                              const std::vector<double>& baseline_values,
+                                              double fallback_value,
+                                              double* q_used_out = nullptr) {
+  const double q = baseline_quantile_used(args);
+  if (q_used_out) *q_used_out = q;
+
+  if (baseline_values.empty()) {
+    return fallback_value;
   }
-  return m;
+  std::vector<double> tmp = baseline_values;
+  const double thr = quantile_inplace(&tmp, q);
+  return std::isfinite(thr) ? thr : fallback_value;
 }
 
 static size_t sec_to_samples(double sec, double fs_hz) {
@@ -707,6 +742,14 @@ int main(int argc, char** argv) {
     }
     if (args.target_reward_rate <= 0.0 || args.target_reward_rate >= 1.0) {
       throw std::runtime_error("--target-rate must be in (0,1)");
+    }
+    if (args.baseline_seconds < 0.0) {
+      throw std::runtime_error("--baseline must be >= 0");
+    }
+    if (std::isfinite(args.baseline_quantile)) {
+      if (args.baseline_quantile < 0.0 || args.baseline_quantile > 1.0) {
+        throw std::runtime_error("--baseline-quantile must be in [0,1]");
+      }
     }
     if (args.adapt_eta < 0.0) {
       throw std::runtime_error("--eta must be >= 0");
@@ -758,6 +801,11 @@ int main(int argc, char** argv) {
         else meta << "null";
         meta << ",\n";
         meta << "  \"baseline_seconds\": " << args.baseline_seconds << ",\n";
+        meta << "  \"baseline_quantile\": ";
+        if (std::isfinite(args.baseline_quantile)) meta << args.baseline_quantile;
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"baseline_quantile_used\": " << baseline_quantile_used(args) << ",\n";
         meta << "  \"target_reward_rate\": " << args.target_reward_rate << ",\n";
         meta << "  \"adapt_eta\": " << args.adapt_eta << ",\n";
         meta << "  \"reward_rate_window_seconds\": " << args.reward_rate_window_seconds << ",\n";
@@ -998,11 +1046,12 @@ int main(int argc, char** argv) {
             if (fr.t_end_sec <= args.baseline_seconds) {
               baseline_values.push_back(val);
             } else {
-              threshold = median(baseline_values);
-              if (!std::isfinite(threshold)) threshold = val;
+              double q_used = 0.5;
+              threshold = initial_threshold_from_baseline(args, baseline_values, val, &q_used);
               have_threshold = true;
               std::cout << "Initial threshold set to: " << threshold
-                        << " (baseline=" << args.baseline_seconds << "s, n=" << baseline_values.size() << ")\n";
+                        << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
+                        << ", n=" << baseline_values.size() << ")\n";
             }
             const double thr_send = have_threshold ? threshold : 0.0;
             osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,
@@ -1120,11 +1169,12 @@ int main(int argc, char** argv) {
             if (fr.t_end_sec <= args.baseline_seconds) {
               baseline_values.push_back(val);
             } else {
-              threshold = median(baseline_values);
-              if (!std::isfinite(threshold)) threshold = val;
+              double q_used = 0.5;
+              threshold = initial_threshold_from_baseline(args, baseline_values, val, &q_used);
               have_threshold = true;
               std::cout << "Initial threshold set to: " << threshold
-                        << " (baseline=" << args.baseline_seconds << "s, n=" << baseline_values.size() << ")\n";
+                        << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
+                        << ", n=" << baseline_values.size() << ")\n";
             }
             const double thr_send = have_threshold ? threshold : 0.0;
             osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,
@@ -1272,11 +1322,12 @@ int main(int argc, char** argv) {
           if (fr.t_end_sec <= args.baseline_seconds) {
             baseline_values.push_back(val);
           } else {
-            threshold = median(baseline_values);
-            if (!std::isfinite(threshold)) threshold = val;
+            double q_used = 0.5;
+            threshold = initial_threshold_from_baseline(args, baseline_values, val, &q_used);
             have_threshold = true;
             std::cout << "Initial threshold set to: " << threshold
-                      << " (baseline=" << args.baseline_seconds << "s, n=" << baseline_values.size() << ")\n";
+                      << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
+                      << ", n=" << baseline_values.size() << ")\n";
           }
           const double thr_send = have_threshold ? threshold : 0.0;
           osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,

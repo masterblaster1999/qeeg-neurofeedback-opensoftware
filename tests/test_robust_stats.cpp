@@ -30,6 +30,35 @@ int main() {
     assert(approx(scale, 1.4826, 1e-4));
   }
 
+  // Quantiles (linearly interpolated empirical quantile with q*(n-1))
+  {
+    std::vector<double> v = {1.0, 2.0, 3.0, 4.0};
+    assert(approx(quantile_inplace(&v, 0.0), 1.0));
+  }
+  {
+    std::vector<double> v = {1.0, 2.0, 3.0, 4.0};
+    assert(approx(quantile_inplace(&v, 1.0), 4.0));
+  }
+  {
+    // Median for even n is the average of the two middle values.
+    std::vector<double> v = {1.0, 2.0, 3.0, 4.0};
+    assert(approx(quantile_inplace(&v, 0.5), 2.5));
+  }
+  {
+    // q=0.25 => idx=0.75 => 1 + 0.75*(2-1)=1.75
+    std::vector<double> v = {1.0, 2.0, 3.0, 4.0};
+    assert(approx(quantile_inplace(&v, 0.25), 1.75));
+  }
+  {
+    // q is clamped to [0,1]
+    std::vector<double> v = {4.0, 1.0, 3.0, 2.0};
+    assert(approx(quantile_inplace(&v, -1.0), 1.0));
+  }
+  {
+    std::vector<double> v = {4.0, 1.0, 3.0, 2.0};
+    assert(approx(quantile_inplace(&v, 2.0), 4.0));
+  }
+
   // Constant data => MAD == 0, fallback should yield a sane non-zero scale.
   {
     const std::vector<double> v = {1.0, 1.0, 1.0};

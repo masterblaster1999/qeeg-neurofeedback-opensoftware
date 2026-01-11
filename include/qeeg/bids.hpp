@@ -91,11 +91,52 @@ void write_bids_channels_tsv(const std::string& path,
 
 // ---- *_events.tsv / *_events.json ----
 
-// Write events.tsv with required columns: onset, duration.
-// Adds trial_type derived from AnnotationEvent::text.
-void write_bids_events_tsv(const std::string& path, const std::vector<AnnotationEvent>& events);
+// Options for events.tsv export.
+//
+// BIDS requires at least `onset` and `duration` columns. Any additional columns
+// are allowed, and SHOULD be described in an accompanying events.json.
+//
+// Note: Historically, BIDS treated `sample` and `value` as optional columns.
+// In newer BIDS versions they are treated as arbitrary additional columns, but
+// they are still commonly used by downstream tools.
+struct BidsEventsTsvOptions {
+  // Write `trial_type` derived from AnnotationEvent::text.
+  bool include_trial_type{true};
 
-// Write a minimal events.json describing the trial_type column.
-void write_bids_events_json(const std::string& path);
+  // Add a `sample` column derived from onset_sec * fs_hz.
+  bool include_sample{false};
+
+  // Add a `value` column derived from parsing AnnotationEvent::text as an integer.
+  bool include_value{false};
+
+  // Base for `sample` indices (0 or 1).
+  // If include_sample==true and fs_hz>0, output sample = round(onset_sec * fs_hz) + sample_index_base.
+  int sample_index_base{0};
+};
+
+// Write events.tsv with required columns: onset, duration.
+// By default also writes `trial_type` derived from AnnotationEvent::text.
+//
+// If opts.include_sample==true, you should pass a valid sampling frequency (fs_hz).
+void write_bids_events_tsv(const std::string& path,
+                           const std::vector<AnnotationEvent>& events,
+                           const BidsEventsTsvOptions& opts,
+                           double fs_hz = 0.0);
+
+// Backwards-compatible convenience wrapper.
+inline void write_bids_events_tsv(const std::string& path, const std::vector<AnnotationEvent>& events) {
+  BidsEventsTsvOptions opts;
+  write_bids_events_tsv(path, events, opts, /*fs_hz=*/0.0);
+}
+
+// Write a minimal events.json describing the columns in events.tsv.
+// By default describes `trial_type` only.
+void write_bids_events_json(const std::string& path, const BidsEventsTsvOptions& opts);
+
+// Backwards-compatible convenience wrapper.
+inline void write_bids_events_json(const std::string& path) {
+  BidsEventsTsvOptions opts;
+  write_bids_events_json(path, opts);
+}
 
 } // namespace qeeg

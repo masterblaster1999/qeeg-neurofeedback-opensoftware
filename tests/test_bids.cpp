@@ -53,6 +53,7 @@ int main() {
     rec.data[1] = {0.0f, 0.0f, 0.0f};
     rec.data[2] = {0.0f, 5.0f, 0.0f};
     rec.events.push_back({1.0, 0.0, "stim"});
+    rec.events.push_back({0.5, 0.1, "5"});
 
     BidsEegJsonMetadata meta;
     meta.eeg_reference = "Cz";
@@ -72,6 +73,18 @@ int main() {
     write_bids_events_tsv(events_tsv.u8string(), rec.events);
     write_bids_events_json(events_json.u8string());
 
+    // Also test optional extra columns in events.tsv.
+    const auto events_extra_tsv = tmp / "sub-01_task-rest_events_extra.tsv";
+    const auto events_extra_json = tmp / "sub-01_task-rest_events_extra.json";
+
+    BidsEventsTsvOptions ev_opts;
+    ev_opts.include_sample = true;
+    ev_opts.sample_index_base = 0;
+    ev_opts.include_value = true;
+
+    write_bids_events_tsv(events_extra_tsv.u8string(), rec.events, ev_opts, rec.fs_hz);
+    write_bids_events_json(events_extra_json.u8string(), ev_opts);
+
     const std::string eeg = slurp(eeg_json);
     assert(eeg.find("\"SamplingFrequency\"") != std::string::npos);
     assert(eeg.find("\"EEGReference\": \"Cz\"") != std::string::npos);
@@ -90,6 +103,16 @@ int main() {
 
     const std::string evj = slurp(events_json);
     assert(evj.find("trial_type") != std::string::npos);
+
+    const std::string evx = slurp(events_extra_tsv);
+    assert(evx.find("onset\tduration\ttrial_type\tsample\tvalue") != std::string::npos);
+    assert(evx.find("0.5\t0.1\t5\t125\t5") != std::string::npos);
+    assert(evx.find("stim\t250\tn/a") != std::string::npos);
+
+    const std::string evxj = slurp(events_extra_json);
+    assert(evxj.find("trial_type") != std::string::npos);
+    assert(evxj.find("sample") != std::string::npos);
+    assert(evxj.find("value") != std::string::npos);
   }
 
   std::cout << "All tests passed.\n";

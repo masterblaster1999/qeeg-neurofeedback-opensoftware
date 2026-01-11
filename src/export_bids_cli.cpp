@@ -41,6 +41,12 @@ struct Args {
   std::string software_filters{"n/a"}; // n/a or raw JSON object
 
   bool no_events{false};
+
+  // Optional extra columns in *_events.tsv
+  bool events_sample{false};
+  int events_sample_base{0}; // 0 or 1
+  bool events_value{false};
+
   bool overwrite{false};
 };
 
@@ -71,6 +77,9 @@ static void print_help() {
       << "  --powerline <auto|n/a|Hz>      PowerLineFrequency. 'auto' uses a 50/60 Hz detector.\n"
       << "  --software-filters <n/a|JSON>  SoftwareFilters. Use 'n/a' or a raw JSON object string.\n"
       << "  --no-events                    Do not write *_events.tsv/json even if events exist.\n"
+      << "  --events-sample                Add a 'sample' column to *_events.tsv (derived from onset * SamplingFrequency).\n"
+      << "  --events-sample-base <0|1>     Base for the 'sample' column (default: 0).\n"
+      << "  --events-value                 Add a 'value' column (integer parsed from annotation text when possible).\n"
       << "  --overwrite                    Overwrite output files if they already exist.\n"
       << "  -h, --help                     Show this help.\n\n"
       << "Notes:\n"
@@ -100,6 +109,19 @@ static double parse_double_or_throw(const std::string& s, const std::string& fla
     return std::stod(s);
   } catch (const std::exception&) {
     throw std::runtime_error("Failed to parse numeric value for " + flag + ": '" + s + "'");
+  }
+}
+
+static int parse_int_or_throw(const std::string& s, const std::string& flag) {
+  try {
+    size_t pos = 0;
+    const int v = std::stoi(s, &pos, 10);
+    if (pos != s.size()) {
+      throw std::runtime_error("Trailing characters");
+    }
+    return v;
+  } catch (const std::exception&) {
+    throw std::runtime_error("Failed to parse integer value for " + flag + ": '" + s + "'");
   }
 }
 
@@ -156,6 +178,12 @@ int main(int argc, char** argv) {
         args.software_filters = require_value(i, argc, argv, a);
       } else if (a == "--no-events") {
         args.no_events = true;
+      } else if (a == "--events-sample") {
+        args.events_sample = true;
+      } else if (a == "--events-sample-base") {
+        args.events_sample_base = parse_int_or_throw(require_value(i, argc, argv, a), a);
+      } else if (a == "--events-value") {
+        args.events_value = true;
       } else if (a == "--overwrite") {
         args.overwrite = true;
       } else {
@@ -186,6 +214,10 @@ int main(int argc, char** argv) {
 
     if (args.format != "edf" && args.format != "brainvision") {
       throw std::runtime_error("Invalid --format (expected edf or brainvision): " + args.format);
+    }
+
+    if (!(args.events_sample_base == 0 || args.events_sample_base == 1)) {
+      throw std::runtime_error("Invalid --events-sample-base (use 0 or 1): " + std::to_string(args.events_sample_base));
     }
 
     // Load recording.
@@ -314,8 +346,13 @@ int main(int argc, char** argv) {
 
     // Write events sidecars if present.
     if (!args.no_events && !rec.events.empty()) {
-      write_bids_events_tsv(events_tsv.u8string(), rec.events);
-      write_bids_events_json(events_json.u8string());
+      BidsEventsTsvOptions ev_opts;
+      ev_opts.include_sample = args.events_sample;
+      ev_opts.sample_index_base = args.events_sample_base;
+      ev_opts.include_value = args.events_value;
+
+      write_bids_events_tsv(events_tsv.u8string(), rec.events, ev_opts, rec.fs_hz);
+      write_bids_events_json(events_json.u8string(), ev_opts);
     }
 
     std::cout << "Wrote BIDS EEG export to: " << eeg_dir.u8string() << "\n";

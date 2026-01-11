@@ -96,6 +96,10 @@ target_link_libraries(qeeg_epoch_cli PRIVATE qeeg)
 add_executable(qeeg_spectrogram_cli src/spectrogram_cli.cpp)
 target_link_libraries(qeeg_spectrogram_cli PRIVATE qeeg)
 
+add_executable(qeeg_trace_plot_cli src/trace_plot_cli.cpp)
+target_link_libraries(qeeg_trace_plot_cli PRIVATE qeeg)
+
+
 add_executable(qeeg_iaf_cli src/iaf_cli.cpp)
 target_link_libraries(qeeg_iaf_cli PRIVATE qeeg)
 
@@ -162,6 +166,7 @@ install(TARGETS
   qeeg_plv_cli
   qeeg_epoch_cli
   qeeg_spectrogram_cli
+  qeeg_trace_plot_cli
   qeeg_iaf_cli
   qeeg_microstates_cli
   qeeg_pac_cli
@@ -359,6 +364,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_robust_stats tests/test_robust_stats.cpp)
   target_link_libraries(qeeg_test_robust_stats PRIVATE qeeg)
   add_test(NAME qeeg_test_robust_stats COMMAND qeeg_test_robust_stats)
+
+  add_executable(qeeg_test_svg_utils tests/test_svg_utils.cpp)
+  target_link_libraries(qeeg_test_svg_utils PRIVATE qeeg)
+  add_test(NAME qeeg_test_svg_utils COMMAND qeeg_test_svg_utils)
 
   add_executable(qeeg_test_pattern_match tests/test_pattern_match.cpp)
   target_link_libraries(qeeg_test_pattern_match PRIVATE qeeg)
