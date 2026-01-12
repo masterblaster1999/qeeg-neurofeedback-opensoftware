@@ -8,8 +8,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace qeeg {
@@ -179,6 +181,196 @@ std::string guess_bids_channel_type(const std::string& channel_name) {
 
   // Default for scalp channels.
   return "EEG";
+}
+
+bool is_valid_bids_coordinate_unit(const std::string& unit) {
+  return unit == "m" || unit == "mm" || unit == "cm" || unit == "n/a";
+}
+
+static inline bool is_na_token(const std::string& s) {
+  const std::string t = to_lower(trim(s));
+  return t.empty() || t == "n/a" || t == "na";
+}
+
+static std::optional<double> parse_optional_double_strict(const std::string& s,
+                                                          const std::string& context) {
+  const std::string t = trim(s);
+  if (is_na_token(t)) return std::nullopt;
+
+  try {
+    size_t pos = 0;
+    const double v = std::stod(t, &pos);
+    if (pos != t.size()) {
+      throw std::runtime_error("Trailing characters");
+    }
+    if (!std::isfinite(v)) {
+      throw std::runtime_error("Non-finite value");
+    }
+    return v;
+  } catch (const std::exception&) {
+    throw std::runtime_error("BIDS: failed to parse numeric value for " + context + ": '" + t + "'");
+  }
+}
+
+static std::string format_double_or_na(const std::optional<double>& v, int precision = 6) {
+  if (!v.has_value()) return "n/a";
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(precision) << v.value();
+  return oss.str();
+}
+
+static char detect_delim(const std::string& header_line) {
+  // Prefer TSV if tabs are present.
+  if (header_line.find('\t') != std::string::npos) return '\t';
+  return ',';
+}
+
+std::vector<BidsElectrode> load_bids_electrodes_table(const std::string& path) {
+  if (path.empty()) throw std::runtime_error("BIDS: electrodes table path is empty");
+
+  std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
+  if (!f) throw std::runtime_error("BIDS: failed to open electrodes table: " + path);
+
+  std::string line;
+  bool have_header = false;
+  char delim = ',';
+  std::vector<std::string> header_fields;
+  std::unordered_map<std::string, size_t> col;
+
+  std::vector<BidsElectrode> out;
+
+  while (std::getline(f, line)) {
+    // Handle UTF-8 BOM on first line (best-effort).
+    if (!have_header) {
+      line = strip_utf8_bom(line);
+    }
+
+    const std::string trimmed = trim(line);
+    if (trimmed.empty()) continue;
+    if (!trimmed.empty() && trimmed[0] == '#') continue;
+
+    if (!have_header) {
+      delim = detect_delim(trimmed);
+      header_fields = (delim == '\t') ? split(trimmed, delim) : split_csv_row(trimmed, delim);
+
+      col.clear();
+      for (size_t i = 0; i < header_fields.size(); ++i) {
+        std::string key = to_lower(trim(header_fields[i]));
+        if (key.empty()) continue;
+        // First occurrence wins.
+        if (col.find(key) == col.end()) col[key] = i;
+      }
+
+      // Required columns.
+      if (col.find("name") == col.end() || col.find("x") == col.end() ||
+          col.find("y") == col.end() || col.find("z") == col.end()) {
+        throw std::runtime_error("BIDS: electrodes table must include header columns: name,x,y,z");
+      }
+
+      have_header = true;
+      continue;
+    }
+
+    const auto fields = (delim == '\t') ? split(trimmed, delim) : split_csv_row(trimmed, delim);
+
+    auto get_field = [&](const char* key) -> std::string {
+      auto it = col.find(key);
+      if (it == col.end()) return {};
+      const size_t idx = it->second;
+      if (idx >= fields.size()) return {};
+      return trim(fields[idx]);
+    };
+
+    BidsElectrode e;
+    e.name = get_field("name");
+    if (e.name.empty()) {
+      throw std::runtime_error("BIDS: electrodes table row is missing a 'name' value");
+    }
+
+    e.x = parse_optional_double_strict(get_field("x"), "electrodes.x");
+    e.y = parse_optional_double_strict(get_field("y"), "electrodes.y");
+    e.z = parse_optional_double_strict(get_field("z"), "electrodes.z");
+
+    // Optional columns.
+    e.type = is_na_token(get_field("type")) ? std::string() : get_field("type");
+    e.material = is_na_token(get_field("material")) ? std::string() : get_field("material");
+    if (col.find("impedance") != col.end()) {
+      e.impedance_kohm = parse_optional_double_strict(get_field("impedance"), "electrodes.impedance");
+    }
+
+    out.push_back(std::move(e));
+  }
+
+  if (!have_header) {
+    throw std::runtime_error("BIDS: electrodes table is empty or missing a header row");
+  }
+
+  return out;
+}
+
+void write_bids_electrodes_tsv(const std::string& path,
+                               const std::vector<BidsElectrode>& electrodes) {
+  if (path.empty()) throw std::runtime_error("BIDS: electrodes.tsv path is empty");
+
+  // Validate uniqueness of electrode names.
+  std::unordered_set<std::string> seen;
+  seen.reserve(electrodes.size());
+  for (const auto& e : electrodes) {
+    if (e.name.empty()) throw std::runtime_error("BIDS: electrode name must not be empty");
+    if (!seen.insert(e.name).second) {
+      throw std::runtime_error("BIDS: duplicate electrode name: '" + e.name + "'");
+    }
+  }
+
+  std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
+  if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  // Required columns first in mandated order, plus recommended columns.
+  f << "name\tx\ty\tz\ttype\tmaterial\timpedance\n";
+
+  for (const auto& e : electrodes) {
+    const std::string type = e.type.empty() ? "n/a" : e.type;
+    const std::string material = e.material.empty() ? "n/a" : e.material;
+
+    f << tsv_sanitize(e.name) << "\t";
+    f << tsv_sanitize(format_double_or_na(e.x)) << "\t";
+    f << tsv_sanitize(format_double_or_na(e.y)) << "\t";
+    f << tsv_sanitize(format_double_or_na(e.z)) << "\t";
+    f << tsv_sanitize(type) << "\t";
+    f << tsv_sanitize(material) << "\t";
+    f << tsv_sanitize(format_double_or_na(e.impedance_kohm, /*precision=*/6)) << "\n";
+  }
+}
+
+void write_bids_coordsystem_json(const std::string& path,
+                                 const BidsCoordsystemJsonEegMetadata& meta) {
+  if (path.empty()) throw std::runtime_error("BIDS: coordsystem.json path is empty");
+  if (meta.eeg_coordinate_system.empty()) {
+    throw std::runtime_error("BIDS: EEGCoordinateSystem is empty");
+  }
+  if (meta.eeg_coordinate_units.empty()) {
+    throw std::runtime_error("BIDS: EEGCoordinateUnits is empty");
+  }
+  if (!is_valid_bids_coordinate_unit(meta.eeg_coordinate_units)) {
+    throw std::runtime_error("BIDS: invalid EEGCoordinateUnits (use m/mm/cm/n/a): '" + meta.eeg_coordinate_units + "'");
+  }
+  if (meta.eeg_coordinate_system == "Other" && meta.eeg_coordinate_system_description.empty()) {
+    throw std::runtime_error("BIDS: EEGCoordinateSystemDescription is required when EEGCoordinateSystem is 'Other'");
+  }
+
+  std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
+  if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  f << "{\n";
+  f << "  \"EEGCoordinateSystem\": \"" << json_escape(meta.eeg_coordinate_system) << "\",\n";
+  f << "  \"EEGCoordinateUnits\": \"" << json_escape(meta.eeg_coordinate_units) << "\"";
+
+  if (!meta.eeg_coordinate_system_description.empty()) {
+    f << ",\n  \"EEGCoordinateSystemDescription\": \""
+      << json_escape(meta.eeg_coordinate_system_description) << "\"";
+  }
+
+  f << "\n}\n";
 }
 
 void write_bids_channels_tsv(const std::string& path,
@@ -385,6 +577,136 @@ void write_bids_events_json(const std::string& path, const BidsEventsTsvOptions&
 
   f << "\n}\n";
 }
+
+static std::string trial_type_level_description(const std::string& level) {
+  // Provide slightly nicer descriptions for common qeeg-derived categories.
+  if (level == "NF:Reward") return "Neurofeedback reward active.";
+  if (level == "NF:Artifact") return "Artifact gate active (data considered contaminated).";
+  if (level == "NF:Baseline") return "Baseline estimation segment.";
+  if (level.rfind("NF:", 0) == 0) return "Neurofeedback derived event.";
+  if (level == "n/a") return "Not applicable / missing label.";
+  return "Event label.";
+}
+
+static std::vector<std::string> collect_unique_trial_types_limited(
+    const std::vector<AnnotationEvent>& events,
+    size_t max_unique,
+    bool* too_many) {
+  if (too_many) *too_many = false;
+
+  // Collect up to max_unique+1 so we can detect overflow.
+  std::set<std::string> uniq;
+  for (const auto& ev : events) {
+    const std::string label = ev.text.empty() ? "n/a" : ev.text;
+    uniq.insert(label);
+    if (uniq.size() > max_unique) {
+      if (too_many) *too_many = true;
+      break;
+    }
+  }
+
+  // Deterministic ordering.
+  std::vector<std::string> out;
+  out.reserve(std::min(max_unique, uniq.size()));
+  for (const auto& s : uniq) {
+    if (out.size() >= max_unique) break;
+    out.push_back(s);
+  }
+  return out;
+}
+
+void write_bids_events_json(const std::string& path,
+                            const BidsEventsTsvOptions& opts,
+                            const std::vector<AnnotationEvent>& events) {
+  if (path.empty()) throw std::runtime_error("BIDS: events.json path is empty");
+
+  if (opts.include_sample && !(opts.sample_index_base == 0 || opts.sample_index_base == 1)) {
+    throw std::runtime_error("BIDS: sample_index_base must be 0 or 1");
+  }
+
+  std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
+  if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  auto write_entry = [&](const std::string& key,
+                         const std::string& long_name,
+                         const std::string& desc,
+                         const std::string& units,
+                         bool& wrote_any) {
+    if (wrote_any) f << ",\n";
+    f << "  \"" << json_escape(key) << "\": {\n";
+    f << "    \"LongName\": \"" << json_escape(long_name) << "\",\n";
+    f << "    \"Description\": \"" << json_escape(desc) << "\"";
+    if (!units.empty()) {
+      f << ",\n    \"Units\": \"" << json_escape(units) << "\"";
+    }
+    f << "\n  }";
+    wrote_any = true;
+  };
+
+  f << "{\n";
+  bool wrote_any = false;
+
+  if (opts.include_trial_type) {
+    if (wrote_any) f << ",\n";
+
+    bool too_many = false;
+    const auto levels = (opts.include_trial_type_levels)
+        ? collect_unique_trial_types_limited(events, opts.trial_type_levels_max, &too_many)
+        : std::vector<std::string>{};
+
+    std::string desc = "Annotation text carried over from the source recording.";
+    if (opts.include_trial_type_levels) {
+      if (too_many) {
+        desc += " Levels omitted because the number of unique values exceeded the configured maximum.";
+      } else {
+        desc += " Levels are listed under Levels for convenience.";
+      }
+    }
+
+    f << "  \"trial_type\": {\n";
+    f << "    \"LongName\": \"Event label\",\n";
+    f << "    \"Description\": \"" << json_escape(desc) << "\"";
+
+    if (opts.include_trial_type_levels && !too_many) {
+      f << ",\n    \"Levels\": {\n";
+      for (size_t i = 0; i < levels.size(); ++i) {
+        const auto& k = levels[i];
+        const auto v = trial_type_level_description(k);
+        f << "      \"" << json_escape(k) << "\": \"" << json_escape(v) << "\"";
+        if (i + 1 < levels.size()) f << ",";
+        f << "\n";
+      }
+      f << "    }";
+    }
+
+    f << "\n  }";
+    wrote_any = true;
+  }
+
+  if (opts.include_sample) {
+    const std::string base_desc = (opts.sample_index_base == 0)
+        ? "Sample indices are 0-based (sample 0 is the first stored sample)."
+        : "Sample indices are 1-based (sample 1 is the first stored sample).";
+
+    write_entry("sample",
+                "Event onset sample",
+                "Event onset expressed in samples of the accompanying raw data file. "
+                "Computed as round(onset * SamplingFrequency). " + base_desc,
+                "samples",
+                wrote_any);
+  }
+
+  if (opts.include_value) {
+    write_entry("value",
+                "Event code",
+                "Integer event code parsed from the annotation text when it is a plain integer; otherwise 'n/a'.",
+                "",
+                wrote_any);
+  }
+
+  f << "\n}\n";
+}
+
 void write_bids_eeg_json(const std::string& path,
                         const EEGRecording& rec,
                         const BidsEegJsonMetadata& meta) {

@@ -220,6 +220,7 @@ TriggerExtractionResult extract_events_from_trigger_channel(const EEGRecording& 
   std::size_t idx = static_cast<std::size_t>(-1);
   std::string used;
   std::string key;
+  std::uint32_t mask = 0;
 
   if (!opt.channel_name.empty()) {
     const std::string want = normalize_channel_name(opt.channel_name);
@@ -235,6 +236,7 @@ TriggerExtractionResult extract_events_from_trigger_channel(const EEGRecording& 
     if (idx == static_cast<std::size_t>(-1)) {
       throw std::runtime_error("Trigger channel not found: " + opt.channel_name);
     }
+    mask = default_mask_for_channel(key, opt);
   } else {
     // Auto: choose best trigger-like candidate.
     double best_score = 0.0;
@@ -274,7 +276,7 @@ TriggerExtractionResult extract_events_from_trigger_channel(const EEGRecording& 
             best_idx = i;
             best_used = rec.channel_names[i];
             best_key = k;
-            best_mask = 0;
+            best_mask = default_mask_for_channel(k, opt);
           }
         }
       }
@@ -283,6 +285,7 @@ TriggerExtractionResult extract_events_from_trigger_channel(const EEGRecording& 
     idx = best_idx;
     used = best_used;
     key = best_key;
+    mask = best_mask;
 
     // For auto path, if best_score is very low, treat as none.
     if (idx == static_cast<std::size_t>(-1) || best_score <= 0.0) {
@@ -290,8 +293,6 @@ TriggerExtractionResult extract_events_from_trigger_channel(const EEGRecording& 
     }
   }
 
-  // Determine mask.
-  const std::uint32_t mask = default_mask_for_channel(key, opt);
 
   TriggerExtractionResult res;
   res.used_channel = used;

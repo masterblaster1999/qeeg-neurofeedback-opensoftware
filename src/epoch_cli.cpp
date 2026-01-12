@@ -1,6 +1,9 @@
 #include "qeeg/annotations.hpp"
 #include "qeeg/baseline.hpp"
 #include "qeeg/bandpower.hpp"
+#include "qeeg/csv_io.hpp"
+#include "qeeg/event_ops.hpp"
+#include "qeeg/nf_session.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
@@ -27,8 +30,16 @@ struct Args {
   std::string input_path;
   std::string outdir{"out_epochs"};
 
-  // If provided, override embedded EDF+/BDF+ annotations with this CSV.
-  std::string events_csv;
+  // If provided, override embedded EDF+/BDF+ annotations with this table.
+  // Supported formats: qeeg events CSV (onset_sec,duration_sec,text) or BIDS events TSV (onset,duration,trial_type).
+  std::string events_path;
+
+  // Additional events tables to merge (repeatable). Useful for overlaying/combining
+  // multiple sources (e.g., BIDS events.tsv + nf_cli derived segments).
+  std::vector<std::string> extra_events_paths;
+
+  // If provided, auto-merge nf_cli derived events (nf_derived_events.tsv/.csv) from this output folder.
+  std::string nf_outdir;
 
   std::string band_spec; // empty => default
   size_t nperseg{1024};
@@ -71,17 +82,22 @@ static void print_help() {
     << "Usage:\n"
     << "  qeeg_epoch_cli --input file.edf --outdir out_epochs\n"
     << "  qeeg_epoch_cli --input file.edf --outdir out_epochs --event-contains Stim --window 1.0\n"
+    << "  qeeg_epoch_cli --input file.edf --nf-outdir nf_out --outdir out_epochs --event-contains NF:Reward\n"
     << "  qeeg_epoch_cli --input file.csv --fs 250 --events events.csv --outdir out_epochs\n\n"
     << "Outputs:\n"
-    << "  events.csv\n"
-    << "  epoch_bandpowers.csv (long format: one row per event x channel x band)\n"
+    << "  events.csv                (event_id + onset_sec + duration_sec + text)\n"
+    << "  events_table.csv          (qeeg events table: onset_sec,duration_sec,text)\n"
+    << "  events_table.tsv          (BIDS-style events table: onset,duration,trial_type)\n"
+    << "  epoch_bandpowers.csv      (long format: one row per event x channel x band)\n"
     << "  epoch_bandpowers_summary.csv (mean across processed epochs)\n"
     << "  (optional) epoch_bandpowers_norm.csv (baseline-normalized values; when --baseline is used)\n"
     << "  (optional) epoch_bandpowers_norm_summary.csv (mean baseline-normalized values; when --baseline is used)\n\n"
     << "Options:\n"
     << "  --input PATH             Input EDF/BDF/CSV (CSV requires --fs)\n"
     << "  --fs HZ                  Sampling rate for CSV\n"
-    << "  --events PATH            Optional events CSV (overrides embedded EDF+/BDF+ annotations)\n"
+    << "  --events PATH            Optional events table (CSV or TSV). Overrides embedded EDF+/BDF+ annotations.\n"
+    << "  --extra-events PATH      Additional events table(s) to merge (repeatable).\n"
+    << "  --nf-outdir PATH         Auto-merge nf_cli derived events (nf_derived_events.tsv/.csv) from this folder.\n"
     << "  --outdir DIR             Output directory (default: out_epochs)\n"
     << "  --bands SPEC             Band spec, e.g. 'alpha:8-12,beta:13-30' (default: built-in EEG bands)\n"
     << "  --nperseg N              Welch segment length (default: 1024)\n"
@@ -117,7 +133,11 @@ static Args parse_args(int argc, char** argv) {
     } else if (arg == "--outdir" && i + 1 < argc) {
       a.outdir = argv[++i];
     } else if (arg == "--events" && i + 1 < argc) {
-      a.events_csv = argv[++i];
+      a.events_path = argv[++i];
+    } else if (arg == "--extra-events" && i + 1 < argc) {
+      a.extra_events_paths.push_back(argv[++i]);
+    } else if (arg == "--nf-outdir" && i + 1 < argc) {
+      a.nf_outdir = argv[++i];
     } else if (arg == "--bands" && i + 1 < argc) {
       a.band_spec = argv[++i];
     } else if (arg == "--nperseg" && i + 1 < argc) {
@@ -179,78 +199,6 @@ static Args parse_args(int argc, char** argv) {
   return a;
 }
 
-static std::string csv_escape(const std::string& s) {
-  const bool need_quote = (s.find_first_of(",\"\n\r") != std::string::npos);
-  if (!need_quote) return s;
-  std::string out;
-  out.reserve(s.size() + 2);
-  out.push_back('"');
-  for (char c : s) {
-    if (c == '"') out += "\"\"";
-    else out.push_back(c);
-  }
-  out.push_back('"');
-  return out;
-}
-
-static std::vector<AnnotationEvent> load_events_csv(const std::string& path) {
-  std::ifstream f(path);
-  if (!f) throw std::runtime_error("Failed to open events CSV: " + path);
-
-  std::vector<AnnotationEvent> out;
-  std::string line;
-  size_t lineno = 0;
-  while (std::getline(f, line)) {
-    ++lineno;
-    std::string raw = line;
-    if (!raw.empty() && raw.back() == '\r') raw.pop_back();
-    std::string t = trim(raw);
-    if (t.empty()) continue;
-    if (starts_with(t, "#")) continue;
-
-    // Skip common header.
-    const std::string low = to_lower(t);
-    if (lineno == 1 && (low.find("onset") != std::string::npos)) {
-      continue;
-    }
-
-    // CSV parsing: onset,duration,text
-    // - quoted fields are supported (e.g., text may contain commas)
-    // - for robustness, if unquoted commas exist in text and produce >3 columns,
-    //   we join the remainder back into the text field.
-    std::vector<std::string> cols = split_csv_row(raw, ',');
-    if (cols.size() < 2) {
-      throw std::runtime_error("Events CSV parse error at line " + std::to_string(lineno) + ": expected onset,duration[,text]");
-    }
-    for (auto& c : cols) c = trim(c);
-
-    const double onset = to_double(cols[0]);
-    const double dur = to_double(cols[1]);
-    std::string text;
-    if (cols.size() >= 3) {
-      text = cols[2];
-      for (size_t i = 3; i < cols.size(); ++i) {
-        text += ",";
-        text += cols[i];
-      }
-      text = trim(text);
-    }
-
-    AnnotationEvent ev;
-    ev.onset_sec = onset;
-    ev.duration_sec = dur;
-    ev.text = text;
-    out.push_back(std::move(ev));
-  }
-
-  std::sort(out.begin(), out.end(), [](const AnnotationEvent& a, const AnnotationEvent& b) {
-    if (a.onset_sec != b.onset_sec) return a.onset_sec < b.onset_sec;
-    if (a.duration_sec != b.duration_sec) return a.duration_sec < b.duration_sec;
-    return a.text < b.text;
-  });
-  return out;
-}
-
 static bool event_text_matches(const AnnotationEvent& ev, const Args& a) {
   if (!a.include_empty_text && trim(ev.text).empty()) return false;
 
@@ -291,14 +239,37 @@ int main(int argc, char** argv) {
     }
 
     EEGRecording rec = read_recording_auto(a.input_path, a.fs_csv);
+
+    // --- Events: base + optional overrides + optional merges ---
     std::vector<AnnotationEvent> events = rec.events;
-    if (!a.events_csv.empty()) {
-      events = load_events_csv(a.events_csv);
+    if (!a.events_path.empty()) {
+      events = read_events_table(a.events_path);
     }
+
+    std::vector<AnnotationEvent> extra;
+    for (const auto& p : a.extra_events_paths) {
+      const auto e = read_events_table(p);
+      extra.insert(extra.end(), e.begin(), e.end());
+    }
+
+    if (!a.nf_outdir.empty()) {
+      const auto nf_tbl = find_nf_derived_events_table(a.nf_outdir);
+      if (nf_tbl.has_value()) {
+        const auto e = read_events_table(*nf_tbl);
+        extra.insert(extra.end(), e.begin(), e.end());
+      } else {
+        const auto d = normalize_nf_outdir_path(a.nf_outdir);
+        std::cerr << "Warning: --nf-outdir provided but no nf_derived_events.tsv/.csv found in: "
+                  << d.u8string() << "\n";
+      }
+    }
+
+    merge_events(&events, extra);
 
     if (events.empty()) {
       throw std::runtime_error(
-        "No events found. If your file is CSV, provide --events. If EDF/BDF, make sure the file is EDF+/BDF+ with an Annotations channel.");
+        "No events found. If your file is CSV, provide --events. If EDF/BDF, make sure the file is EDF+/BDF+ with an Annotations channel.\n"
+        "You can also merge nf_cli-derived segments via --nf-outdir.");
     }
 
     // Optional preprocessing (offline).
@@ -322,13 +293,18 @@ int main(int argc, char** argv) {
 
     ensure_directory(a.outdir);
 
-    // Write events.csv (the (possibly overridden) event list)
+    // Export event lists for interoperability.
     {
+      // Richer table with stable row ids.
       std::ofstream fe(a.outdir + "/events.csv");
       fe << "event_id,onset_sec,duration_sec,text\n";
       for (size_t i = 0; i < events.size(); ++i) {
         fe << i << "," << events[i].onset_sec << "," << events[i].duration_sec << "," << csv_escape(events[i].text) << "\n";
       }
+
+      // Standard tables for other tools (qeeg CSV and BIDS TSV).
+      write_events_csv(a.outdir + "/events_table.csv", events);
+      write_events_tsv(a.outdir + "/events_table.tsv", events);
     }
 
     std::ofstream fb(a.outdir + "/epoch_bandpowers.csv");
@@ -505,7 +481,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Loaded " << rec.channel_names.size() << " channels, fs=" << rec.fs_hz << " Hz\n";
-    std::cout << "Found " << events.size() << " events (exported to events.csv)\n";
+    std::cout << "Found " << events.size() << " events (exported to events.csv, events_table.csv, events_table.tsv)\n";
     std::cout << "Processed " << n_used_events << " matching events\n";
     std::cout << "Wrote epoch_bandpowers.csv and epoch_bandpowers_summary.csv to: " << a.outdir << "\n";
     if (do_baseline) {

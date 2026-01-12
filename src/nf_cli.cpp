@@ -8,7 +8,9 @@
 #include "qeeg/nf_metric.hpp"
 #include "qeeg/nf_metric_eval.hpp"
 #include "qeeg/nf_threshold.hpp"
+#include "qeeg/debounce.hpp"
 #include "qeeg/robust_stats.hpp"
+#include "qeeg/csv_io.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/wav_writer.hpp"
@@ -18,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <iomanip>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -76,6 +79,13 @@ struct Args {
   double reward_rate_window_seconds{5.0};
   bool no_adaptation{false};
 
+  // Optional reward debouncing / hysteresis (in NF update frames).
+  // Example: --reward-on-frames 2 --reward-off-frames 2
+  // will require two consecutive raw rewards to switch ON, and two consecutive
+  // non-rewards to switch OFF.
+  int reward_on_frames{1};
+  int reward_off_frames{1};
+
   // Playback
   double chunk_seconds{0.10};
 
@@ -89,7 +99,16 @@ struct Args {
   double artifact_rms_z{6.0};
   double artifact_kurtosis_z{6.0};
   int artifact_min_bad_channels{1};
+  std::vector<std::string> artifact_ignore_channels; // optional
   bool export_artifacts{false};
+
+  // Optional static HTML UI export (BioTrace+ inspired).
+  // Writes a self-contained 'biotrace_ui.html' into --outdir.
+  bool biotrace_ui{false};
+
+  // Optional derived events export (reward/artifact/baseline segments).
+  // Writes 'nf_derived_events.csv' and 'nf_derived_events.tsv' into --outdir.
+  bool export_derived_events{false};
 
   // Optional audio feedback (writes a simple reward tone WAV)
   // If audio_wav is a filename without any path separators, it will be written inside --outdir.
@@ -150,6 +169,8 @@ static void print_help() {
     << "  --target-rate R           Target reward rate in (0,1) (default: 0.6)\n"
     << "  --eta E                   Adaptation speed (default: 0.10)\n"
     << "  --rate-window S           Reward-rate window seconds (default: 5)\n"
+    << "  --reward-on-frames N      Debounce: require N consecutive reward frames to turn ON (default: 1)\n"
+    << "  --reward-off-frames N     Debounce: require N consecutive non-reward frames to turn OFF (default: 1)\n"
     << "  --no-adaptation            Disable adaptive thresholding (fixed threshold from baseline)\n"
     << "  --average-reference        Apply common average reference across channels\n"
     << "  --notch HZ                 Apply a notch filter at HZ (e.g., 50 or 60)\n"
@@ -163,7 +184,11 @@ static void print_help() {
     << "  --artifact-rms-z Z         Artifact threshold: RMS robust z (<=0 disables; default: 6)\n"
     << "  --artifact-kurtosis-z Z    Artifact threshold: excess kurtosis robust z (<=0 disables; default: 6)\n"
     << "  --artifact-min-bad-ch N    Artifact frame is bad if >=N channels flagged (default: 1)\n"
+    << "  --artifact-ignore LIST     Comma-separated channel names to ignore for artifact gating\n"
     << "  --export-artifacts         Write artifact_gate_timeseries.csv aligned to NF updates\n"
+    << "  --biotrace-ui              Write a self-contained BioTrace+ style HTML UI (biotrace_ui.html).\n"
+    << "                           Also writes nf_derived_events.csv and nf_derived_events.tsv for interoperability.\n"
+    << "  --export-derived-events    Write nf_derived_events.csv/.tsv (baseline/reward/artifact segments) even if --biotrace-ui is off.\n"
     << "  --audio-wav PATH           Optional: write a reward-tone WAV (mono PCM16)\n"
     << "  --audio-rate HZ            Audio sample rate (default: 44100)\n"
     << "  --audio-tone HZ            Reward tone frequency (default: 440)\n"
@@ -233,6 +258,10 @@ static Args parse_args(int argc, char** argv) {
       a.adapt_eta = to_double(argv[++i]);
     } else if (arg == "--rate-window" && i + 1 < argc) {
       a.reward_rate_window_seconds = to_double(argv[++i]);
+    } else if (arg == "--reward-on-frames" && i + 1 < argc) {
+      a.reward_on_frames = to_int(argv[++i]);
+    } else if (arg == "--reward-off-frames" && i + 1 < argc) {
+      a.reward_off_frames = to_int(argv[++i]);
     } else if (arg == "--no-adaptation") {
       a.no_adaptation = true;
     } else if (arg == "--average-reference") {
@@ -260,8 +289,18 @@ static Args parse_args(int argc, char** argv) {
       a.artifact_kurtosis_z = to_double(argv[++i]);
     } else if (arg == "--artifact-min-bad-ch" && i + 1 < argc) {
       a.artifact_min_bad_channels = to_int(argv[++i]);
+    } else if (arg == "--artifact-ignore" && i + 1 < argc) {
+      const auto parts = split(argv[++i], ',');
+      for (const auto& p : parts) {
+        const std::string t = trim(p);
+        if (!t.empty()) a.artifact_ignore_channels.push_back(t);
+      }
     } else if (arg == "--export-artifacts") {
       a.export_artifacts = true;
+    } else if (arg == "--biotrace-ui") {
+      a.biotrace_ui = true;
+    } else if (arg == "--export-derived-events") {
+      a.export_derived_events = true;
     } else if (arg == "--audio-wav" && i + 1 < argc) {
       a.audio_wav = argv[++i];
     } else if (arg == "--audio-rate" && i + 1 < argc) {
@@ -331,6 +370,837 @@ static std::string json_escape(const std::string& s) {
     }
   }
   return out;
+}
+
+struct NfUiFrame {
+  double t_end_sec{0.0};
+  double metric{std::numeric_limits<double>::quiet_NaN()};
+  double threshold{std::numeric_limits<double>::quiet_NaN()};
+  int reward{0};
+  double reward_rate{0.0};
+
+  // Optional artifact info (only populated when the artifact engine is enabled).
+  int artifact_ready{0};
+  int artifact{0};
+  int bad_channels{0};
+};
+
+// Build simple duration annotations from a binary state sampled at regular-ish
+// NF update frames. This lets nf_cli export reward/artifact segments that can
+// be consumed by other tools (trace_plot_cli, export_bids_cli, etc.).
+struct BoolSegmentBuilder {
+  std::string label;
+  bool open{false};
+  double start_sec{0.0};
+  double last_end_sec{0.0};
+
+  explicit BoolSegmentBuilder(std::string lbl) : label(std::move(lbl)) {}
+
+  void update(bool active, double frame_start_sec, double frame_end_sec, std::vector<AnnotationEvent>* out) {
+    if (!out) return;
+    if (active) {
+      if (!open) {
+        open = true;
+        start_sec = frame_start_sec;
+      }
+      last_end_sec = frame_end_sec;
+    } else {
+      if (open) {
+        const double end_sec = last_end_sec;
+        const double dur = end_sec - start_sec;
+        if (dur > 0.0 && std::isfinite(dur) && std::isfinite(start_sec) && std::isfinite(end_sec)) {
+          out->push_back({start_sec, dur, label});
+        }
+        open = false;
+      }
+    }
+  }
+
+  void finish(double end_sec, std::vector<AnnotationEvent>* out) {
+    if (!out) return;
+    if (!open) return;
+    const double e = std::isfinite(end_sec) ? end_sec : last_end_sec;
+    const double dur = e - start_sec;
+    if (dur > 0.0 && std::isfinite(dur) && std::isfinite(start_sec)) {
+      out->push_back({start_sec, dur, label});
+    }
+    open = false;
+  }
+};
+
+static void write_biotrace_ui_html_if_requested(const Args& args,
+                                                const EEGRecording& rec,
+                                                const NfMetricSpec& metric,
+                                                const std::vector<NfUiFrame>& frames,
+                                                bool include_artifacts,
+                                                const std::vector<AnnotationEvent>* extra_events = nullptr) {
+  if (!args.biotrace_ui) return;
+  (void)metric;
+  if (frames.empty()) {
+    std::cerr << "BioTrace UI: no frames captured (nothing to render)\n";
+    return;
+  }
+
+  const std::string outpath = args.outdir + "/biotrace_ui.html";
+  std::ofstream out(outpath);
+  if (!out) throw std::runtime_error("Failed to write " + outpath);
+
+  out << "<!doctype html>\n"
+      << "<html lang=\"en\">\n"
+      << "<head>\n"
+      << "  <meta charset=\"utf-8\"/>\n"
+      << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\n"
+      << "  <title>BioTrace+ Style Neurofeedback UI</title>\n"
+      << "  <style>\n"
+      << "    :root { --bg:#0b1020; --panel:#111a33; --panel2:#0f172a; --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; --reward:#34d399; --warn:#f97316; --bad:#ef4444; }\n"
+      << "    html, body { height:100%; margin:0; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }\n"
+      << "    .topbar { height:52px; display:flex; align-items:center; gap:12px; padding:0 14px; background:linear-gradient(90deg,var(--panel),var(--panel2)); border-bottom:1px solid rgba(255,255,255,0.08); }\n"
+      << "    .brand { font-weight:700; letter-spacing:0.2px; }\n"
+      << "    .pill { padding:4px 10px; border:1px solid rgba(255,255,255,0.12); border-radius:999px; color:var(--muted); font-size:12px; }\n"
+      << "    .layout { display:grid; grid-template-columns: 320px 1fr; height: calc(100% - 52px - 68px); }\n"
+      << "    .side { padding:14px; background:var(--panel2); border-right:1px solid rgba(255,255,255,0.08); overflow:auto; }\n"
+      << "    .main { padding:14px; }\n"
+      << "    .card { background:rgba(17,26,51,0.6); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:12px; margin-bottom:12px; }\n"
+      << "    .row { display:flex; justify-content:space-between; gap:10px; }\n"
+      << "    .k { color:var(--muted); font-size:12px; }\n"
+      << "    .v { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:12px; }\n"
+      << "    .big { font-size:22px; font-weight:800; }\n"
+      << "    canvas { width:100%; height:420px; background:rgba(0,0,0,0.18); border:1px solid rgba(255,255,255,0.08); border-radius:12px; }\n"
+      << "    .bottombar { height:68px; display:flex; align-items:center; gap:12px; padding:0 14px; background:linear-gradient(90deg,var(--panel2),var(--panel)); border-top:1px solid rgba(255,255,255,0.08); }\n"
+      << "    button { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); color:var(--text); border-radius:10px; padding:10px 12px; cursor:pointer; }\n"
+      << "    button:hover { border-color:rgba(255,255,255,0.22); }\n"
+      << "    input[type=range] { width:320px; }\n"
+      << "    select { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); color:var(--text); border-radius:10px; padding:10px 12px; }\n"
+      << "    .hint { color:var(--muted); font-size:12px; }\n"
+      << "    .bar { height:10px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.12); border-radius:999px; overflow:hidden; }\n"
+      << "    .bar > div { height:100%; width:0%; background:linear-gradient(90deg, var(--reward), rgba(52,211,153,0.4)); }\n"
+      << "    .evlist { max-height:240px; overflow:auto; }\n"
+      << "    .evitem { padding:8px 10px; border:1px solid rgba(255,255,255,0.10); border-radius:10px; margin-top:8px; cursor:pointer; background:rgba(255,255,255,0.03); }\n"
+      << "    .evitem:hover { border-color:rgba(255,255,255,0.22); }\n"
+      << "    .evitem .t { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color:var(--muted); font-size:12px; }\n"
+      << "    .evitem .txt { font-size:13px; margin-top:2px; }\n"
+      << "  </style>\n"
+      << "</head>\n"
+      << "<body>\n"
+      << "  <div class=\"topbar\">\n"
+      << "    <div class=\"brand\">QEEG Neurofeedback — BioTrace+ Style UI</div>\n"
+      << "    <div class=\"pill\" id=\"pillMetric\"></div>\n"
+      << "    <div class=\"pill\" id=\"pillFs\"></div>\n"
+      << "    <div class=\"pill\" id=\"pillUpdate\"></div>\n"
+      << "  </div>\n"
+      << "  <div class=\"layout\">\n"
+      << "    <div class=\"side\">\n"
+      << "      <div class=\"card\">\n"
+      << "        <div class=\"k\">Current</div>\n"
+      << "        <div class=\"big\" id=\"curMetric\">—</div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Threshold</div><div class=\"v\" id=\"curThreshold\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Reward</div><div class=\"v\" id=\"curReward\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Reward rate</div><div class=\"v\" id=\"curRR\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Artifacts</div><div class=\"v\" id=\"curArt\">—</div></div>\n"
+      << "      </div>\n"
+      << "      <div class=\"card\">\n"
+      << "        <div class=\"k\">Session</div>\n"
+      << "        <div class=\"row\"><div class=\"k\">t</div><div class=\"v\" id=\"curT\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Frames</div><div class=\"v\" id=\"curIdx\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Reward %</div><div class=\"v\" id=\"curPct\">—</div></div>\n"
+      << "        <div class=\"bar\" style=\"margin-top:8px\"><div id=\"barPct\"></div></div>\n"
+      << "        <div class=\"row\" style=\"margin-top:8px\"><div class=\"k\">Segment</div><div class=\"v\" id=\"curSegment\">—</div></div>\n"
+      << "        <div class=\"row\" style=\"margin-top:8px\"><div class=\"k\">Event</div><div class=\"v\" id=\"curEvent\">—</div></div>\n"
+      << "      </div>\n"
+      << "      <div class=\"card\">\n"
+      << "        <div class=\"k\">Segments</div>\n"
+      << "        <div class=\"hint\">Click a segment to jump the scrubber.</div>\n"
+      << "        <div class=\"evlist\" id=\"segmentList\"></div>\n"
+      << "      </div>\n"
+      << "      <div class=\"card\">\n"
+      << "        <div class=\"k\">Events</div>\n"
+      << "        <div class=\"hint\">Click an event to jump the scrubber.</div>\n"
+      << "        <div class=\"evlist\" id=\"eventList\"></div>\n"
+      << "      </div>\n"
+      << "      <div class=\"card\">\n"
+      << "        <div class=\"k\">Notes</div>\n"
+      << "        <div class=\"hint\">This file is generated by qeeg_nf_cli --biotrace-ui. It embeds the NF timeline so it can be opened directly in a browser (no server needed).</div>\n"
+      << "      </div>\n"
+      << "    </div>\n"
+      << "    <div class=\"main\">\n"
+      << "      <canvas id=\"plot\"></canvas>\n"
+      << "      <div class=\"hint\" style=\"margin-top:10px\">Metric (line), Threshold (line). Reward frames are highlighted; artifact frames (if present) are shaded. Duration events are shown as a segment band near the bottom axis.</div>\n"
+      << "    </div>\n"
+      << "  </div>\n"
+      << "  <div class=\"bottombar\">\n"
+      << "    <button id=\"btnStart\" title=\"Go to start\">⏮</button>\n"
+      << "    <button id=\"btnPlay\">▶︎ Play</button>\n"
+      << "    <button id=\"btnStop\">■ Stop</button>\n"
+      << "    <button id=\"btnEnd\" title=\"Go to end\">⏭</button>\n"
+      << "    <span class=\"hint\">Scrub:</span>\n"
+      << "    <input id=\"slider\" type=\"range\" min=\"0\" max=\"0\" value=\"0\" step=\"1\"/>\n"
+      << "    <span class=\"hint\">Speed:</span>\n"
+      << "    <select id=\"speed\">\n"
+      << "      <option value=\"0.25\">0.25×</option>\n"
+      << "      <option value=\"0.5\">0.5×</option>\n"
+      << "      <option value=\"1\" selected>1×</option>\n"
+      << "      <option value=\"2\">2×</option>\n"
+      << "      <option value=\"4\">4×</option>\n"
+      << "    </select>\n"
+      << "    <span class=\"hint\">View:</span>\n"
+      << "    <select id=\"viewMode\">\n"
+      << "      <option value=\"overview\" selected>Overview</option>\n"
+      << "      <option value=\"realtime\">Real-time</option>\n"
+      << "    </select>\n"
+      << "    <span class=\"hint\">Time axis:</span>\n"
+      << "    <select id=\"winSec\">\n"
+      << "      <option value=\"5\">5 s</option>\n"
+      << "      <option value=\"10\">10 s</option>\n"
+      << "      <option value=\"20\">20 s</option>\n"
+      << "      <option value=\"30\" selected>30 s</option>\n"
+      << "      <option value=\"60\">60 s</option>\n"
+      << "      <option value=\"120\">120 s</option>\n"
+      << "    </select>\n"
+      << "    <span class=\"hint\">Y:</span>\n"
+      << "    <select id=\"yMode\">\n"
+      << "      <option value=\"global\" selected>Global</option>\n"
+      << "      <option value=\"window\">Window</option>\n"
+      << "    </select>\n"
+      << "  </div>\n"
+      << "  <script id=\"nfData\" type=\"application/json\">\n";
+
+  out << std::setprecision(10);
+  out << "{\n";
+  out << "  \"meta\": {\n";
+  out << "    \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
+  out << "    \"band_spec\": \"" << json_escape(args.band_spec) << "\",\n";
+  out << "    \"reward_direction\": \"" << (args.reward_direction == RewardDirection::Above ? "above" : "below") << "\",\n";
+  out << "    \"target_reward_rate\": " << args.target_reward_rate << ",\n";
+  out << "    \"baseline_seconds\": " << args.baseline_seconds << ",\n";
+  out << "    \"update_seconds\": " << args.update_seconds << ",\n";
+  out << "    \"recording_fs_hz\": " << rec.fs_hz << ",\n";
+  out << "    \"artifact_engine\": " << (include_artifacts ? 1 : 0) << "\n";
+  out << "  },\n";
+  out << "  \"frames\": [\n";
+
+  auto write_num_or_null = [&](double v) {
+    if (std::isfinite(v)) {
+      out << v;
+    } else {
+      out << "null";
+    }
+  };
+
+  for (size_t i = 0; i < frames.size(); ++i) {
+    const auto& fr = frames[i];
+    out << "    {\"t\":";
+    write_num_or_null(fr.t_end_sec);
+    out << ",\"metric\":";
+    write_num_or_null(fr.metric);
+    out << ",\"threshold\":";
+    write_num_or_null(fr.threshold);
+    out << ",\"reward\":" << fr.reward;
+    out << ",\"reward_rate\":";
+    write_num_or_null(fr.reward_rate);
+    out << ",\"artifact_ready\":" << (include_artifacts ? fr.artifact_ready : 0);
+    out << ",\"artifact\":" << (include_artifacts ? fr.artifact : 0);
+    out << ",\"bad_channels\":" << (include_artifacts ? fr.bad_channels : 0);
+    out << "}";
+    if (i + 1 < frames.size()) out << ",";
+    out << "\n";
+  }
+  out << "  ],\n";
+
+  // Optional annotation events from the source recording (if any). These are
+  // rendered as vertical markers and listed in the sidebar.
+  out << "  \"events\": [\n";
+  const size_t max_events = 2000;
+  size_t n_written = 0;
+  bool first = true;
+  std::vector<AnnotationEvent> merged_events = rec.events;
+  if (extra_events && !extra_events->empty()) {
+    merged_events.insert(merged_events.end(), extra_events->begin(), extra_events->end());
+  }
+  std::sort(merged_events.begin(), merged_events.end(), [](const AnnotationEvent& a, const AnnotationEvent& b) {
+    if (a.onset_sec != b.onset_sec) return a.onset_sec < b.onset_sec;
+    return a.duration_sec < b.duration_sec;
+  });
+
+  for (const auto& ev : merged_events) {
+    if (n_written >= max_events) break;
+    if (!std::isfinite(ev.onset_sec) || !std::isfinite(ev.duration_sec)) continue;
+    if (!first) out << ",\n";
+    first = false;
+    out << "    {\"onset\":" << ev.onset_sec << ",\"duration\":" << ev.duration_sec
+        << ",\"text\":\"" << json_escape(ev.text) << "\"}";
+    ++n_written;
+  }
+  if (!first) out << "\n";
+  out << "  ]\n";
+  out << "}\n";
+  out << "  </script>\n";
+
+  // JS: render + basic playback.
+  out << R"JS(
+  <script>
+  const data = JSON.parse(document.getElementById('nfData').textContent);
+  const frames = data.frames || [];
+  const events = data.events || [];
+
+  const pillMetric = document.getElementById('pillMetric');
+  const pillFs = document.getElementById('pillFs');
+  const pillUpdate = document.getElementById('pillUpdate');
+
+  pillMetric.textContent = `Metric: ${data.meta.metric_spec}`;
+  pillFs.textContent = `Fs: ${Number(data.meta.recording_fs_hz).toFixed(3)} Hz`;
+  pillUpdate.textContent = `Update: ${Number(data.meta.update_seconds).toFixed(3)} s`;
+
+  const plot = document.getElementById('plot');
+  const ctx = plot.getContext('2d');
+
+  const curMetric = document.getElementById('curMetric');
+  const curThreshold = document.getElementById('curThreshold');
+  const curReward = document.getElementById('curReward');
+  const curRR = document.getElementById('curRR');
+  const curArt = document.getElementById('curArt');
+  const curT = document.getElementById('curT');
+  const curIdx = document.getElementById('curIdx');
+  const curPct = document.getElementById('curPct');
+  const curSegment = document.getElementById('curSegment');
+  const curEvent = document.getElementById('curEvent');
+  const barPct = document.getElementById('barPct');
+  const eventList = document.getElementById('eventList');
+  const segmentList = document.getElementById('segmentList');
+
+  const slider = document.getElementById('slider');
+  const btnStart = document.getElementById('btnStart');
+  const btnPlay = document.getElementById('btnPlay');
+  const btnStop = document.getElementById('btnStop');
+  const btnEnd = document.getElementById('btnEnd');
+  const speedSel = document.getElementById('speed');
+  const viewModeSel = document.getElementById('viewMode');
+  const winSel = document.getElementById('winSec');
+  const yModeSel = document.getElementById('yMode');
+
+  let idx = 0;
+  let playing = false;
+  let timer = null;
+
+  // Events/segments: sorted by onset (seconds).
+  // BioTrace+ can export both point markers and duration-based segments.
+  const eventsSorted = (events || [])
+    .map(e => ({ onset: Number(e.onset), duration: Number(e.duration), text: String(e.text ?? '') }))
+    .filter(e => Number.isFinite(e.onset))
+    .sort((a, b) => a.onset - b.onset);
+
+  // Segment rule:
+  //   - duration <= 0 => point marker
+  //   - duration  > 0 => time segment
+  //
+  // This matches both qeeg events CSV and BIDS events.tsv conventions and
+  // ensures short NF segments (e.g. 1-frame reward bursts) still render as segments.
+  function isSegment(e) {
+    return Number.isFinite(e.duration) && e.duration > 0;
+  }
+  function isArtifactLabel(txt) {
+    const t = String(txt || '').toLowerCase();
+    return t.includes('artifact') || t.includes('artefact');
+  }
+  function hash32(str) {
+    // Simple deterministic string hash (FNV-1a-ish)
+    let h = 2166136261 >>> 0;
+    const s = String(str || '');
+    for (let i = 0; i < s.length; ++i) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+  function segFill(text) {
+    const h = hash32(text) % 360;
+    return `hsla(${h},70%,55%,0.22)`;
+  }
+
+  const segmentsSorted = eventsSorted
+    .filter(isSegment)
+    .map(e => ({ ...e, end: Number(e.onset) + Math.max(0, Number(e.duration)), artifact: isArtifactLabel(e.text) }));
+
+  const pointEventsSorted = eventsSorted
+    .filter(e => !isSegment(e));
+
+  function indexFromTime(t) {
+    if (frames.length === 0) return 0;
+    if (!Number.isFinite(t)) return 0;
+    let lo = 0, hi = frames.length - 1;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const tm = Number(frames[mid].t);
+      if (tm < t) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  }
+
+  function fmtTime(t) {
+    if (!Number.isFinite(t)) return '—';
+    const s = Math.max(0, t);
+    const m = Math.floor(s / 60);
+    const ss = s - m * 60;
+    return `${m}:${ss.toFixed(3).padStart(6, '0')}`;
+  }
+
+  function buildSegmentList() {
+    if (!segmentList) return;
+    segmentList.innerHTML = '';
+    if (segmentsSorted.length === 0) {
+      const d = document.createElement('div');
+      d.className = 'hint';
+      d.textContent = 'No segments (duration events) detected.';
+      segmentList.appendChild(d);
+      return;
+    }
+    const maxShow = 200;
+    for (let i = 0; i < Math.min(maxShow, segmentsSorted.length); ++i) {
+      const seg = segmentsSorted[i];
+      const box = document.createElement('div');
+      box.className = 'evitem';
+      if (seg.artifact) {
+        box.style.borderColor = 'rgba(239,68,68,0.35)';
+      }
+      box.addEventListener('click', () => setIndex(indexFromTime(seg.onset)));
+      const t = document.createElement('div');
+      t.className = 't';
+      const dur = (Number.isFinite(seg.duration) ? seg.duration.toFixed(1) : '0.0');
+      t.textContent = `${fmtTime(seg.onset)}  (dur ${dur}s)`;
+      const txt = document.createElement('div');
+      txt.className = 'txt';
+      txt.textContent = seg.text || '(segment)';
+      box.appendChild(t);
+      box.appendChild(txt);
+      segmentList.appendChild(box);
+    }
+    if (segmentsSorted.length > maxShow) {
+      const more = document.createElement('div');
+      more.className = 'hint';
+      more.style.marginTop = '8px';
+      more.textContent = `Showing first ${maxShow} of ${segmentsSorted.length} segments.`;
+      segmentList.appendChild(more);
+    }
+  }
+
+  function buildEventList() {
+    if (!eventList) return;
+    eventList.innerHTML = '';
+    if (pointEventsSorted.length === 0) {
+      const d = document.createElement('div');
+      d.className = 'hint';
+      d.textContent = 'No point events in source recording.';
+      eventList.appendChild(d);
+      return;
+    }
+    const maxShow = 200;
+    for (let i = 0; i < Math.min(maxShow, pointEventsSorted.length); ++i) {
+      const ev = pointEventsSorted[i];
+      const box = document.createElement('div');
+      box.className = 'evitem';
+      box.addEventListener('click', () => setIndex(indexFromTime(ev.onset)));
+      const t = document.createElement('div');
+      t.className = 't';
+      t.textContent = fmtTime(ev.onset);
+      const txt = document.createElement('div');
+      txt.className = 'txt';
+      txt.textContent = ev.text || '(event)';
+      box.appendChild(t);
+      box.appendChild(txt);
+      eventList.appendChild(box);
+    }
+    if (pointEventsSorted.length > maxShow) {
+      const more = document.createElement('div');
+      more.className = 'hint';
+      more.style.marginTop = '8px';
+      more.textContent = `Showing first ${maxShow} of ${pointEventsSorted.length} events.`;
+      eventList.appendChild(more);
+    }
+  }
+
+  buildSegmentList();
+  buildEventList();
+
+  let evPtr = 0;
+  function currentEventLabel(t) {
+    if (pointEventsSorted.length === 0 || !Number.isFinite(t)) return '—';
+    while (evPtr + 1 < pointEventsSorted.length && pointEventsSorted[evPtr + 1].onset <= t) {
+      ++evPtr;
+    }
+    const ev = pointEventsSorted[Math.max(0, Math.min(evPtr, pointEventsSorted.length - 1))];
+    const dt = t - ev.onset;
+    const gate = Math.max(0.25, 1.5 * Number(data.meta.update_seconds || 0.25));
+    if (dt >= 0 && dt <= gate) return ev.text || '(event)';
+    return '—';
+  }
+
+  let segPtr = 0;
+  function currentSegmentLabel(t) {
+    if (segmentsSorted.length === 0 || !Number.isFinite(t)) return '—';
+    if (t < segmentsSorted[0].onset) return '—';
+    while (segPtr + 1 < segmentsSorted.length && segmentsSorted[segPtr + 1].onset <= t) {
+      ++segPtr;
+    }
+    // Check a small backward window to handle overlaps.
+    for (let back = 0; back < 64; ++back) {
+      const j = segPtr - back;
+      if (j < 0) break;
+      const s = segmentsSorted[j];
+      if (t >= s.onset && t <= (s.end ?? (s.onset + s.duration))) {
+        return s.text || '(segment)';
+      }
+    }
+    return '—';
+  }
+
+  function finiteOrNaN(x) {
+    return (x === null || x === undefined) ? NaN : Number(x);
+  }
+
+  function resizeCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    const rect = plot.getBoundingClientRect();
+    plot.width = Math.max(1, Math.floor(rect.width * dpr));
+    plot.height = Math.max(1, Math.floor(rect.height * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  window.addEventListener('resize', () => { resizeCanvas(); render(); });
+
+  function computeYRangeFor(i0, i1) {
+    let minY = Infinity;
+    let maxY = -Infinity;
+    if (frames.length === 0) {
+      return { minY: 0, maxY: 1 };
+    }
+    const a = Math.max(0, Math.min(Number(i0) || 0, frames.length - 1));
+    const b = Math.max(0, Math.min(Number(i1) || 0, frames.length - 1));
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    for (let i = lo; i <= hi; ++i) {
+      const f = frames[i];
+      const m = finiteOrNaN(f.metric);
+      const th = finiteOrNaN(f.threshold);
+      if (Number.isFinite(m)) { minY = Math.min(minY, m); maxY = Math.max(maxY, m); }
+      if (Number.isFinite(th)) { minY = Math.min(minY, th); maxY = Math.max(maxY, th); }
+    }
+    if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
+      minY = 0; maxY = 1;
+    }
+    if (Math.abs(maxY - minY) < 1e-12) {
+      maxY = minY + 1;
+    }
+    const pad = 0.10 * (maxY - minY);
+    return { minY: minY - pad, maxY: maxY + pad };
+  }
+
+  const globalYR = computeYRangeFor(0, frames.length - 1);
+
+  function render() {
+    if (frames.length === 0) return;
+    resizeCanvas();
+    const w = plot.getBoundingClientRect().width;
+    const h = plot.getBoundingClientRect().height;
+    ctx.clearRect(0, 0, w, h);
+
+    const padL = 50, padR = 18, padT = 14, padB = 32;
+    const x0 = padL, x1 = w - padR, y0 = padT, y1 = h - padB;
+
+    const t0 = Number(frames[0].t);
+    const tN = Number(frames[frames.length - 1].t);
+    const tcur = Number(frames[idx].t);
+
+    const mode = viewModeSel ? String(viewModeSel.value) : 'overview';
+    const winSec = Math.max(0.5, Number(winSel ? winSel.value : 30));
+    const yMode = yModeSel ? String(yModeSel.value) : 'global';
+
+    let tMin = t0;
+    let tMax = tN;
+    if (mode === 'realtime') {
+      // BioTrace+ has a real-time mode (scrolling strip chart). We approximate it
+      // by showing a trailing window ending at the current frame.
+      tMax = Number.isFinite(tcur) ? tcur : tN;
+      tMin = tMax - winSec;
+      if (tMin < t0) {
+        tMin = t0;
+        tMax = Math.min(tN, t0 + winSec);
+      }
+      if (tMax > tN) {
+        tMax = tN;
+        tMin = Math.max(t0, tN - winSec);
+      }
+    }
+
+    const tSpan = Math.max(1e-9, tMax - tMin);
+    let iStart = indexFromTime(tMin);
+    let iEnd = indexFromTime(tMax);
+    if (iEnd > 0 && Number(frames[iEnd].t) > tMax) iEnd -= 1;
+    iEnd = Math.max(iStart, Math.min(iEnd, frames.length - 1));
+
+    const yr = (yMode === 'window') ? computeYRangeFor(iStart, iEnd) : globalYR;
+
+    function xFromT(t) { return x0 + (t - tMin) / tSpan * (x1 - x0); }
+    function yFromV(v) { return y1 - (v - yr.minY) / (yr.maxY - yr.minY) * (y1 - y0); }
+
+    // Grid (strip-chart feel).
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let g = 1; g < 6; ++g) {
+      const yg = y0 + g * (y1 - y0) / 6;
+      ctx.beginPath(); ctx.moveTo(x0, yg); ctx.lineTo(x1, yg); ctx.stroke();
+    }
+    // Vertical grid at ~10 lines max.
+    const step = Math.pow(10, Math.floor(Math.log10(Math.max(1e-9, tSpan))));
+    const nice = (tSpan / step > 10) ? step * 2 : (tSpan / step > 5 ? step : step / 2);
+    const start = Math.ceil(tMin / nice) * nice;
+    for (let tt = start; tt < tMax; tt += nice) {
+      const xg = xFromT(tt);
+      ctx.beginPath(); ctx.moveTo(xg, y0); ctx.lineTo(xg, y1); ctx.stroke();
+    }
+
+    // Axes
+    ctx.globalAlpha = 1.0;
+    ctx.strokeStyle = 'rgba(255,255,255,0.20)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x0, y1);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+
+    // Artifact shading
+    if (Number(data.meta.artifact_engine) === 1) {
+      ctx.fillStyle = 'rgba(239,68,68,0.10)';
+      let open = false;
+      let xStart = 0;
+      for (let i = iStart; i <= iEnd; ++i) {
+        const f = frames[i];
+        const bad = Number(f.artifact) === 1;
+        const x = xFromT(Number(f.t));
+        if (bad && !open) { open = true; xStart = x; }
+        if (!bad && open) {
+          open = false;
+          ctx.fillRect(xStart, y0, Math.max(1, x - xStart), y1 - y0);
+        }
+      }
+      if (open) {
+        const xEnd = xFromT(Number(frames[iEnd].t));
+        ctx.fillRect(xStart, y0, Math.max(1, xEnd - xStart), y1 - y0);
+      }
+    }
+
+    // Segment band (BioTrace+ style): duration events rendered near the bottom axis.
+    if (segmentsSorted.length > 0) {
+      const segH = 10;
+      const ySeg0 = y1 - segH;
+      for (const seg of segmentsSorted) {
+        if (!Number.isFinite(seg.onset) || !Number.isFinite(seg.end)) continue;
+        const s0 = seg.onset;
+        const s1 = seg.end;
+        if (s1 < tMin || s0 > tMax) continue;
+        const xa = xFromT(Math.max(tMin, s0));
+        const xb = xFromT(Math.min(tMax, s1));
+        const ww = Math.max(1, xb - xa);
+        if (seg.artifact) {
+          ctx.fillStyle = 'rgba(239,68,68,0.12)';
+          ctx.fillRect(xa, ySeg0, ww, segH);
+          ctx.strokeStyle = 'rgba(239,68,68,0.35)';
+          ctx.lineWidth = 1;
+          const step = 6;
+          for (let x = xa - segH; x < xa + ww + segH; x += step) {
+            ctx.beginPath();
+            ctx.moveTo(x, ySeg0 + segH);
+            ctx.lineTo(x + segH, ySeg0);
+            ctx.stroke();
+          }
+        } else {
+          ctx.fillStyle = segFill(seg.text);
+          ctx.fillRect(xa, ySeg0, ww, segH);
+        }
+      }
+      ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x0, y1 - segH, x1 - x0, segH);
+    }
+
+    // Event markers
+    if (pointEventsSorted.length > 0) {
+      ctx.strokeStyle = 'rgba(148,163,184,0.22)';
+      ctx.lineWidth = 1;
+      for (const ev of pointEventsSorted) {
+        if (!Number.isFinite(ev.onset)) continue;
+        if (ev.onset < tMin || ev.onset > tMax) continue;
+        const x = xFromT(ev.onset);
+        ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
+      }
+    }
+
+    // Threshold line
+    ctx.strokeStyle = 'rgba(251,191,36,0.95)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for (let i = iStart; i <= iEnd; ++i) {
+      const f = frames[i];
+      const th = finiteOrNaN(f.threshold);
+      if (!Number.isFinite(th)) continue;
+      const x = xFromT(Number(f.t));
+      const y = yFromV(th);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+
+    // Metric line
+    ctx.strokeStyle = 'rgba(56,189,248,0.95)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    started = false;
+    for (let i = iStart; i <= iEnd; ++i) {
+      const f = frames[i];
+      const m = finiteOrNaN(f.metric);
+      if (!Number.isFinite(m)) continue;
+      const x = xFromT(Number(f.t));
+      const y = yFromV(m);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+
+    // Reward overlay (draw points)
+    ctx.fillStyle = 'rgba(52,211,153,0.95)';
+    for (let i = iStart; i <= iEnd; ++i) {
+      if (Number(frames[i].reward) !== 1) continue;
+      const m = finiteOrNaN(frames[i].metric);
+      if (!Number.isFinite(m)) continue;
+      const x = xFromT(Number(frames[i].t));
+      const y = yFromV(m);
+      ctx.fillRect(x - 1, y - 1, 2, 2);
+    }
+
+    // Current index marker
+    const f = frames[idx];
+    const xCur = xFromT(Number(f.t));
+    ctx.strokeStyle = 'rgba(255,255,255,0.50)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(xCur, y0);
+    ctx.lineTo(xCur, y1);
+    ctx.stroke();
+
+    // Axis labels
+    ctx.fillStyle = 'rgba(148,163,184,0.9)';
+    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+    const modeLabel = (mode === 'realtime') ? 'RT' : 'OV';
+    ctx.fillText(`t: ${tMin.toFixed(2)}..${tMax.toFixed(2)} s (${modeLabel})`, x0, h - 10);
+    ctx.fillText(`y: ${yr.minY.toPrecision(4)}..${yr.maxY.toPrecision(4)}`, x0, 14);
+  }
+
+  function updateReadouts() {
+    if (frames.length === 0) return;
+    idx = Math.max(0, Math.min(idx, frames.length - 1));
+    const f = frames[idx];
+    const m = finiteOrNaN(f.metric);
+    const th = finiteOrNaN(f.threshold);
+    const rr = finiteOrNaN(f.reward_rate);
+    curMetric.textContent = Number.isFinite(m) ? m.toPrecision(6) : '—';
+    curThreshold.textContent = Number.isFinite(th) ? th.toPrecision(6) : '—';
+    curRR.textContent = Number.isFinite(rr) ? rr.toFixed(3) : '—';
+    const rOn = (Number(f.reward) === 1);
+    curReward.textContent = rOn ? 'ON' : 'OFF';
+    curReward.style.color = rOn ? 'var(--reward)' : 'var(--muted)';
+
+    if (Number(data.meta.artifact_engine) === 1) {
+      const ready = Number(f.artifact_ready) === 1;
+      const bad = Number(f.artifact) === 1;
+      const bc = Number(f.bad_channels) || 0;
+      curArt.textContent = ready ? (bad ? `BAD (bad_ch=${bc})` : `OK (bad_ch=${bc})`) : 'warming up';
+    } else {
+      curArt.textContent = 'disabled';
+    }
+
+    const tcur = Number(f.t);
+    curT.textContent = `${tcur.toFixed(3)} s`;
+    curIdx.textContent = `${idx + 1} / ${frames.length}`;
+
+    let sum = 0;
+    for (let i = 0; i <= idx; ++i) sum += Number(frames[i].reward) === 1 ? 1 : 0;
+    const pct = 100 * sum / Math.max(1, (idx + 1));
+    curPct.textContent = `${pct.toFixed(1)}%`;
+
+    if (barPct) {
+      const p = Math.max(0, Math.min(100, pct));
+      barPct.style.width = `${p.toFixed(1)}%`;
+    }
+
+    if (curSegment) {
+      curSegment.textContent = currentSegmentLabel(tcur);
+    }
+
+    if (curEvent) {
+      curEvent.textContent = currentEventLabel(tcur);
+    }
+  }
+
+  function setIndex(i) {
+    idx = Math.max(0, Math.min(i, frames.length - 1));
+    slider.value = String(idx);
+    updateReadouts();
+    render();
+  }
+
+  function stop() {
+    playing = false;
+    if (timer) { clearInterval(timer); timer = null; }
+    btnPlay.textContent = '▶︎ Play';
+    setIndex(0);
+  }
+
+  function playToggle() {
+    if (frames.length === 0) return;
+    playing = !playing;
+    if (!playing) {
+      if (timer) { clearInterval(timer); timer = null; }
+      btnPlay.textContent = '▶︎ Play';
+      return;
+    }
+    btnPlay.textContent = '❚❚ Pause';
+    const baseDtMs = 1000.0 * Number(data.meta.update_seconds || 0.25);
+    const speed = Number(speedSel.value || 1.0);
+    const dtMs = Math.max(10, Math.floor(baseDtMs / Math.max(1e-9, speed)));
+    if (timer) { clearInterval(timer); timer = null; }
+    timer = setInterval(() => {
+      if (!playing) return;
+      if (idx >= frames.length - 1) {
+        playing = false;
+        btnPlay.textContent = '▶︎ Play';
+        clearInterval(timer);
+        timer = null;
+        return;
+      }
+      setIndex(idx + 1);
+    }, dtMs);
+  }
+
+  slider.addEventListener('input', () => setIndex(Number(slider.value)));
+  btnPlay.addEventListener('click', playToggle);
+  btnStop.addEventListener('click', stop);
+  speedSel.addEventListener('change', () => { if (playing) playToggle(), playToggle(); });
+
+  if (btnStart) btnStart.addEventListener('click', () => setIndex(0));
+  if (btnEnd) btnEnd.addEventListener('click', () => setIndex(Math.max(0, frames.length - 1)));
+
+  if (viewModeSel) viewModeSel.addEventListener('change', () => render());
+  if (winSel) winSel.addEventListener('change', () => render());
+  if (yModeSel) yModeSel.addEventListener('change', () => render());
+
+  slider.max = String(Math.max(0, frames.length - 1));
+  slider.value = '0';
+  setIndex(0);
+  </script>
+)JS";
+
+  out << "</body>\n</html>\n";
+  std::cout << "Wrote BioTrace+ style UI: " << outpath << "\n";
 }
 
 
@@ -425,6 +1295,14 @@ static void osc_send_info(OscUdpClient* osc, const std::string& prefix, const Ar
     OscMessage m3(prefix + "/reward_direction");
     m3.add_string(reward_direction_name(args.reward_direction));
     osc->send(m3);
+
+    OscMessage m_on(prefix + "/reward_on_frames");
+    m_on.add_int32(args.reward_on_frames);
+    osc->send(m_on);
+
+    OscMessage m_off(prefix + "/reward_off_frames");
+    m_off.add_int32(args.reward_off_frames);
+    osc->send(m_off);
 
     if (std::isfinite(args.initial_threshold)) {
       OscMessage m4(prefix + "/threshold_init");
@@ -754,6 +1632,12 @@ int main(int argc, char** argv) {
     if (args.adapt_eta < 0.0) {
       throw std::runtime_error("--eta must be >= 0");
     }
+    if (args.reward_on_frames < 1) {
+      throw std::runtime_error("--reward-on-frames must be >= 1");
+    }
+    if (args.reward_off_frames < 1) {
+      throw std::runtime_error("--reward-off-frames must be >= 1");
+    }
     if (args.relative_power && (args.relative_fmin_hz != 0.0 || args.relative_fmax_hz != 0.0)) {
       if (args.relative_fmin_hz < 0.0) {
         throw std::runtime_error("--relative-range LO must be >= 0");
@@ -809,6 +1693,8 @@ int main(int argc, char** argv) {
         meta << "  \"target_reward_rate\": " << args.target_reward_rate << ",\n";
         meta << "  \"adapt_eta\": " << args.adapt_eta << ",\n";
         meta << "  \"reward_rate_window_seconds\": " << args.reward_rate_window_seconds << ",\n";
+        meta << "  \"reward_on_frames\": " << args.reward_on_frames << ",\n";
+        meta << "  \"reward_off_frames\": " << args.reward_off_frames << ",\n";
         meta << "  \"window_seconds\": " << args.window_seconds << ",\n";
         meta << "  \"update_seconds\": " << args.update_seconds << ",\n";
         meta << "  \"nperseg\": " << args.nperseg << ",\n";
@@ -816,7 +1702,28 @@ int main(int argc, char** argv) {
         meta << "  \"relative_power\": " << (args.relative_power ? "true" : "false") << ",\n";
         meta << "  \"relative_fmin_hz\": " << args.relative_fmin_hz << ",\n";
         meta << "  \"relative_fmax_hz\": " << args.relative_fmax_hz << ",\n";
-        meta << "  \"overlap\": " << args.overlap << "\n";
+        meta << "  \"overlap\": " << args.overlap << ",\n";
+        meta << "  \"artifact_gate\": " << (args.artifact_gate ? "true" : "false") << ",\n";
+        meta << "  \"artifact_ptp_z\": " << args.artifact_ptp_z << ",\n";
+        meta << "  \"artifact_rms_z\": " << args.artifact_rms_z << ",\n";
+        meta << "  \"artifact_kurtosis_z\": " << args.artifact_kurtosis_z << ",\n";
+        meta << "  \"artifact_min_bad_channels\": " << args.artifact_min_bad_channels << ",\n";
+        meta << "  \"artifact_ignore_channels\": [";
+        for (size_t i = 0; i < args.artifact_ignore_channels.size(); ++i) {
+          if (i) meta << ", ";
+          meta << "\"" << json_escape(args.artifact_ignore_channels[i]) << "\"";
+        }
+        meta << "],\n";
+        const bool derived_events_written = (args.biotrace_ui || args.export_derived_events);
+        meta << "  \"biotrace_ui\": " << (args.biotrace_ui ? "true" : "false") << ",\n";
+        meta << "  \"export_derived_events\": " << (args.export_derived_events ? "true" : "false") << ",\n";
+        meta << "  \"derived_events_written\": " << (derived_events_written ? "true" : "false") << ",\n";
+        meta << "  \"derived_events_csv\": "
+             << (derived_events_written ? "\"" + json_escape("nf_derived_events.csv") + "\"" : "null")
+             << ",\n";
+        meta << "  \"derived_events_tsv\": "
+             << (derived_events_written ? "\"" + json_escape("nf_derived_events.tsv") + "\"" : "null")
+             << "\n";
         meta << "}\n";
       }
     }
@@ -887,6 +1794,82 @@ int main(int argc, char** argv) {
 
     const bool do_artifacts = args.artifact_gate || args.export_artifacts;
 
+    // Cross-tool integration: optionally export derived events (reward/artifact/baseline)
+    // as duration annotations that can be consumed by trace_plot_cli / export_bids_cli.
+    const bool want_derived_events = (args.biotrace_ui || args.export_derived_events);
+    std::vector<AnnotationEvent> derived_events;
+    if (want_derived_events) derived_events.reserve(512);
+    BoolSegmentBuilder reward_seg("NF:Reward");
+    BoolSegmentBuilder artifact_seg("NF:Artifact");
+    double prev_frame_end_sec = std::numeric_limits<double>::quiet_NaN();
+    double last_frame_end_sec = std::numeric_limits<double>::quiet_NaN();
+
+    auto derived_update = [&](double t_end_sec, bool reward_on, bool artifact_on) {
+      if (!want_derived_events) return;
+      double frame_end = t_end_sec;
+      double frame_start = std::isfinite(prev_frame_end_sec) ? prev_frame_end_sec : (frame_end - args.update_seconds);
+      if (!std::isfinite(frame_start)) frame_start = 0.0;
+      if (frame_start < 0.0) frame_start = 0.0;
+      if (frame_end < frame_start) frame_end = frame_start;
+      reward_seg.update(reward_on, frame_start, frame_end, &derived_events);
+      if (do_artifacts) {
+        artifact_seg.update(artifact_on, frame_start, frame_end, &derived_events);
+      }
+      prev_frame_end_sec = frame_end;
+      last_frame_end_sec = frame_end;
+    };
+
+    auto finalize_derived_events = [&]() {
+      if (!want_derived_events) return;
+      const double file_dur = static_cast<double>(rec.n_samples()) / rec.fs_hz;
+      const double end_sec = std::isfinite(last_frame_end_sec) ? last_frame_end_sec : file_dur;
+      reward_seg.finish(end_sec, &derived_events);
+      if (do_artifacts) artifact_seg.finish(end_sec, &derived_events);
+
+      // Mark the initial threshold estimation baseline period (only when threshold is not forced).
+      if (!std::isfinite(args.initial_threshold) && args.baseline_seconds > 0.0) {
+        const double bl_end = std::min(file_dur, args.baseline_seconds);
+        if (bl_end > 0.0 && std::isfinite(bl_end)) {
+          derived_events.push_back({0.0, bl_end, "NF:Baseline"});
+        }
+      }
+
+      std::sort(derived_events.begin(), derived_events.end(), [](const AnnotationEvent& a, const AnnotationEvent& b) {
+        if (a.onset_sec != b.onset_sec) return a.onset_sec < b.onset_sec;
+        return a.duration_sec < b.duration_sec;
+      });
+
+      if (args.export_derived_events || args.biotrace_ui) {
+        const std::string p_csv = args.outdir + "/nf_derived_events.csv";
+        const std::string p_tsv = args.outdir + "/nf_derived_events.tsv";
+        write_events_csv(p_csv, derived_events);
+        write_events_tsv(p_tsv, derived_events);
+        std::cout << "Wrote derived events: " << p_csv << " (" << derived_events.size() << ")" << std::endl;
+        std::cout << "Wrote derived events: " << p_tsv << " (" << derived_events.size() << ")" << std::endl;
+      }
+    };
+
+    // Optional BioTrace+ style UI timeline (HTML) that can be rendered after the run.
+    std::vector<NfUiFrame> ui_frames;
+    ui_frames.reserve(4096);
+
+    auto ui_push = [&](double t_end_sec, double metric_val, double thr, bool thr_ready,
+                       int reward, double rr, const OnlineArtifactFrame& af) {
+      if (!args.biotrace_ui) return;
+      NfUiFrame uf;
+      uf.t_end_sec = t_end_sec;
+      uf.metric = metric_val;
+      uf.threshold = thr_ready ? thr : std::numeric_limits<double>::quiet_NaN();
+      uf.reward = reward;
+      uf.reward_rate = rr;
+      if (do_artifacts) {
+        uf.artifact_ready = af.baseline_ready ? 1 : 0;
+        uf.artifact = (af.baseline_ready && af.bad) ? 1 : 0;
+        uf.bad_channels = static_cast<int>(af.bad_channel_count);
+      }
+      ui_frames.push_back(std::move(uf));
+    };
+
     out << "t_end_sec,metric,threshold,reward,reward_rate";
     if (do_artifacts) {
       out << ",artifact_ready,artifact,bad_channels";
@@ -917,6 +1900,12 @@ int main(int argc, char** argv) {
       sec_to_samples(args.reward_rate_window_seconds, 1.0 / args.update_seconds));
     std::deque<int> reward_hist;
     reward_hist.clear();
+
+    // Optional reward debouncing / hysteresis.
+    BoolDebouncer reward_gate(static_cast<size_t>(args.reward_on_frames),
+                              static_cast<size_t>(args.reward_off_frames),
+                              /*initial_state=*/false);
+
     auto reward_rate = [&]() {
       if (reward_hist.empty()) return 0.0;
       int sum = 0;
@@ -943,6 +1932,7 @@ int main(int argc, char** argv) {
       aopt.rms_z = args.artifact_rms_z;
       aopt.kurtosis_z = args.artifact_kurtosis_z;
       aopt.min_bad_channels = static_cast<size_t>(args.artifact_min_bad_channels);
+      aopt.ignore_channels = args.artifact_ignore_channels;
       artifact_gate = std::make_unique<OnlineArtifactGate>(rec.channel_names, rec.fs_hz, aopt);
       art = artifact_gate.get();
       if (args.export_artifacts) {
@@ -1034,15 +2024,19 @@ int main(int argc, char** argv) {
                                                             fr.t_end_sec,
                                                             0.5 / rec.fs_hz);
           const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
+          const bool artifact_state = (do_artifacts && af.baseline_ready && af.bad);
 
           const double val = fr.coherences[static_cast<size_t>(b_idx)][0];
           if (!std::isfinite(val)) {
+            reward_gate.reset(false);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
             if (art) osc_send_artifact(osc, osc_prefix, af);
             audio_reward_flags.push_back(0);
             continue;
           }
 
           if (!have_threshold) {
+            reward_gate.reset(false);
             if (fr.t_end_sec <= args.baseline_seconds) {
               baseline_values.push_back(val);
             } else {
@@ -1058,15 +2052,19 @@ int main(int argc, char** argv) {
                           have_threshold ? 1 : 0);
             if (art) osc_send_artifact(osc, osc_prefix, af);
             audio_reward_flags.push_back(0);
+            ui_push(fr.t_end_sec, val, threshold, have_threshold, /*reward=*/0, /*rr=*/0.0, af);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
             continue;
           }
 
           if (artifact_hit) {
+            reward_gate.reset(false);
             const double rr = reward_rate();
             osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
                           0, rr, 1);
             if (art) osc_send_artifact(osc, osc_prefix, af);
             audio_reward_flags.push_back(0);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
 
             out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
             if (do_artifacts) {
@@ -1077,10 +2075,13 @@ int main(int argc, char** argv) {
             out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
                 << "," << coherence_measure_name(metric.coherence_measure);
             out << "\n";
+            ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/0, rr, af);
             continue;
           }
 
-          const bool reward = is_reward(val, threshold, args.reward_direction);
+          const bool raw_reward = is_reward(val, threshold, args.reward_direction);
+          const bool reward = reward_gate.update(raw_reward);
+          derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state);
           audio_reward_flags.push_back(reward ? 1 : 0);
           reward_hist.push_back(reward ? 1 : 0);
           while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
@@ -1103,10 +2104,14 @@ int main(int argc, char** argv) {
           out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
                 << "," << coherence_measure_name(metric.coherence_measure);
           out << "\n";
+          ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/(reward ? 1 : 0), rr, af);
         }
       }
 
+      finalize_derived_events();
       write_reward_tone_wav_if_requested(args, audio_reward_flags);
+      write_biotrace_ui_html_if_requested(args, rec, metric, ui_frames, do_artifacts,
+                                          want_derived_events ? &derived_events : nullptr);
       std::cout << "Done. Outputs written to: " << args.outdir << "\n";
       return 0;
     }
@@ -1157,15 +2162,19 @@ int main(int argc, char** argv) {
                                                             fr.t_end_sec,
                                                             0.5 / rec.fs_hz);
           const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
+          const bool artifact_state = (do_artifacts && af.baseline_ready && af.bad);
 
           const double val = fr.value;
           if (!std::isfinite(val)) {
+            reward_gate.reset(false);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
             if (art) osc_send_artifact(osc, osc_prefix, af);
             audio_reward_flags.push_back(0);
             continue;
           }
 
           if (!have_threshold) {
+            reward_gate.reset(false);
             if (fr.t_end_sec <= args.baseline_seconds) {
               baseline_values.push_back(val);
             } else {
@@ -1181,15 +2190,19 @@ int main(int argc, char** argv) {
                           have_threshold ? 1 : 0);
             if (art) osc_send_artifact(osc, osc_prefix, af);
             audio_reward_flags.push_back(0);
+            ui_push(fr.t_end_sec, val, threshold, have_threshold, /*reward=*/0, /*rr=*/0.0, af);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
             continue;
           }
 
           if (artifact_hit) {
+            reward_gate.reset(false);
             const double rr = reward_rate();
             osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
                           0, rr, 1);
             if (art) osc_send_artifact(osc, osc_prefix, af);
             audio_reward_flags.push_back(0);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
 
             out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
             if (do_artifacts) {
@@ -1200,10 +2213,13 @@ int main(int argc, char** argv) {
             out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel;
             out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
             out << "\n";
+            ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/0, rr, af);
             continue;
           }
 
-          const bool reward = is_reward(val, threshold, args.reward_direction);
+          const bool raw_reward = is_reward(val, threshold, args.reward_direction);
+          const bool reward = reward_gate.update(raw_reward);
+          derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state);
           audio_reward_flags.push_back(reward ? 1 : 0);
           reward_hist.push_back(reward ? 1 : 0);
           while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
@@ -1226,10 +2242,14 @@ int main(int argc, char** argv) {
           out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel;
           out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
           out << "\n";
+          ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/(reward ? 1 : 0), rr, af);
         }
       }
 
+      finalize_derived_events();
       write_reward_tone_wav_if_requested(args, audio_reward_flags);
+      write_biotrace_ui_html_if_requested(args, rec, metric, ui_frames, do_artifacts,
+                                          want_derived_events ? &derived_events : nullptr);
       std::cout << "Done. Outputs written to: " << args.outdir << "\n";
       return 0;
     }
@@ -1310,15 +2330,19 @@ int main(int argc, char** argv) {
                                                           fr.t_end_sec,
                                                           0.5 / rec.fs_hz);
         const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
+        const bool artifact_state = (do_artifacts && af.baseline_ready && af.bad);
 
         const double val = compute_metric_band_or_ratio(fr, metric, ch_idx, b_idx, b_num, b_den);
         if (!std::isfinite(val)) {
+          reward_gate.reset(false);
+          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
           if (art) osc_send_artifact(osc, osc_prefix, af);
           audio_reward_flags.push_back(0);
           continue;
         }
 
         if (!have_threshold) {
+          reward_gate.reset(false);
           if (fr.t_end_sec <= args.baseline_seconds) {
             baseline_values.push_back(val);
           } else {
@@ -1334,15 +2358,19 @@ int main(int argc, char** argv) {
                         have_threshold ? 1 : 0);
           if (art) osc_send_artifact(osc, osc_prefix, af);
           audio_reward_flags.push_back(0);
+          ui_push(fr.t_end_sec, val, threshold, have_threshold, /*reward=*/0, /*rr=*/0.0, af);
+          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
           continue;
         }
 
         if (artifact_hit) {
+          reward_gate.reset(false);
           const double rr = reward_rate();
           osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
                         0, rr, 1);
           if (art) osc_send_artifact(osc, osc_prefix, af);
           audio_reward_flags.push_back(0);
+          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
 
           out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
           if (do_artifacts) {
@@ -1356,10 +2384,13 @@ int main(int argc, char** argv) {
             out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
           }
           out << "\n";
+          ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/0, rr, af);
           continue;
         }
 
-        const bool reward = is_reward(val, threshold, args.reward_direction);
+        const bool raw_reward = is_reward(val, threshold, args.reward_direction);
+        const bool reward = reward_gate.update(raw_reward);
+        derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state);
         audio_reward_flags.push_back(reward ? 1 : 0);
         reward_hist.push_back(reward ? 1 : 0);
         while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
@@ -1386,6 +2417,8 @@ int main(int argc, char** argv) {
         }
         out << "\n";
 
+        ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/(reward ? 1 : 0), rr, af);
+
         if (args.export_bandpowers) {
           out_bp << fr.t_end_sec;
           for (size_t b = 0; b < fr.bands.size(); ++b) {
@@ -1398,7 +2431,10 @@ int main(int argc, char** argv) {
       }
     }
 
+    finalize_derived_events();
     write_reward_tone_wav_if_requested(args, audio_reward_flags);
+    write_biotrace_ui_html_if_requested(args, rec, metric, ui_frames, do_artifacts,
+                                        want_derived_events ? &derived_events : nullptr);
     std::cout << "Done. Outputs written to: " << args.outdir << "\n";
     return 0;
   } catch (const std::exception& e) {

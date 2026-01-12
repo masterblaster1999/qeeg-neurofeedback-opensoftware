@@ -74,6 +74,33 @@ int main() {
   expect(ready_frames > 0, "OnlineArtifactGate should produce frames after baseline is ready");
   expect(flagged > 0, "OnlineArtifactGate should flag the injected artifact burst");
 
+  // If we ignore the artifact channel, we should not flag (since only A is contaminated).
+  OnlineArtifactOptions opt2 = opt;
+  opt2.ignore_channels = {"A"};
+  OnlineArtifactGate gate2({"A", "B"}, fs, opt2);
+
+  size_t flagged2 = 0;
+  size_t ready_frames2 = 0;
+  for (size_t pos = 0; pos < n; pos += chunk) {
+    const size_t end = std::min(n, pos + chunk);
+    std::vector<std::vector<float>> block(2);
+    block[0].assign(a.begin() + static_cast<std::ptrdiff_t>(pos),
+                    a.begin() + static_cast<std::ptrdiff_t>(end));
+    block[1].assign(b.begin() + static_cast<std::ptrdiff_t>(pos),
+                    b.begin() + static_cast<std::ptrdiff_t>(end));
+
+    const auto frames = gate2.push_block(block);
+    for (const auto& fr : frames) {
+      if (fr.baseline_ready) {
+        ++ready_frames2;
+        if (fr.bad) ++flagged2;
+      }
+    }
+  }
+
+  expect(ready_frames2 > 0, "OnlineArtifactGate (ignore) should produce frames after baseline is ready");
+  expect(flagged2 == 0, "Ignoring channel A should suppress artifact flagging when only A is contaminated");
+
   std::cout << "test_online_artifacts OK\n";
   return 0;
 }

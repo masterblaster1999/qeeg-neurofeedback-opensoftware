@@ -54,6 +54,67 @@ int main() {
     expect_bytes(bytes, 8, { 'h', 'i', 0, 0 });
   }
 
+  // Bool test: /b ,T (no payload bytes)
+  {
+    OscMessage m("/b");
+    m.add_bool(true);
+    const std::vector<uint8_t> bytes = m.to_bytes();
+
+    assert(bytes.size() == 8);
+    assert((bytes.size() % 4) == 0);
+
+    expect_bytes(bytes, 0, { '/', 'b', 0, 0 });
+    expect_bytes(bytes, 4, { ',', 'T', 0, 0 });
+  }
+
+  // Int64 test: /h ,h 1
+  {
+    OscMessage m("/h");
+    m.add_int64(1);
+    const std::vector<uint8_t> bytes = m.to_bytes();
+
+    assert(bytes.size() == 16);
+    assert((bytes.size() % 4) == 0);
+
+    expect_bytes(bytes, 0, { '/', 'h', 0, 0 });
+    expect_bytes(bytes, 4, { ',', 'h', 0, 0 });
+
+    // int64 1 big-endian
+    expect_bytes(bytes, 8, { 0, 0, 0, 0, 0, 0, 0, 1 });
+  }
+
+  // Float64 test: /d ,d 0.5
+  {
+    OscMessage m("/d");
+    m.add_float64(0.5);
+    const std::vector<uint8_t> bytes = m.to_bytes();
+
+    assert(bytes.size() == 16);
+    assert((bytes.size() % 4) == 0);
+
+    expect_bytes(bytes, 0, { '/', 'd', 0, 0 });
+    expect_bytes(bytes, 4, { ',', 'd', 0, 0 });
+
+    // float64 0.5 big-endian == 0x3FE0000000000000
+    expect_bytes(bytes, 8, { 0x3F, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+  }
+
+  // Blob test: /blob ,b <len=3> 0x01 0x02 0x03
+  {
+    const std::vector<uint8_t> payload = { 1, 2, 3 };
+    OscMessage m("/blob");
+    m.add_blob(payload);
+    const std::vector<uint8_t> bytes = m.to_bytes();
+
+    assert(bytes.size() == 20);
+    assert((bytes.size() % 4) == 0);
+
+    expect_bytes(bytes, 0,  { '/', 'b', 'l', 'o', 'b', 0, 0, 0 });
+    expect_bytes(bytes, 8,  { ',', 'b', 0, 0 });
+    expect_bytes(bytes, 12, { 0, 0, 0, 3 });
+    expect_bytes(bytes, 16, { 1, 2, 3, 0 });
+  }
+
   // Bundle test: #bundle <timetag> [size][message]...
   {
     OscMessage a("/a");

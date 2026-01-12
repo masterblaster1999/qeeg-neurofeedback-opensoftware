@@ -81,9 +81,10 @@ int main() {
     ev_opts.include_sample = true;
     ev_opts.sample_index_base = 0;
     ev_opts.include_value = true;
+    ev_opts.include_trial_type_levels = true;
 
     write_bids_events_tsv(events_extra_tsv.u8string(), rec.events, ev_opts, rec.fs_hz);
-    write_bids_events_json(events_extra_json.u8string(), ev_opts);
+    write_bids_events_json(events_extra_json.u8string(), ev_opts, rec.events);
 
     const std::string eeg = slurp(eeg_json);
     assert(eeg.find("\"SamplingFrequency\"") != std::string::npos);
@@ -113,6 +114,62 @@ int main() {
     assert(evxj.find("trial_type") != std::string::npos);
     assert(evxj.find("sample") != std::string::npos);
     assert(evxj.find("value") != std::string::npos);
+    assert(evxj.find("\"Levels\"") != std::string::npos);
+    assert(evxj.find("\"stim\"") != std::string::npos);
+    assert(evxj.find("\"5\"") != std::string::npos);
+  }
+
+  // Electrodes + coordsystem helpers.
+  {
+    const auto tmp = std::filesystem::temp_directory_path() / "qeeg_test_bids_electrodes";
+    std::filesystem::create_directories(tmp);
+
+    // Write a small CSV electrodes table and load it.
+    const auto in_csv = tmp / "electrodes_in.csv";
+    {
+      std::ofstream f(in_csv, std::ios::binary);
+      assert(static_cast<bool>(f));
+      f << "name,x,y,z,type,material,impedance\n";
+      f << "Cz,0,0.0714,0.0699,cup,Ag/AgCl,5.5\n";
+      f << "REF,n/a,n/a,n/a,,,\n";
+    }
+
+    const auto loaded = load_bids_electrodes_table(in_csv.u8string());
+    assert(loaded.size() == 2);
+    assert(loaded[0].name == "Cz");
+    assert(loaded[0].x.has_value());
+    assert(loaded[0].y.has_value());
+    assert(loaded[0].z.has_value());
+    assert(loaded[0].type == "cup");
+    assert(loaded[0].material == "Ag/AgCl");
+    assert(loaded[0].impedance_kohm.has_value());
+    assert(loaded[1].name == "REF");
+    assert(!loaded[1].x.has_value());
+    assert(!loaded[1].y.has_value());
+    assert(!loaded[1].z.has_value());
+
+    // Write electrodes.tsv.
+    const auto electrodes_tsv = tmp / "sub-01_task-rest_electrodes.tsv";
+    write_bids_electrodes_tsv(electrodes_tsv.u8string(), loaded);
+
+    const std::string el = slurp(electrodes_tsv);
+    assert(el.find("name\tx\ty\tz") != std::string::npos);
+    assert(el.find("Cz\t0.000000\t0.071400\t0.069900") != std::string::npos);
+    assert(el.find("REF\tn/a\tn/a\tn/a") != std::string::npos);
+
+    // Coord system JSON.
+    assert(is_valid_bids_coordinate_unit("mm"));
+    assert(!is_valid_bids_coordinate_unit("meters"));
+
+    const auto coordsystem_json = tmp / "sub-01_task-rest_coordsystem.json";
+    BidsCoordsystemJsonEegMetadata cs;
+    cs.eeg_coordinate_system = "CapTrak";
+    cs.eeg_coordinate_units = "mm";
+    write_bids_coordsystem_json(coordsystem_json.u8string(), cs);
+
+    const std::string csj = slurp(coordsystem_json);
+    assert(csj.find("\"EEGCoordinateSystem\": \"CapTrak\"") != std::string::npos);
+    assert(csj.find("\"EEGCoordinateUnits\": \"mm\"") != std::string::npos);
   }
 
   std::cout << "All tests passed.\n";

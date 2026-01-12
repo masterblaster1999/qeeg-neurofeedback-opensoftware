@@ -42,6 +42,7 @@ add_library(qeeg STATIC
   src/coherence.cpp
   src/pac.cpp
   src/plv.cpp
+  src/online_plv.cpp
   src/nf_metric.cpp
   src/artifacts.cpp
   src/online_artifacts.cpp
@@ -254,6 +255,10 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_triggers PRIVATE qeeg)
   add_test(NAME qeeg_test_triggers COMMAND qeeg_test_triggers)
 
+  add_executable(qeeg_test_debounce tests/test_debounce.cpp)
+  target_link_libraries(qeeg_test_debounce PRIVATE qeeg)
+  add_test(NAME qeeg_test_debounce COMMAND qeeg_test_debounce)
+
   add_executable(qeeg_test_bids tests/test_bids.cpp)
   target_link_libraries(qeeg_test_bids PRIVATE qeeg)
   add_test(NAME qeeg_test_bids COMMAND qeeg_test_bids)
@@ -302,6 +307,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_online_coherence tests/test_online_coherence.cpp)
   target_link_libraries(qeeg_test_online_coherence PRIVATE qeeg)
   add_test(NAME qeeg_test_online_coherence COMMAND qeeg_test_online_coherence)
+
+  add_executable(qeeg_test_online_plv tests/test_online_plv.cpp)
+  target_link_libraries(qeeg_test_online_plv PRIVATE qeeg)
+  add_test(NAME qeeg_test_online_plv COMMAND qeeg_test_online_plv)
 
   add_executable(qeeg_test_biquad tests/test_biquad.cpp)
   target_link_libraries(qeeg_test_biquad PRIVATE qeeg)
@@ -377,6 +386,18 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_reference_csv tests/test_reference_csv.cpp)
   target_link_libraries(qeeg_test_reference_csv PRIVATE qeeg)
   add_test(NAME qeeg_test_reference_csv COMMAND qeeg_test_reference_csv)
+
+  add_executable(qeeg_test_events_table tests/test_events_table.cpp)
+  target_link_libraries(qeeg_test_events_table PRIVATE qeeg)
+  add_test(NAME qeeg_test_events_table COMMAND qeeg_test_events_table)
+
+  add_executable(qeeg_test_event_ops tests/test_event_ops.cpp)
+  target_link_libraries(qeeg_test_event_ops PRIVATE qeeg)
+  add_test(NAME qeeg_test_event_ops COMMAND qeeg_test_event_ops)
+
+  add_executable(qeeg_test_nf_session tests/test_nf_session.cpp)
+  target_link_libraries(qeeg_test_nf_session PRIVATE qeeg)
+  add_test(NAME qeeg_test_nf_session COMMAND qeeg_test_nf_session)
 
   add_executable(qeeg_test_relative_bandpower tests/test_relative_bandpower.cpp)
   target_link_libraries(qeeg_test_relative_bandpower PRIVATE qeeg)

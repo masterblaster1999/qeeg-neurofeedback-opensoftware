@@ -233,10 +233,10 @@ int main() {
     assert(std::fabs(rec.data[0][3] - 1.3f) < 1e-6f);
     assert(std::fabs(rec.data[1][4] - 2.4f) < 1e-6f);
 
-    // Marker code 5 active for 2 samples starting at sample index 2.
+    // Marker code 5 starts at sample index 2.
     assert(rec.events.size() == 1);
     assert(approx(rec.events[0].onset_sec, 2.0 / 250.0));
-    assert(approx(rec.events[0].duration_sec, 2.0 / 250.0));
+    assert(approx(rec.events[0].duration_sec, 0.0));
     assert(rec.events[0].text == "5");
   }
 
@@ -265,11 +265,253 @@ int main() {
 
     assert(rec.events.size() == 1);
     assert(approx(rec.events[0].onset_sec, 1.0 / 250.0));
-    assert(approx(rec.events[0].duration_sec, 2.0 / 250.0));
+    assert(approx(rec.events[0].duration_sec, 0.0));
     assert(rec.events[0].text == "Start");
   }
 
   std::remove(path9.c_str());
+
+
+
+  // 10) Allow missing trailing empty columns (common when the last column is an event/marker stream).
+  // Many exporters omit the trailing delimiter when the last cell is empty.
+  const std::string path10 = "tmp_marker_trailing_missing.csv";
+  {
+    std::ofstream out(path10);
+    out << "time,C1,C2,event\n";
+    out << "0.000,1,2\n";            // missing trailing event cell
+    out << "0.004,2,3,Start\n";
+    out << "0.008,3,4,Start\n";
+    out << "0.012,4,5\n";            // missing trailing event cell
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer
+    EEGRecording rec = r.read(path10);
+
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 4);
+    assert(rec.data[1].size() == 4);
+
+    // "Start" begins at sample 1.
+    assert(rec.events.size() == 1);
+    assert(approx(rec.events[0].onset_sec, 1.0 / 250.0));
+    assert(approx(rec.events[0].duration_sec, 0.0));
+    assert(rec.events[0].text == "Start");
+  }
+
+  std::remove(path10.c_str());
+
+  // 11) Allow extra trailing delimiters that produce empty columns.
+  const std::string path11 = "tmp_extra_trailing_delims.csv";
+  {
+    std::ofstream out(path11);
+    out << "time,C1,event\n";
+    out << "0.000,1,Start,\n";  // extra trailing empty field
+    out << "0.004,2,,\n";       // event empty + extra trailing empty field
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer
+    EEGRecording rec = r.read(path11);
+
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 1);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.data.size() == 1);
+    assert(rec.data[0].size() == 2);
+
+    assert(rec.events.size() == 1);
+    assert(approx(rec.events[0].onset_sec, 0.0));
+    assert(approx(rec.events[0].duration_sec, 0.0));
+    assert(rec.events[0].text == "Start");
+  }
+
+  std::remove(path11.c_str());
+
+  // 12) BioTrace+ style hh:mm:ss time axis.
+  // BioTrace+ can export time in hh:mm:ss (with optional fractional seconds).
+  // We should be able to infer fs from a monotonic hh:mm:ss.xxx column.
+  const std::string path12 = "tmp_time_hms.csv";
+  {
+    std::ofstream out(path12);
+    out << "time,C1\n";
+    out << "00:00:00.000,1\n";
+    out << "00:00:00.004,2\n";
+    out << "00:00:00.008,3\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer
+    EEGRecording rec = r.read(path12);
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 1);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.data.size() == 1);
+    assert(rec.data[0].size() == 3);
+    assert(std::fabs(rec.data[0][2] - 3.0f) < 1e-6f);
+  }
+
+  std::remove(path12.c_str());
+
+  // 13) Missing numeric cells: forward-fill by default.
+  // This occurs in some BioTrace+ ASCII exports if "repeat slower channels" is disabled.
+  const std::string path13 = "tmp_missing_cells_forward_fill.csv";
+  {
+    std::ofstream out(path13);
+    out << "time_ms;EEG;Temp\n";
+    out << "0;1;20\n";
+    out << "4;2;\n";   // Temp missing
+    out << "8;3;21\n";
+    out << "12;4;\n";  // Temp missing
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer
+    EEGRecording rec = r.read(path13);
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "EEG");
+    assert(rec.channel_names[1] == "Temp");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 4);
+    assert(rec.data[1].size() == 4);
+    assert(std::fabs(rec.data[1][0] - 20.0f) < 1e-6f);
+    assert(std::fabs(rec.data[1][1] - 20.0f) < 1e-6f); // forward-filled
+    assert(std::fabs(rec.data[1][2] - 21.0f) < 1e-6f);
+    assert(std::fabs(rec.data[1][3] - 21.0f) < 1e-6f); // forward-filled
+  }
+
+  std::remove(path13.c_str());
+
+  // 14) NeXus/BioTrace+ style: sample index + time column.
+  // Many exports include an explicit sample counter column before the time axis.
+  const std::string path14 = "tmp_sample_and_time.csv";
+  {
+    std::ofstream out(path14);
+    out << "BioTrace+ ASCII Export;TEST\n";
+    out << "Client;Example\n";
+    out << "Sample;Time;C1;C2\n";
+    out << "0;00:00:00.000;1;2\n";
+    out << "1;00:00:00.004;1.1;2.1\n";
+    out << "2;00:00:00.008;1.2;2.2\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer from Time
+    EEGRecording rec = r.read(path14);
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 3);
+    assert(rec.data[1].size() == 3);
+    assert(std::fabs(rec.data[0][1] - 1.1f) < 1e-6f);
+    assert(std::fabs(rec.data[1][2] - 2.2f) < 1e-6f);
+  }
+
+  std::remove(path14.c_str());
+
+  // 15) Sample index only: should be ignored as a data channel when fs is provided.
+  const std::string path15 = "tmp_sample_index_only.csv";
+  {
+    std::ofstream out(path15);
+    out << "sample,C1,C2\n";
+    out << "0,1,2\n";
+    out << "1,3,4\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/250.0); // provided
+    EEGRecording rec = r.read(path15);
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 2);
+    assert(rec.data[1].size() == 2);
+    assert(std::fabs(rec.data[0][1] - 3.0f) < 1e-6f);
+    assert(std::fabs(rec.data[1][0] - 2.0f) < 1e-6f);
+  }
+
+  std::remove(path15.c_str());
+
+
+  // 16) Unit suffixes in channel headers: strip recognized unit tokens and scale to microvolts.
+  // BioTrace+/NeXus ASCII exports often annotate columns with units like "(uV)" or "(mV)".
+  const std::string path16 = "tmp_units_in_header.csv";
+  {
+    std::ofstream out(path16);
+    out << "time_ms;EEG1 (mV);Cz [uV];Pz (\xC2\xB5V);EEG2_uV\n";
+    out << "0;0.001;10;100;20\n";
+    out << "4;0.002;11;101;21\n";
+    out << "8;0.003;12;102;22\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer
+    EEGRecording rec = r.read(path16);
+
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 4);
+    assert(rec.channel_names[0] == "EEG1");
+    assert(rec.channel_names[1] == "Cz");
+    assert(rec.channel_names[2] == "Pz");
+    assert(rec.channel_names[3] == "EEG2");
+    assert(rec.data.size() == 4);
+    assert(rec.data[0].size() == 3);
+
+    // EEG1 is labeled as mV in the header -> scale to microvolts (uV) internally.
+    assert(std::fabs(rec.data[0][0] - 1.0f) < 1e-6f); // 0.001 mV -> 1 uV
+    assert(std::fabs(rec.data[0][2] - 3.0f) < 1e-6f); // 0.003 mV -> 3 uV
+
+    // Other channels are already uV.
+    assert(std::fabs(rec.data[2][1] - 101.0f) < 1e-6f);
+    assert(std::fabs(rec.data[3][0] - 20.0f) < 1e-6f);
+  }
+
+  std::remove(path16.c_str());
+
+  // 17) BioTrace+ "Include segments" export: segment column should be treated as an event stream.
+  // The BioTrace+ user manual describes an option to include segments in ASCII exports.
+  // When present, a "Segment" column typically contains labels that are constant over a range.
+  const std::string path17 = "tmp_segment_column.csv";
+  {
+    std::ofstream out(path17);
+    out << "time_ms;C1;Segment;C2\n";
+    out << "0;1;Baseline;2\n";
+    out << "4;1.1;Baseline;2.1\n";
+    out << "8;1.2;Train;2.2\n";
+    out << "12;1.3;Train;2.3\n";
+    out << "16;1.4;;2.4\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer
+    EEGRecording rec = r.read(path17);
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+
+    // Segment labels emitted as events.
+    assert(rec.events.size() == 2);
+    assert(rec.events[0].text == "Baseline");
+    assert(approx(rec.events[0].onset_sec, 0.0));
+    assert(approx(rec.events[0].duration_sec, 2.0 / 250.0));
+
+    assert(rec.events[1].text == "Train");
+    assert(approx(rec.events[1].onset_sec, 2.0 / 250.0));
+    assert(approx(rec.events[1].duration_sec, 2.0 / 250.0));
+  }
+
+  std::remove(path17.c_str());
 
   std::cout << "test_csv_reader OK\n";
   return 0;

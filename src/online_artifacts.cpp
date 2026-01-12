@@ -1,12 +1,14 @@
 #include "qeeg/online_artifacts.hpp"
 
 #include "qeeg/robust_stats.hpp"
+#include "qeeg/utils.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace qeeg {
 namespace {
@@ -61,6 +63,29 @@ OnlineArtifactGate::OnlineArtifactGate(std::vector<std::string> channel_names,
   base_rms_.assign(channel_names_.size(), {});
   base_kurt_.assign(channel_names_.size(), {});
   baseline_stats_.assign(channel_names_.size(), ArtifactChannelStats{});
+
+  // Build ignore mask from channel names (best-effort normalized matching).
+  ignore_mask_.assign(channel_names_.size(), 0);
+  included_channel_count_ = channel_names_.size();
+  if (!opt_.ignore_channels.empty()) {
+    std::unordered_set<std::string> ignored;
+    ignored.reserve(opt_.ignore_channels.size());
+    for (const auto& name : opt_.ignore_channels) {
+      const std::string norm = normalize_channel_name(name);
+      if (!norm.empty()) ignored.insert(norm);
+    }
+
+    included_channel_count_ = 0;
+    for (size_t i = 0; i < channel_names_.size(); ++i) {
+      const std::string norm = normalize_channel_name(channel_names_[i]);
+      if (!norm.empty() && ignored.count(norm)) {
+        ignore_mask_[i] = 1;
+      } else {
+        ignore_mask_[i] = 0;
+        ++included_channel_count_;
+      }
+    }
+  }
 }
 
 OnlineArtifactGate::RawFeatures OnlineArtifactGate::compute_raw_features() const {
@@ -206,7 +231,11 @@ std::vector<OnlineArtifactFrame> OnlineArtifactGate::push_block(const std::vecto
       if (baseline_ready_) {
         size_t bad_ch = 0;
         double max_ptp = 0.0, max_rms = 0.0, max_kurt = 0.0;
+        const size_t min_bad = (included_channel_count_ > 0)
+                               ? std::min(opt_.min_bad_channels, included_channel_count_)
+                               : std::numeric_limits<size_t>::max();
         for (size_t ch = 0; ch < channel_names_.size(); ++ch) {
+          if (ch < ignore_mask_.size() && ignore_mask_[ch]) continue;
           const auto& st = baseline_stats_[ch];
           const double z_ptp = (raw.ptp[ch] - st.ptp_median) / st.ptp_scale;
           const double z_rms = (raw.rms[ch] - st.rms_median) / st.rms_scale;
@@ -223,7 +252,7 @@ std::vector<OnlineArtifactFrame> OnlineArtifactGate::push_block(const std::vecto
           if (bad) ++bad_ch;
         }
         fr.bad_channel_count = bad_ch;
-        fr.bad = (bad_ch >= opt_.min_bad_channels);
+        fr.bad = (bad_ch >= min_bad);
         fr.max_ptp_z = max_ptp;
         fr.max_rms_z = max_rms;
         fr.max_kurtosis_z = max_kurt;

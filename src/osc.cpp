@@ -1,5 +1,6 @@
 #include "qeeg/osc.hpp"
 
+#include <cerrno>
 #include <cstring>
 #include <stdexcept>
 
@@ -51,11 +52,36 @@ static void append_i32_be(std::vector<uint8_t>* out, int32_t v) {
   append_u32_be(out, static_cast<uint32_t>(v));
 }
 
+static void append_i64_be(std::vector<uint8_t>* out, int64_t v) {
+  append_u64_be(out, static_cast<uint64_t>(v));
+}
+
 static void append_f32_be(std::vector<uint8_t>* out, float v) {
   static_assert(sizeof(float) == 4, "float must be 32-bit");
   uint32_t bits = 0;
   std::memcpy(&bits, &v, sizeof(bits));
   append_u32_be(out, bits);
+}
+
+static void append_f64_be(std::vector<uint8_t>* out, double v) {
+  static_assert(sizeof(double) == 8, "double must be 64-bit");
+  uint64_t bits = 0;
+  std::memcpy(&bits, &v, sizeof(bits));
+  append_u64_be(out, bits);
+}
+
+static void append_blob(std::vector<uint8_t>* out, const void* data, size_t size) {
+  if (!out) return;
+  if (size > 0xFFFFFFFFull) {
+    throw std::runtime_error("OscMessage: blob too large (max 2^32-1 bytes)");
+  }
+  append_u32_be(out, static_cast<uint32_t>(size));
+  if (size > 0) {
+    if (!data) throw std::runtime_error("OscMessage: blob data pointer is null");
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    out->insert(out->end(), p, p + size);
+  }
+  while ((out->size() % 4) != 0) out->push_back(0);
 }
 
 #ifdef _WIN32
@@ -102,14 +128,34 @@ void OscMessage::add_int32(int32_t v) {
   append_i32_be(&args_, v);
 }
 
+void OscMessage::add_int64(int64_t v) {
+  typetags_.push_back('h');
+  append_i64_be(&args_, v);
+}
+
 void OscMessage::add_float32(float v) {
   typetags_.push_back('f');
   append_f32_be(&args_, v);
 }
 
+void OscMessage::add_float64(double v) {
+  typetags_.push_back('d');
+  append_f64_be(&args_, v);
+}
+
 void OscMessage::add_string(const std::string& v) {
   typetags_.push_back('s');
   append_padded_string(&args_, v);
+}
+
+void OscMessage::add_bool(bool v) {
+  // OSC boolean typetags have no payload bytes.
+  typetags_.push_back(v ? 'T' : 'F');
+}
+
+void OscMessage::add_blob(const void* data, size_t size) {
+  typetags_.push_back('b');
+  append_blob(&args_, data, size);
 }
 
 std::vector<uint8_t> OscMessage::to_bytes() const {
@@ -179,10 +225,16 @@ struct OscUdpClient::Impl {
 
   bool ok{false};
   std::string last_error;
+
+  std::string host;
+  int port{0};
 };
 
 OscUdpClient::OscUdpClient(const std::string& host, int port)
   : impl_(std::make_unique<Impl>()) {
+  impl_->host = host;
+  impl_->port = port;
+
   if (port <= 0 || port > 65535) {
     impl_->last_error = "OscUdpClient: port must be in [1, 65535]";
     impl_->ok = false;
@@ -207,9 +259,9 @@ OscUdpClient::OscUdpClient(const std::string& host, int port)
   const int rc = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
   if (rc != 0 || !res) {
 #ifdef _WIN32
-    impl_->last_error = std::string("OscUdpClient: getaddrinfo failed: ") + gai_strerrorA(rc);
+    impl_->last_error = std::string("OscUdpClient: getaddrinfo failed for '") + host + ":" + port_str + "': " + gai_strerrorA(rc);
 #else
-    impl_->last_error = std::string("OscUdpClient: getaddrinfo failed: ") + gai_strerror(rc);
+    impl_->last_error = std::string("OscUdpClient: getaddrinfo failed for '") + host + ":" + port_str + "': " + gai_strerror(rc);
 #endif
     impl_->ok = false;
     return;
@@ -237,7 +289,7 @@ OscUdpClient::OscUdpClient(const std::string& host, int port)
   freeaddrinfo(res);
 
   if (!opened) {
-    impl_->last_error = "OscUdpClient: failed to open UDP socket";
+    impl_->last_error = std::string("OscUdpClient: failed to open UDP socket for '") + host + ":" + port_str + "'";
     impl_->ok = false;
     return;
   }
@@ -288,7 +340,8 @@ bool OscUdpClient::send_bytes(const std::vector<uint8_t>& bytes) {
     reinterpret_cast<const sockaddr*>(&impl_->addr),
     impl_->addr_len);
   if (sent == SOCKET_ERROR) {
-    impl_->last_error = "OscUdpClient: sendto failed";
+    const int ec = WSAGetLastError();
+    impl_->last_error = "OscUdpClient: sendto failed (WSA error " + std::to_string(ec) + ")";
     return false;
   }
 #else
@@ -300,10 +353,16 @@ bool OscUdpClient::send_bytes(const std::vector<uint8_t>& bytes) {
     reinterpret_cast<const sockaddr*>(&impl_->addr),
     impl_->addr_len);
   if (sent < 0) {
-    impl_->last_error = "OscUdpClient: sendto failed";
+    impl_->last_error = std::string("OscUdpClient: sendto failed: ") + std::strerror(errno);
     return false;
   }
 #endif
+
+  // For UDP datagrams, sendto should either send the full packet or fail.
+  if (static_cast<size_t>(sent) != bytes.size()) {
+    impl_->last_error = "OscUdpClient: sendto sent unexpected byte count";
+    return false;
+  }
 
   return true;
 }

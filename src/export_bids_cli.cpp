@@ -1,17 +1,22 @@
 #include "qeeg/bids.hpp"
 #include "qeeg/brainvision_writer.hpp"
+#include "qeeg/csv_io.hpp"
 #include "qeeg/channel_map.hpp"
 #include "qeeg/edf_writer.hpp"
+#include "qeeg/event_ops.hpp"
 #include "qeeg/line_noise.hpp"
+#include "qeeg/nf_session.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/types.hpp"
 #include "qeeg/utils.hpp"
 
 #include <cstdlib>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace qeeg;
 
@@ -42,10 +47,28 @@ struct Args {
 
   bool no_events{false};
 
+  // Optional additional events to merge into rec.events before writing
+  // *_events.tsv/json. Accepts qeeg events CSV or BIDS events.tsv.
+  std::vector<std::string> extra_events;
+
+  // Convenience: load nf_cli-derived events from <nf_outdir>/nf_derived_events.tsv/.csv
+  // without having to specify --extra-events explicitly.
+  std::string nf_outdir;
+
   // Optional extra columns in *_events.tsv
   bool events_sample{false};
   int events_sample_base{0}; // 0 or 1
   bool events_value{false};
+
+  // Optionally include trial_type Levels mapping in *_events.json.
+  bool events_levels{false};
+
+  // Optional: electrode positions (digitized) and coordinate system.
+  // When provided, writes *_electrodes.tsv and *_coordsystem.json.
+  std::string electrodes_in;     // CSV/TSV with header: name,x,y,z[,type,material,impedance]
+  std::string eeg_coord_system;  // e.g., CapTrak / EEGLAB / EEGLAB-HJ / Other
+  std::string eeg_coord_units;   // m|mm|cm|n/a
+  std::string eeg_coord_desc;    // required if eeg_coord_system == Other
 
   bool overwrite{false};
 };
@@ -54,7 +77,8 @@ static void print_help() {
   std::cout
       << "qeeg_export_bids_cli\n\n"
       << "Export a recording (EDF/BDF/CSV/BrainVision) into a BIDS EEG folder layout.\n"
-      << "Writes: data file (EDF or BrainVision) + *_eeg.json + *_channels.tsv (+ events.tsv/json if present).\n\n"
+      << "Writes: data file (EDF or BrainVision) + *_eeg.json + *_channels.tsv (+ events.tsv/json if present).\n"
+      << "Optionally writes *_electrodes.tsv and *_coordsystem.json when --electrodes is provided.\n\n"
       << "Usage:\n"
       << "  qeeg_export_bids_cli --input <in.edf|in.bdf|in.csv|in.txt|in.vhdr> --out-dir <bids_root> --sub <label> --task <label> [options]\n\n"
       << "Required:\n"
@@ -77,9 +101,18 @@ static void print_help() {
       << "  --powerline <auto|n/a|Hz>      PowerLineFrequency. 'auto' uses a 50/60 Hz detector.\n"
       << "  --software-filters <n/a|JSON>  SoftwareFilters. Use 'n/a' or a raw JSON object string.\n"
       << "  --no-events                    Do not write *_events.tsv/json even if events exist.\n"
+      << "  --extra-events <file.{csv|tsv}> Load additional events and merge them before writing events.tsv\n"
+      << "                               (repeatable; supports qeeg events CSV or BIDS events.tsv).\n"
+      << "  --nf-outdir <dir>               Convenience: merge nf_cli derived events from <dir>/nf_derived_events.tsv/.csv\n"
       << "  --events-sample                Add a 'sample' column to *_events.tsv (derived from onset * SamplingFrequency).\n"
       << "  --events-sample-base <0|1>     Base for the 'sample' column (default: 0).\n"
       << "  --events-value                 Add a 'value' column (integer parsed from annotation text when possible).\n"
+      << "  --events-levels                Include a trial_type Levels map in *_events.json (only if unique values are few).\n"
+      << "  --electrodes <file.{tsv|csv}>  Input digitized electrode positions table; writes *_electrodes.tsv and *_coordsystem.json.\n"
+      << "                               Header must include: name,x,y,z (optional: type,material,impedance).\n"
+      << "  --eeg-coord-system <value>     EEGCoordinateSystem for *_coordsystem.json (e.g., CapTrak, EEGLAB, EEGLAB-HJ, Other).\n"
+      << "  --eeg-coord-units <m|mm|cm|n/a> EEGCoordinateUnits for *_coordsystem.json.\n"
+      << "  --eeg-coord-desc <text>        EEGCoordinateSystemDescription (REQUIRED if --eeg-coord-system Other).\n"
       << "  --overwrite                    Overwrite output files if they already exist.\n"
       << "  -h, --help                     Show this help.\n\n"
       << "Notes:\n"
@@ -178,12 +211,26 @@ int main(int argc, char** argv) {
         args.software_filters = require_value(i, argc, argv, a);
       } else if (a == "--no-events") {
         args.no_events = true;
+      } else if (a == "--extra-events") {
+        args.extra_events.push_back(require_value(i, argc, argv, a));
+      } else if (a == "--nf-outdir") {
+        args.nf_outdir = require_value(i, argc, argv, a);
       } else if (a == "--events-sample") {
         args.events_sample = true;
       } else if (a == "--events-sample-base") {
         args.events_sample_base = parse_int_or_throw(require_value(i, argc, argv, a), a);
       } else if (a == "--events-value") {
         args.events_value = true;
+      } else if (a == "--events-levels") {
+        args.events_levels = true;
+      } else if (a == "--electrodes") {
+        args.electrodes_in = require_value(i, argc, argv, a);
+      } else if (a == "--eeg-coord-system") {
+        args.eeg_coord_system = require_value(i, argc, argv, a);
+      } else if (a == "--eeg-coord-units") {
+        args.eeg_coord_units = require_value(i, argc, argv, a);
+      } else if (a == "--eeg-coord-desc") {
+        args.eeg_coord_desc = require_value(i, argc, argv, a);
       } else if (a == "--overwrite") {
         args.overwrite = true;
       } else {
@@ -229,6 +276,30 @@ int main(int argc, char** argv) {
       apply_channel_map(&rec, m);
     }
 
+    // Optional extra events table(s) to merge before exporting.
+    // This enables cross-tool workflows, e.g.:
+    //   - nf_cli -> nf_derived_events.tsv/.csv -> export as BIDS events.tsv
+    //   - hand-edited BIDS events.tsv -> add to exported dataset
+    std::vector<std::string> extra_paths = args.extra_events;
+    if (!args.nf_outdir.empty()) {
+      const auto p = find_nf_derived_events_table(args.nf_outdir);
+      if (p) {
+        extra_paths.push_back(*p);
+      } else {
+        std::cerr << "Warning: --nf-outdir provided, but nf_derived_events.tsv/.csv was not found in: "
+                  << args.nf_outdir << "\n"
+                  << "         Did you run qeeg_nf_cli with --export-derived-events or --biotrace-ui?\n";
+      }
+    }
+
+    std::vector<AnnotationEvent> extra_all;
+    for (const auto& p : extra_paths) {
+      const auto extra = read_events_table(p);
+      extra_all.insert(extra_all.end(), extra.begin(), extra.end());
+    }
+    // Also normalizes + de-duplicates source events for deterministic exports.
+    merge_events(&rec.events, extra_all);
+
     // Prepare BIDS paths.
     BidsEntities ent;
     ent.sub = args.sub;
@@ -251,12 +322,16 @@ int main(int argc, char** argv) {
     const std::string stem_eeg = format_bids_filename_stem(ent, "eeg");
     const std::string stem_channels = format_bids_filename_stem(ent, "channels");
     const std::string stem_events = format_bids_filename_stem(ent, "events");
+    const std::string stem_electrodes = format_bids_filename_stem(ent, "electrodes");
+    const std::string stem_coordsystem = format_bids_filename_stem(ent, "coordsystem");
 
     // Output file paths.
     std::filesystem::path eeg_json = eeg_dir / (stem_eeg + ".json");
     std::filesystem::path channels_tsv = eeg_dir / (stem_channels + ".tsv");
     std::filesystem::path events_tsv = eeg_dir / (stem_events + ".tsv");
     std::filesystem::path events_json = eeg_dir / (stem_events + ".json");
+    std::filesystem::path electrodes_tsv = eeg_dir / (stem_electrodes + ".tsv");
+    std::filesystem::path coordsystem_json = eeg_dir / (stem_coordsystem + ".json");
 
     // Data file(s).
     std::filesystem::path data_primary;
@@ -281,6 +356,11 @@ int main(int argc, char** argv) {
     if (!args.no_events && !rec.events.empty()) {
       ensure_writable(events_tsv, args.overwrite);
       ensure_writable(events_json, args.overwrite);
+    }
+
+    if (!args.electrodes_in.empty()) {
+      ensure_writable(electrodes_tsv, args.overwrite);
+      ensure_writable(coordsystem_json, args.overwrite);
     }
 
     // Write data.
@@ -350,9 +430,29 @@ int main(int argc, char** argv) {
       ev_opts.include_sample = args.events_sample;
       ev_opts.sample_index_base = args.events_sample_base;
       ev_opts.include_value = args.events_value;
+      ev_opts.include_trial_type_levels = args.events_levels;
 
       write_bids_events_tsv(events_tsv.u8string(), rec.events, ev_opts, rec.fs_hz);
-      write_bids_events_json(events_json.u8string(), ev_opts);
+      write_bids_events_json(events_json.u8string(), ev_opts, rec.events);
+    }
+
+    // Optional: electrodes.tsv + coordsystem.json (digitized positions).
+    if (!args.electrodes_in.empty()) {
+      if (trim(args.eeg_coord_system).empty()) {
+        throw std::runtime_error("--eeg-coord-system is required when --electrodes is provided");
+      }
+      if (trim(args.eeg_coord_units).empty()) {
+        throw std::runtime_error("--eeg-coord-units is required when --electrodes is provided");
+      }
+
+      BidsCoordsystemJsonEegMetadata cs;
+      cs.eeg_coordinate_system = trim(args.eeg_coord_system);
+      cs.eeg_coordinate_units = trim(args.eeg_coord_units);
+      cs.eeg_coordinate_system_description = trim(args.eeg_coord_desc);
+      write_bids_coordsystem_json(coordsystem_json.u8string(), cs);
+
+      const auto electrodes = load_bids_electrodes_table(args.electrodes_in);
+      write_bids_electrodes_tsv(electrodes_tsv.u8string(), electrodes);
     }
 
     std::cout << "Wrote BIDS EEG export to: " << eeg_dir.u8string() << "\n";
@@ -365,6 +465,10 @@ int main(int argc, char** argv) {
     std::cout << "  Channels: " << channels_tsv.u8string() << "\n";
     if (!args.no_events && !rec.events.empty()) {
       std::cout << "  Events: " << events_tsv.u8string() << "\n";
+    }
+    if (!args.electrodes_in.empty()) {
+      std::cout << "  Electrodes: " << electrodes_tsv.u8string() << "\n";
+      std::cout << "  Coordsystem: " << coordsystem_json.u8string() << "\n";
     }
 
     return 0;

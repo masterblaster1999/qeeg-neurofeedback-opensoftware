@@ -37,6 +37,11 @@ struct OnlineArtifactOptions {
 
   // Frame is "bad" if at least this many channels are flagged.
   size_t min_bad_channels{1};
+
+  // Optional: channels to ignore when computing bad_channel_count/bad.
+  // Useful if you include non-EEG channels (e.g., EOG/EMG/ECG) with very different
+  // amplitude distributions.
+  std::vector<std::string> ignore_channels{};
 };
 
 struct OnlineArtifactFrame {
@@ -93,6 +98,10 @@ private:
   std::vector<std::string> channel_names_;
   double fs_hz_{0.0};
   OnlineArtifactOptions opt_;
+
+  // Ignore mask for channels (built from opt_.ignore_channels).
+  std::vector<char> ignore_mask_;
+  size_t included_channel_count_{0};
 
   size_t window_samples_{0};
   size_t update_samples_{0};

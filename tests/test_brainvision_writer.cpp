@@ -112,6 +112,7 @@ int main() {
       }
       assert(got.events.size() == 1);
       assert(got.events[0].text == "Stim1");
+      assert(std::abs(got.events[0].duration_sec - 0.0) < 1e-12);
       assert(std::abs(got.events[0].onset_sec - 0.5) < (1.0 / rec.fs_hz));
     }
   }
@@ -171,8 +172,66 @@ int main() {
       }
       assert(got.events.size() == 1);
       assert(got.events[0].text == "Stim1");
+      assert(std::abs(got.events[0].duration_sec - 0.0) < 1e-12);
       assert(std::abs(got.events[0].onset_sec - 0.5) < (1.0 / rec.fs_hz));
     }
+  }
+
+  // --- writer escapes commas as \1 (BrainVision convention) ---
+  {
+    EEGRecording rec2 = rec;
+    rec2.events.clear();
+    rec2.events.push_back(AnnotationEvent{0.1, 0.0, "hello,world"});
+
+    const std::filesystem::path vhdr = outdir / "escaped_comma.vhdr";
+    BrainVisionWriterOptions opts;
+    opts.binary_format = BrainVisionBinaryFormat::Float32;
+    opts.unit = "uV";
+
+    BrainVisionWriter w;
+    w.write(rec2, vhdr.string(), opts);
+
+    const std::filesystem::path vmrk = outdir / "escaped_comma.vmrk";
+    assert(std::filesystem::exists(vmrk));
+
+    const std::string vmrk_txt = slurp_text(vmrk);
+    // In .vmrk, commas in fields are typically encoded as "\\1".
+    assert(vmrk_txt.find("hello\\1world") != std::string::npos);
+
+    BrainVisionReader r;
+    EEGRecording got = r.read(vhdr.string());
+    assert(got.events.size() == 1);
+    assert(got.events[0].text == "hello,world");
+    assert(std::abs(got.events[0].duration_sec - 0.0) < 1e-12);
+  }
+
+  // --- reader robustness: comma inside marker description ---
+  {
+    const std::filesystem::path vhdr = outdir / "comma_desc.vhdr";
+    BrainVisionWriterOptions opts;
+    opts.binary_format = BrainVisionBinaryFormat::Float32;
+    opts.unit = "uV";
+
+    BrainVisionWriter w;
+    w.write(rec, vhdr.string(), opts);
+
+    const std::filesystem::path vmrk = outdir / "comma_desc.vmrk";
+    assert(std::filesystem::exists(vmrk));
+
+    // Append a marker whose description contains a comma.
+    // Some third-party tools write such markers; robust parsers should handle them.
+    {
+      std::ofstream os(vmrk, std::ios::app);
+      assert(os && "failed to open vmrk for append");
+      os << "Mk3=Comment,hello,world,10,1,0\n";
+    }
+
+    BrainVisionReader r;
+    EEGRecording got = r.read(vhdr.string());
+    assert(got.events.size() == 2);
+    // Events should be sorted by onset, so the early marker comes first.
+    assert(got.events[0].text == "hello,world");
+    assert(got.events[1].text == "Stim1");
   }
 
   // Cleanup (best-effort)

@@ -1,6 +1,8 @@
 #include "qeeg/brainvision_writer.hpp"
 #include "qeeg/channel_map.hpp"
 #include "qeeg/csv_io.hpp"
+#include "qeeg/event_ops.hpp"
+#include "qeeg/nf_session.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
 
@@ -18,6 +20,8 @@ struct Args {
   std::string output_vhdr;
   std::string channel_map_path;
   std::string events_out_csv;
+  std::vector<std::string> extra_events;
+  std::string nf_outdir;
   double fs_csv{0.0};
 
   BrainVisionBinaryFormat binary_format{BrainVisionBinaryFormat::Float32};
@@ -38,6 +42,8 @@ static void print_help() {
       << "Options:\n"
       << "  --channel-map <map.csv>         Remap/drop channels before writing.\n"
       << "  --fs <Hz>                       Sampling rate hint for CSV/ASCII (0 = infer from time column).\n"
+      << "  --extra-events <file.{csv|tsv}> Merge additional events before writing (repeatable).\n"
+      << "  --nf-outdir <dir>               Convenience: merge nf_cli derived events from <dir>/nf_derived_events.tsv/.csv\n"
       << "  --events-out <events.csv>       Write events/annotations to CSV (sidecar).\n"
       << "  --float32                       Write IEEE_FLOAT_32 samples (default).\n"
       << "  --int16                         Write INT_16 samples with per-channel resolution.\n"
@@ -84,6 +90,10 @@ int main(int argc, char** argv) {
         args.output_vhdr = require_value(i, argc, argv, a);
       } else if (a == "--channel-map") {
         args.channel_map_path = require_value(i, argc, argv, a);
+      } else if (a == "--extra-events") {
+        args.extra_events.push_back(require_value(i, argc, argv, a));
+      } else if (a == "--nf-outdir") {
+        args.nf_outdir = require_value(i, argc, argv, a);
       } else if (a == "--events-out") {
         args.events_out_csv = require_value(i, argc, argv, a);
       } else if (a == "--fs") {
@@ -113,6 +123,27 @@ int main(int argc, char** argv) {
       ChannelMap m = load_channel_map_file(args.channel_map_path);
       apply_channel_map(&rec, m);
     }
+
+    // Merge additional events (e.g., NF-derived segments) into the recording.
+    // Supports qeeg events CSV as well as BIDS-style events.tsv.
+    std::vector<std::string> extra_paths = args.extra_events;
+    if (!args.nf_outdir.empty()) {
+      const auto p = find_nf_derived_events_table(args.nf_outdir);
+      if (p) {
+        extra_paths.push_back(*p);
+      } else {
+        std::cerr << "Warning: --nf-outdir provided, but nf_derived_events.tsv/.csv was not found in: "
+                  << args.nf_outdir << "\n"
+                  << "         Did you run qeeg_nf_cli with --export-derived-events or --biotrace-ui?\n";
+      }
+    }
+
+    std::vector<AnnotationEvent> extra_all;
+    for (const auto& p : extra_paths) {
+      const auto extra = read_events_table(p);
+      extra_all.insert(extra_all.end(), extra.begin(), extra.end());
+    }
+    merge_events(&rec.events, extra_all);
 
     if (!args.events_out_csv.empty()) {
       write_events_csv(args.events_out_csv, rec);

@@ -1,3 +1,6 @@
+#include "qeeg/csv_io.hpp"
+#include "qeeg/event_ops.hpp"
+#include "qeeg/nf_session.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/robust_stats.hpp"
@@ -55,6 +58,22 @@ struct Args {
   bool draw_event_labels{true};
   int max_event_labels{40};
 
+  // Optional extra events file(s) to overlay (CSV or TSV). This is useful for
+  // plotting nf_cli-derived events (reward/artifacts) or BIDS events.tsv.
+  std::vector<std::string> extra_events;
+
+  // Convenience: point to an nf_cli output directory (created by --outdir).
+  // If <dir>/nf_derived_events.tsv/.csv exists, it is auto-merged for drawing.
+  std::string nf_outdir;
+
+  // Segments (duration annotations) - BioTrace+ style
+  bool draw_segments{true};
+  bool draw_segment_labels{true};
+  bool min_segment_sec_user_set{false};
+  double min_segment_sec{0.5};
+  int segment_band_px{14};
+  int max_segment_labels{30};
+
   // Preprocess
   bool average_reference{false};
   double notch_hz{0.0};
@@ -87,6 +106,14 @@ static void print_help() {
     << "  --no-events             Do not draw EDF+/BDF+ events/annotations\n"
     << "  --no-event-labels       Draw event lines but omit text labels\n"
     << "  --max-event-labels N    Limit number of event labels (default: 40)\n"
+    << "  --events FILE           Load additional events from a CSV/TSV and overlay them\n"
+    << "                         (repeatable; supports qeeg events CSV or BIDS events.tsv)\n"
+    << "  --nf-outdir DIR         Convenience: overlay nf_cli derived events from DIR/nf_derived_events.tsv/.csv\n"
+    << "  --no-segments           Do not draw duration annotations as segment bars\n"
+    << "  --min-segment-sec SEC   Minimum duration (s) to treat annotation as a segment (default: 0.5)\n"
+    << "  --segment-band-px PX    Height of segment band in px (default: 14)\n"
+    << "  --no-segment-labels     Draw segment bars but omit text labels\n"
+    << "  --max-segment-labels N  Limit number of segment labels (default: 30)\n"
     << "  --average-reference     Apply common average reference across channels\n"
     << "  --notch HZ              Apply a notch filter at HZ (e.g., 50 or 60)\n"
     << "  --notch-q Q             Notch Q factor (default: 30)\n"
@@ -132,8 +159,23 @@ static Args parse_args(int argc, char** argv) {
       a.draw_events = false;
     } else if (arg == "--no-event-labels") {
       a.draw_event_labels = false;
+    } else if (arg == "--events" && i + 1 < argc) {
+      a.extra_events.push_back(argv[++i]);
+    } else if (arg == "--nf-outdir" && i + 1 < argc) {
+      a.nf_outdir = argv[++i];
     } else if (arg == "--max-event-labels" && i + 1 < argc) {
       a.max_event_labels = to_int(argv[++i]);
+    } else if (arg == "--no-segments") {
+      a.draw_segments = false;
+    } else if (arg == "--min-segment-sec" && i + 1 < argc) {
+      a.min_segment_sec = to_double(argv[++i]);
+      a.min_segment_sec_user_set = true;
+    } else if (arg == "--segment-band-px" && i + 1 < argc) {
+      a.segment_band_px = to_int(argv[++i]);
+    } else if (arg == "--no-segment-labels") {
+      a.draw_segment_labels = false;
+    } else if (arg == "--max-segment-labels" && i + 1 < argc) {
+      a.max_segment_labels = to_int(argv[++i]);
     } else if (arg == "--average-reference") {
       a.average_reference = true;
     } else if (arg == "--notch" && i + 1 < argc) {
@@ -206,11 +248,45 @@ int main(int argc, char** argv) {
     if (args.default_n_channels < 1) args.default_n_channels = 1;
     if (args.max_points < 200) args.max_points = 200;
 
+    if (args.min_segment_sec < 0.0) args.min_segment_sec = 0.0;
+    if (args.segment_band_px < 0) args.segment_band_px = 0;
+    if (args.max_segment_labels < 0) args.max_segment_labels = 0;
+
     ensure_directory(args.outdir);
 
     EEGRecording rec = read_recording_auto(args.input_path, args.fs_csv);
     if (rec.fs_hz <= 0.0) throw std::runtime_error("Invalid sampling rate");
     if (rec.n_channels() == 0 || rec.n_samples() < 8) throw std::runtime_error("Recording too small");
+
+    // Optional extra events overlay (CSV or TSV). These are merged into any
+    // events parsed from the source file (EDF+/BDF+ annotations or CSV marker columns).
+    std::vector<std::string> extra_paths = args.extra_events;
+    if (!args.nf_outdir.empty()) {
+      const auto p = find_nf_derived_events_table(args.nf_outdir);
+      if (p) {
+        extra_paths.push_back(*p);
+      } else {
+        std::cerr << "Warning: --nf-outdir provided, but nf_derived_events.tsv/.csv was not found in: "
+                  << args.nf_outdir << "\n"
+                  << "         Did you run qeeg_nf_cli with --export-derived-events or --biotrace-ui?\n";
+      }
+    }
+
+
+    // When overlaying an external events table (qeeg events CSV / BIDS events.tsv),
+    // treat *any* duration > 0 as a segment by default. This is especially useful
+    // for nf_cli derived segments (e.g., short reward bursts at the update rate).
+    if (!extra_paths.empty() && !args.min_segment_sec_user_set) {
+      args.min_segment_sec = 0.0;
+    }
+
+    std::vector<AnnotationEvent> extra_all;
+    for (const auto& p : extra_paths) {
+      const auto extra = read_events_table(p);
+      extra_all.insert(extra_all.end(), extra.begin(), extra.end());
+    }
+    // Also normalizes + de-duplicates source events for deterministic rendering.
+    merge_events(&rec.events, extra_all);
 
     PreprocessOptions popt;
     popt.average_reference = args.average_reference;
@@ -260,6 +336,10 @@ int main(int argc, char** argv) {
     const int plot_height = n_ch * args.row_height_px;
     const int height_px = args.margin_top_px + plot_height + args.margin_bottom_px;
 
+    const int seg_band_px = (args.draw_segments ? std::max(0, args.segment_band_px) : 0);
+    const int seg_y0 = args.margin_top_px + plot_height + 4;
+    const int tick_label_y = args.margin_top_px + plot_height + seg_band_px + 20;
+
     const double duration = end_sec - start_sec;
     const auto colors = palette();
 
@@ -280,6 +360,13 @@ int main(int argc, char** argv) {
 
     f << "<rect x=\"0\" y=\"0\" width=\"" << args.width_px << "\" height=\"" << height_px
       << "\" fill=\"white\"/>\n";
+
+    // Definitions (pattern fill for artifact segments)
+    f << "<defs>\n";
+    f << "  <pattern id=\"artifactHatch\" patternUnits=\"userSpaceOnUse\" width=\"6\" height=\"6\" patternTransform=\"rotate(45)\">\n";
+    f << "    <line x1=\"0\" y1=\"0\" x2=\"0\" y2=\"6\" stroke=\"#cc0000\" stroke-width=\"2\" opacity=\"0.45\"/>\n";
+    f << "  </pattern>\n";
+    f << "</defs>\n";
 
     // Grid + time axis ticks
     const double tick = choose_time_tick(duration);
@@ -302,12 +389,78 @@ int main(int argc, char** argv) {
     }
     f << "</g>\n";
 
+    // Segment band (duration annotations) - BioTrace+ style
+    if (args.draw_segments && seg_band_px > 0 && !rec.events.empty()) {
+      auto is_artifact = [&](const std::string& s) {
+        const std::string t = to_lower(s);
+        return (t.find("artifact") != std::string::npos) || (t.find("artefact") != std::string::npos);
+      };
+      const std::vector<std::string> seg_colors = {
+        "#93c5fd", "#a7f3d0", "#fcd34d", "#fca5a5", "#d8b4fe",
+        "#fdba74", "#c4b5fd", "#f9a8d4", "#86efac", "#fde68a"
+      };
+      auto pick_color = [&](const std::string& lbl) {
+        const size_t h = std::hash<std::string>{}(lbl);
+        return seg_colors[h % seg_colors.size()];
+      };
+
+      f << "<g>\n";
+      // Band outline
+      f << "<rect x=\"" << args.margin_left_px << "\" y=\"" << seg_y0
+        << "\" width=\"" << plot_width << "\" height=\"" << seg_band_px
+        << "\" fill=\"none\" stroke=\"#e0e0e0\" stroke-width=\"1\"/>\n";
+
+      int nlab = 0;
+      for (const auto& ev : rec.events) {
+        if (!(ev.duration_sec > 0.0) || !std::isfinite(ev.duration_sec)) continue;
+        if (ev.duration_sec < args.min_segment_sec) continue;
+        const double s0 = ev.onset_sec;
+        const double s1 = ev.onset_sec + ev.duration_sec;
+        if (s1 < start_sec - 1e-9) continue;
+        if (s0 > end_sec + 1e-9) continue;
+
+        const double a0 = std::max(start_sec, s0);
+        const double a1 = std::min(end_sec, s1);
+        const double xA = to_x(a0);
+        const double xB = to_x(a1);
+        const double wseg = std::max(0.0, xB - xA);
+        if (wseg < 0.5) continue;
+
+        const bool art = is_artifact(ev.text);
+        const std::string color = pick_color(ev.text);
+
+        if (art) {
+          f << "<rect x=\"" << xA << "\" y=\"" << seg_y0
+            << "\" width=\"" << wseg << "\" height=\"" << seg_band_px
+            << "\" fill=\"#ffcccc\" opacity=\"0.25\"/>\n";
+          f << "<rect x=\"" << xA << "\" y=\"" << seg_y0
+            << "\" width=\"" << wseg << "\" height=\"" << seg_band_px
+            << "\" fill=\"url(#artifactHatch)\" opacity=\"0.85\"/>\n";
+        } else {
+          f << "<rect x=\"" << xA << "\" y=\"" << seg_y0
+            << "\" width=\"" << wseg << "\" height=\"" << seg_band_px
+            << "\" fill=\"" << color << "\" opacity=\"0.45\" stroke=\"#999\" stroke-width=\"0.5\"/>\n";
+        }
+
+        if (args.draw_segment_labels && nlab < args.max_segment_labels && wseg >= 50.0) {
+          std::string txt = ev.text;
+          if (txt.size() > 28) txt = txt.substr(0, 28) + "…";
+          const double xc = xA + 0.5 * wseg;
+          f << "<text x=\"" << xc << "\" y=\"" << (seg_y0 + seg_band_px - 3)
+            << "\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"10\" fill=\"#222\">"
+            << svg_escape(txt) << "</text>\n";
+          ++nlab;
+        }
+      }
+      f << "</g>\n";
+    }
+
     // Axis labels (time)
     f << "<g font-family=\"sans-serif\" font-size=\"12\" fill=\"#333\">\n";
     for (double t = t0; t <= end_sec + 1e-9; t += tick) {
       if (t < start_sec - 1e-9) continue;
       const double x = to_x(t);
-      f << "<text x=\"" << x << "\" y=\"" << (args.margin_top_px + plot_height + 20)
+      f << "<text x=\"" << x << "\" y=\"" << tick_label_y
         << "\" text-anchor=\"middle\">";
       f << std::fixed << std::setprecision(1) << t;
       f << "</text>\n";
@@ -320,6 +473,7 @@ int main(int argc, char** argv) {
     if (args.draw_events && !rec.events.empty()) {
       f << "<g stroke=\"#cc0000\" stroke-width=\"1\" opacity=\"0.65\">\n";
       for (const auto& ev : rec.events) {
+        if (args.draw_segments && ev.duration_sec >= args.min_segment_sec) continue;
         if (ev.onset_sec < start_sec - 1e-9) continue;
         if (ev.onset_sec > end_sec + 1e-9) continue;
         const double x = to_x(ev.onset_sec);
@@ -332,6 +486,7 @@ int main(int argc, char** argv) {
         f << "<g font-family=\"sans-serif\" font-size=\"11\" fill=\"#cc0000\">\n";
         int nlab = 0;
         for (const auto& ev : rec.events) {
+          if (args.draw_segments && ev.duration_sec >= args.min_segment_sec) continue;
           if (ev.onset_sec < start_sec - 1e-9) continue;
           if (ev.onset_sec > end_sec + 1e-9) continue;
           if (nlab >= args.max_event_labels) break;

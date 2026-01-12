@@ -1,6 +1,8 @@
 #include "qeeg/artifacts.hpp"
 #include "qeeg/channel_map.hpp"
 #include "qeeg/csv_io.hpp"
+#include "qeeg/event_ops.hpp"
+#include "qeeg/nf_session.hpp"
 #include "qeeg/edf_writer.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
@@ -29,6 +31,11 @@ struct Args {
 
   // Optional channel mapping.
   std::string channel_map_path;
+
+  // Optional extra events tables (qeeg events CSV or BIDS events TSV).
+  // These are merged into the recording before exporting segments.
+  std::vector<std::string> extra_events;
+  std::string nf_outdir;
 
   // Artifact detection.
   double window_sec{1.0};
@@ -71,7 +78,7 @@ static void print_help() {
       << "  bad_segments.csv   (time ranges flagged as bad)\n"
       << "  good_segments.csv  (time ranges considered good)\n"
       << "  clean_summary.txt  (quick summary)\n"
-      << "  (optional) segment_<k>.csv / segment_<k>.edf and segment_<k>_events.csv\n\n"
+      << "  (optional) segment_<k>.csv / segment_<k>.edf and segment_<k>_events.csv / segment_<k>_events.tsv\n\n"
       << "Usage:\n"
       << "  qeeg_clean_cli --input file.edf --outdir out_clean --pad 0.25 --min-good 2 --export-csv\n"
       << "  qeeg_clean_cli --input file.csv --fs 250 --outdir out_clean --window 1 --step 0.5 --export-edf\n\n"
@@ -80,6 +87,9 @@ static void print_help() {
       << "  --fs HZ                 Sampling rate hint for CSV inputs\n"
       << "  --outdir DIR            Output directory (default: out_clean)\n"
       << "  --channel-map PATH      Rename/drop channels before analysis (new=DROP to drop)\n"
+      << "\nEvents (optional overlays):\n"
+      << "  --extra-events PATH     Merge extra events table (qeeg CSV or BIDS TSV) before segment export (repeatable)\n"
+      << "  --nf-outdir DIR         Convenience: merge nf_cli derived events from DIR/nf_derived_events.tsv/.csv\n"
       << "\nArtifact detection:\n"
       << "  --window SEC            Sliding window length (default: 1.0)\n"
       << "  --step SEC              Step between window starts (default: 0.5)\n"
@@ -123,6 +133,10 @@ static Args parse_args(int argc, char** argv) {
       a.fs_csv = to_double(argv[++i]);
     } else if (arg == "--channel-map" && i + 1 < argc) {
       a.channel_map_path = argv[++i];
+    } else if (arg == "--extra-events" && i + 1 < argc) {
+      a.extra_events.push_back(argv[++i]);
+    } else if (arg == "--nf-outdir" && i + 1 < argc) {
+      a.nf_outdir = argv[++i];
     } else if (arg == "--window" && i + 1 < argc) {
       a.window_sec = to_double(argv[++i]);
     } else if (arg == "--step" && i + 1 < argc) {
@@ -239,6 +253,29 @@ int main(int argc, char** argv) {
       preprocess_recording_inplace(rec, popt);
     }
 
+    // Optional: merge extra events tables (e.g., NF-derived segments) into the recording
+    // before segment slicing/export. Supports qeeg events CSV as well as BIDS-style events.tsv.
+    {
+      std::vector<std::string> extra_paths = args.extra_events;
+      if (!args.nf_outdir.empty()) {
+        const auto p = find_nf_derived_events_table(args.nf_outdir);
+        if (p) {
+          extra_paths.push_back(*p);
+        } else {
+          std::cerr << "Warning: --nf-outdir provided, but nf_derived_events.tsv/.csv was not found in: "
+                    << args.nf_outdir << "\n"
+                    << "         Did you run qeeg_nf_cli with --export-derived-events or --biotrace-ui?\n";
+        }
+      }
+
+      std::vector<AnnotationEvent> extra_all;
+      for (const auto& p : extra_paths) {
+        const auto extra = read_events_table(p);
+        extra_all.insert(extra_all.end(), extra.begin(), extra.end());
+      }
+      merge_events(&rec.events, extra_all);
+    }
+
     ArtifactDetectionOptions aopt;
     aopt.window_seconds = args.window_sec;
     aopt.step_seconds = args.step_sec;
@@ -348,6 +385,7 @@ int main(int argc, char** argv) {
 
         if (!srec.events.empty()) {
           write_events_csv(stem + "_events.csv", srec);
+          write_events_tsv(stem + "_events.tsv", srec);
         }
 
         ++exported;

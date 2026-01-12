@@ -47,10 +47,14 @@ int main() {
   // POST removed.
   assert(s.events.size() == 3);
 
-  // Events are sorted by onset, then duration, then text.
+  // Events are sorted deterministically (onset asc, duration desc, text asc).
   assert(approx(s.events[0].onset_sec, 0.0));
   assert(approx(s.events[1].onset_sec, 0.0));
   assert(approx(s.events[2].onset_sec, 1.0));
+
+  // At the same onset, duration events should come before point events.
+  assert(s.events[0].text == "PRE");
+  assert(s.events[1].text == "P");
 
   // Identify by text.
   double pre_on = 0.0, pre_dur = 0.0;

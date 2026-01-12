@@ -24,6 +24,34 @@ void write_events_csv(const std::string& path, const std::vector<AnnotationEvent
 // Convenience overload.
 void write_events_csv(const std::string& path, const EEGRecording& rec);
 
+// Write a BIDS-style events TSV with columns: onset\tduration\ttrial_type
+//
+// Notes:
+// - Uses TAB as the delimiter.
+// - Writes 'onset' and 'duration' in seconds, with fixed 6 decimal places.
+// - Uses AnnotationEvent.text as the 'trial_type' column.
+void write_events_tsv(const std::string& path, const std::vector<AnnotationEvent>& events);
+
+// Convenience overload.
+void write_events_tsv(const std::string& path, const EEGRecording& rec);
+
+// Read an events table from a delimited text file (CSV or TSV).
+//
+// Supported formats:
+// - qeeg events CSV written by write_events_csv:
+//     onset_sec,duration_sec,text
+// - BIDS-style events TSV:
+//     onset\tduration\ttrial_type
+//
+// The parser is intentionally forgiving:
+// - Lines beginning with '#' are ignored.
+// - Extra/short rows are padded/trimmed.
+// - Column names are matched case-insensitively.
+//
+// Returns a vector of AnnotationEvent (onset_sec, duration_sec, text).
+// Invalid rows (missing/invalid onset) are skipped.
+std::vector<AnnotationEvent> read_events_table(const std::string& path);
+
 // Write a time-series CSV.
 //
 // Output format:

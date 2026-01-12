@@ -1,4 +1,5 @@
 #include "qeeg/recording_ops.hpp"
+#include "qeeg/event_ops.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -83,11 +84,7 @@ EEGRecording slice_recording_samples(const EEGRecording& rec,
     out.events.push_back(std::move(e2));
   }
 
-  std::sort(out.events.begin(), out.events.end(), [](const AnnotationEvent& a, const AnnotationEvent& b) {
-    if (a.onset_sec != b.onset_sec) return a.onset_sec < b.onset_sec;
-    if (a.duration_sec != b.duration_sec) return a.duration_sec < b.duration_sec;
-    return a.text < b.text;
-  });
+  sort_events(&out.events);
 
   return out;
 }

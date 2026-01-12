@@ -103,6 +103,17 @@ struct BidsEventsTsvOptions {
   // Write `trial_type` derived from AnnotationEvent::text.
   bool include_trial_type{true};
 
+  // If include_trial_type==true, optionally add a `Levels` map to events.json.
+  //
+  // This is most useful when the number of unique trial_type values is small
+  // (e.g., NF-derived events like "NF:Reward" / "NF:Artifact"), enabling a
+  // more self-describing exported dataset.
+  bool include_trial_type_levels{false};
+
+  // Maximum unique trial_type values to include in `Levels`.
+  // If the unique count exceeds this threshold, the Levels section is omitted.
+  size_t trial_type_levels_max{64};
+
   // Add a `sample` column derived from onset_sec * fs_hz.
   bool include_sample{false};
 
@@ -133,10 +144,73 @@ inline void write_bids_events_tsv(const std::string& path, const std::vector<Ann
 // By default describes `trial_type` only.
 void write_bids_events_json(const std::string& path, const BidsEventsTsvOptions& opts);
 
+// Write events.json and optionally include a `Levels` mapping for trial_type.
+//
+// If opts.include_trial_type_levels==true, this overload derives the set of
+// unique trial_type values from `events`, up to opts.trial_type_levels_max.
+void write_bids_events_json(const std::string& path,
+                            const BidsEventsTsvOptions& opts,
+                            const std::vector<AnnotationEvent>& events);
+
 // Backwards-compatible convenience wrapper.
 inline void write_bids_events_json(const std::string& path) {
   BidsEventsTsvOptions opts;
   write_bids_events_json(path, opts);
 }
+
+// ---- *_electrodes.tsv / *_coordsystem.json ----
+
+// Minimal representation of a BIDS EEG electrodes.tsv row.
+//
+// Notes:
+// - BIDS requires x/y/z columns in electrodes.tsv, but allows "n/a" for
+//   unknown positions.
+// - Units are specified in *_coordsystem.json.
+struct BidsElectrode {
+  std::string name;
+  std::optional<double> x;
+  std::optional<double> y;
+  std::optional<double> z;
+
+  // Optional / recommended columns.
+  std::string type;     // e.g., "cup", "ring", "clip-on"
+  std::string material; // e.g., "Ag/AgCl"
+  std::optional<double> impedance_kohm;
+};
+
+// Load a simple electrode coordinate table (CSV or TSV).
+//
+// The file must contain a header row with at least: name, x, y, z.
+// Optional columns: type, material, impedance.
+//
+// Values of "n/a" (case-insensitive) or empty fields are treated as missing.
+std::vector<BidsElectrode> load_bids_electrodes_table(const std::string& path);
+
+// Write electrodes.tsv.
+//
+// This writes required columns in the mandated order: name, x, y, z.
+// It also writes type/material/impedance columns for convenience.
+void write_bids_electrodes_tsv(const std::string& path,
+                               const std::vector<BidsElectrode>& electrodes);
+
+// Validate a coordinate unit token for BIDS.
+// Accepted (case-sensitive): "m", "mm", "cm", "n/a".
+bool is_valid_bids_coordinate_unit(const std::string& unit);
+
+// Minimal EEG coordinate system metadata for *_coordsystem.json.
+struct BidsCoordsystemJsonEegMetadata {
+  // Required when providing EEG electrode positions.
+  std::string eeg_coordinate_system; // e.g., "CapTrak", "EEGLAB", "Other"
+  std::string eeg_coordinate_units;  // "m", "mm", "cm", or "n/a"
+
+  // RECOMMENDED, but REQUIRED if eeg_coordinate_system == "Other".
+  std::string eeg_coordinate_system_description;
+};
+
+// Write a minimal *_coordsystem.json containing EEGCoordinateSystem/Units.
+//
+// If meta.eeg_coordinate_system == "Other", the description must be provided.
+void write_bids_coordsystem_json(const std::string& path,
+                                 const BidsCoordsystemJsonEegMetadata& meta);
 
 } // namespace qeeg

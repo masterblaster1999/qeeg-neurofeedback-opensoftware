@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -11,7 +12,14 @@ namespace qeeg {
 //
 // This is intentionally small and dependency-light:
 // - Supports OSC Messages and Bundles
-// - Supports argument types: int32, float32, string
+// - Supports common argument types:
+//     * int32   ('i')
+//     * int64   ('h')
+//     * float32 ('f')
+//     * float64 ('d')
+//     * string  ('s')
+//     * bool    ('T' / 'F') (no payload bytes)
+//     * blob    ('b') (u32 size + raw bytes, padded to 4)
 //
 // OSC is frequently used to bridge real-time control signals between programs
 // (e.g., Max/MSP, Pure Data, TouchOSC, Processing).
@@ -24,8 +32,16 @@ public:
   const std::string& address() const { return address_; }
 
   void add_int32(int32_t v);
+  void add_int64(int64_t v);
   void add_float32(float v);
+  void add_float64(double v);
   void add_string(const std::string& v);
+  void add_bool(bool v);
+
+  // OSC "blob" type: raw bytes with a 32-bit length prefix.
+  // The blob payload is padded to a 4-byte boundary as required by OSC.
+  void add_blob(const void* data, size_t size);
+  void add_blob(const std::vector<uint8_t>& data) { add_blob(data.data(), data.size()); }
 
   // Encode as an OSC Message byte array.
   // The returned size is always a multiple of 4 bytes (OSC alignment).
@@ -33,8 +49,8 @@ public:
 
 private:
   std::string address_;
-  std::string typetags_;         // begins with ','
-  std::vector<uint8_t> args_;    // encoded arg bytes (padded where required)
+  std::string typetags_;        // begins with ','
+  std::vector<uint8_t> args_;   // encoded arg bytes (padded where required)
 };
 
 // Minimal OSC Bundle builder.
@@ -43,9 +59,10 @@ private:
 // packet. OSC bundles also carry a 64-bit timetag.
 //
 // Notes:
-// - This only supports bundling OSC Messages (no nested bundles).
 // - The default timetag is 1, which is the conventional OSC "immediately"
 //   timetag value.
+// - add_bytes() can be used to add a pre-encoded OSC element (including
+//   nested bundles) if you already have aligned bytes.
 class OscBundle {
 public:
   explicit OscBundle(uint64_t timetag = 1);

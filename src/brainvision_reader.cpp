@@ -2,6 +2,8 @@
 
 #include "qeeg/utils.hpp"
 
+#include "qeeg/event_ops.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -51,6 +53,22 @@ static inline std::string lower_copy(std::string s) {
   return s;
 }
 
+static inline std::string bv_unescape_commas(std::string s) {
+  // BrainVision .vhdr/.vmrk convention: literal commas inside fields may be encoded as \"\\1\".
+  // Decode \"\\1\" back to ','.
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '1') {
+      out.push_back(',');
+      ++i;
+    } else {
+      out.push_back(s[i]);
+    }
+  }
+  return out;
+}
+
 static inline double parse_double_or(const std::string& s, double fallback) {
   std::string t = trim(s);
   if (t.empty()) return fallback;
@@ -68,6 +86,20 @@ static inline long long parse_ll_or(const std::string& s, long long fallback) {
     return std::stoll(t);
   } catch (...) {
     return fallback;
+  }
+}
+
+static inline bool try_parse_ll_strict(const std::string& s, long long* out) {
+  const std::string t = trim(s);
+  if (t.empty()) return false;
+  try {
+    size_t idx = 0;
+    const long long v = std::stoll(t, &idx, 10);
+    if (idx != t.size()) return false;
+    if (out) *out = v;
+    return true;
+  } catch (...) {
+    return false;
   }
 }
 
@@ -162,7 +194,7 @@ static BVHeader parse_vhdr(const fs::path& vhdr_path) {
         // Format: ChN=<Name>,<Reference>,<Resolution>,<Unit>[,...]
         std::vector<std::string> fields = split(val, ',');
         BVChannelInfo ci;
-        if (!fields.empty()) ci.name = trim(fields[0]);
+        if (!fields.empty()) ci.name = bv_unescape_commas(trim(fields[0]));
         if (fields.size() >= 3) ci.resolution = parse_double_or(fields[2], 1.0);
         if (fields.size() >= 4) ci.unit = trim(fields[3]);
         if (ci.name.empty()) ci.name = "Ch" + std::to_string(idx);
@@ -200,6 +232,107 @@ struct BVMarker {
   int channel{0};
 };
 
+static bool split_right_commas(const std::string& s, int n, std::string* left,
+                               std::vector<std::string>* tail) {
+  if (!left || !tail) return false;
+  if (n <= 0) return false;
+
+  std::string cur = s;
+  tail->clear();
+  tail->reserve(static_cast<size_t>(n));
+
+  for (int i = 0; i < n; ++i) {
+    const size_t comma = cur.rfind(',');
+    if (comma == std::string::npos) return false;
+    tail->push_back(trim(cur.substr(comma + 1)));
+    cur = cur.substr(0, comma);
+  }
+
+  std::reverse(tail->begin(), tail->end());
+  *left = trim(cur);
+  return true;
+}
+
+// Parse a BrainVision marker value:
+//   <type>, <description>, <position>, <points>, <channel number>[, <date>]
+//
+// This function is robust to commas in the description by splitting numeric fields from the right.
+static bool parse_bv_marker_value(const std::string& val, BVMarker* mk) {
+  if (!mk) return false;
+
+  mk->type.clear();
+  mk->desc.clear();
+  mk->pos = 0;
+  mk->len = 0;
+  mk->channel = 0;
+
+  const std::string v = trim(val);
+  if (v.empty()) return false;
+
+  const size_t first_comma = v.find(',');
+  mk->type = trim((first_comma == std::string::npos) ? v : v.substr(0, first_comma));
+  const std::string rest = (first_comma == std::string::npos) ? std::string() : v.substr(first_comma + 1);
+
+  auto finalize = [&]() {
+    mk->type = bv_unescape_commas(mk->type);
+    mk->desc = bv_unescape_commas(mk->desc);
+  };
+
+  if (rest.empty()) {
+    finalize();
+    return true;
+  }
+
+  // BrainVision may optionally add a date field, and it is only evaluated for "New Segment" markers.
+  // We try to detect this extra field without being confused by commas inside the description.
+  const bool is_new_segment = ieq(trim(mk->type), "New Segment");
+  bool has_date_field = false;
+  if (is_new_segment) {
+    const size_t last_comma = rest.rfind(',');
+    if (last_comma != std::string::npos) {
+      const std::string last_tok = trim(rest.substr(last_comma + 1));
+      long long as_ll = 0;
+      // Heuristic: channel numbers are typically small (0 meaning "all channels").
+      // If the last token is not a small integer, treat it as a date field.
+      if (!try_parse_ll_strict(last_tok, &as_ll) || as_ll > 10000 || as_ll < -10000) {
+        has_date_field = true;
+      }
+    }
+  }
+
+  std::string desc;
+  std::vector<std::string> tail;
+
+  auto parse_with_tail = [&](int n_tail) -> bool {
+    if (!split_right_commas(rest, n_tail, &desc, &tail)) return false;
+    if (static_cast<int>(tail.size()) != n_tail) return false;
+
+    // For n_tail == 3: tail = [position, points, channel]
+    // For n_tail == 4: tail = [position, points, channel, date]
+    mk->desc = desc;
+    mk->pos = parse_ll_or(tail[0], 0);
+    mk->len = parse_ll_or(tail[1], 0);
+    mk->channel = parse_int_or(tail[2], 0);
+    return true;
+  };
+
+  if (has_date_field) {
+    // If this fails (e.g., because the description itself created an extra comma), fall back.
+    if (parse_with_tail(4)) { finalize(); return true; }
+  }
+  if (parse_with_tail(3)) { finalize(); return true; }
+
+  // Fallback to the original naive split for malformed lines.
+  const std::vector<std::string> fields = split(v, ',');
+  if (fields.size() >= 1) mk->type = trim(fields[0]);
+  if (fields.size() >= 2) mk->desc = trim(fields[1]);
+  if (fields.size() >= 3) mk->pos = parse_ll_or(fields[2], 0);
+  if (fields.size() >= 4) mk->len = parse_ll_or(fields[3], 0);
+  if (fields.size() >= 5) mk->channel = parse_int_or(fields[4], 0);
+  finalize();
+  return true;
+}
+
 static std::vector<BVMarker> parse_vmrk(const fs::path& vmrk_path) {
   std::vector<BVMarker> out;
   std::ifstream is(vmrk_path);
@@ -234,14 +367,9 @@ static std::vector<BVMarker> parse_vmrk(const fs::path& vmrk_path) {
     if (key.size() < 2 || key[0] != 'm' || key[1] != 'k') continue;
 
     std::string val = trim(line.substr(eq + 1));
-    std::vector<std::string> fields = split(val, ',');
 
     BVMarker mk;
-    if (fields.size() >= 1) mk.type = trim(fields[0]);
-    if (fields.size() >= 2) mk.desc = trim(fields[1]);
-    if (fields.size() >= 3) mk.pos = parse_ll_or(fields[2], 0);
-    if (fields.size() >= 4) mk.len = parse_ll_or(fields[3], 0);
-    if (fields.size() >= 5) mk.channel = parse_int_or(fields[4], 0);
+    if (!parse_bv_marker_value(val, &mk)) continue;
 
     if (mk.pos > 0) {
       out.push_back(mk);
@@ -382,7 +510,10 @@ EEGRecording BrainVisionReader::read(const std::string& vhdr_path_str) {
     for (const auto& mk : markers) {
       // BrainVision marker positions are 1-based.
       const double onset_sec = (static_cast<double>(mk.pos) - 1.0) / rec.fs_hz;
-      const double duration_sec = (mk.len > 0) ? (static_cast<double>(mk.len) / rec.fs_hz) : 0.0;
+      // BrainVision stores marker length in *data points* ("points").
+      // In practice, point/impulse markers typically have a length of 1 data point.
+      // Map len<=1 to duration=0 to better preserve "instantaneous" events across formats.
+      const double duration_sec = (mk.len > 1) ? (static_cast<double>(mk.len) / rec.fs_hz) : 0.0;
 
       // "New Segment" is often a record-start marker.
       if (ieq(mk.type, "New Segment") && trim(mk.desc).empty()) {
@@ -409,10 +540,8 @@ EEGRecording BrainVisionReader::read(const std::string& vhdr_path_str) {
       rec.events.push_back(ev);
     }
 
-    std::sort(rec.events.begin(), rec.events.end(), [](const AnnotationEvent& a, const AnnotationEvent& b) {
-      if (a.onset_sec != b.onset_sec) return a.onset_sec < b.onset_sec;
-      return a.duration_sec < b.duration_sec;
-    });
+    // Deterministic ordering (segments before point markers at the same onset).
+    sort_events(&rec.events);
   }
 
   return rec;
