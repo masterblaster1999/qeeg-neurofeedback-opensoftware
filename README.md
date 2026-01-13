@@ -77,6 +77,53 @@ target_link_libraries(my_app PRIVATE qeeg::qeeg)
 
 ## Usage
 
+### QEEG Tools UI (dashboard)
+
+If you want a single "home page" that lists all of the project's executables and links to any
+discovered outputs, you can generate a self-contained HTML dashboard:
+
+```bash
+# From your build directory (where the executables live):
+./build/qeeg_ui_cli --root . --bin-dir ./build --open
+
+# Or point it at a parent folder that contains multiple tool outdirs (out_map/out_nf/...):
+./build/qeeg_ui_cli --root /path/to/runs --bin-dir ./build --output /path/to/runs/qeeg_ui.html
+```
+
+The dashboard can (optionally) embed each tool's `--help` output and will surface run artifacts via
+the `*_run_meta.json` manifests emitted by some tools.
+
+If you provide `--bin-dir`, the dashboard will also **auto-discover any additional**
+`qeeg_*_cli` executables present in that folder and include them in the UI (so new tools show up
+without manually updating a list). You can disable this with `--no-bin-scan`.
+
+#### Optional: run tools from the browser (local-only)
+
+Browsers can't directly execute local binaries for security reasons, so the "Run" buttons in the
+dashboard are enabled only when you serve the UI with the local server:
+
+```bash
+./build/qeeg_ui_server_cli --root /path/to/runs --bin-dir ./build --port 8765 --open
+```
+
+This serves the dashboard at `http://127.0.0.1:8765/` and exposes a tiny local-only API that lets the
+UI launch `qeeg_*_cli` executables and write per-run logs under `.../ui_runs/`.
+
+The server prints a random API token on startup. The dashboard fetches it automatically, but if you
+call the API yourself (e.g. with `curl`), you must include it in the `X-QEEG-Token` header.
+
+Convenience: any arguments you type into the UI can use `{{RUN_DIR}}` (relative) or `{{RUN_DIR_ABS}}`
+(absolute) placeholders, which expand to the per-job run folder created by the server. This makes it
+easy to route `--outdir` under the run folder.
+
+The dashboard also includes a small **Workspace browser** (when served via `qeeg_ui_server_cli`) so you can
+browse files under `--root` and quickly select an input path for tool runs. Use the "Use selected file" button
+on any tool card to inject it as `--input`.
+
+For convenience, the "Run" panel defaults rewrite common output flags (like `--outdir`, `--output`, and `--events-out`)
+to land under `{{RUN_DIR}}` so each UI-launched run stays self-contained. You can also save/load/delete per-tool
+argument presets in your browser (stored in `localStorage`).
+
 ### 0) Inspect a recording (quick summary)
 
 ```bash
@@ -435,6 +482,24 @@ This CLI simulates a real-time neurofeedback loop by:
 - optionally rewarding when the metric is **above** or **below** the threshold (`--reward-direction`)
 - optionally adapting the threshold to maintain a target reward rate
 
+
+Adaptive threshold modes:
+- `--adapt-mode exp` (default): multiplicative update driven by reward-rate error.
+- `--adapt-mode quantile`: tracks a running empirical quantile of recent metric values so the reward fraction approaches `--target-rate`.
+
+Useful controls:
+- `--adapt-window S` (quantile mode): rolling window length in seconds (0 => full history).
+- `--adapt-min-samples N` (quantile mode): minimum metric samples before adapting.
+- `--adapt-interval S`: only update threshold every S seconds (0 => every update frame).
+
+Example (quantile mode):
+
+```bash
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf_q --metric alpha:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+  --adapt-mode quantile --adapt-window 30 --adapt-min-samples 20
+```
+
 Supported metrics:
 - bandpower: `alpha:Pz`
 - ratio: `alpha/beta:Pz`
@@ -445,6 +510,26 @@ Supported metrics:
 ```bash
 ./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
   --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6
+```
+
+Optional: pace **offline** playback so updates arrive in real time (useful when driving an
+external UI via OSC, or when watching the built-in BioTrace-style UI):
+
+```bash
+# Real-time pacing (1x)
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 --realtime
+
+# Faster-than-real-time pacing (e.g., 2x)
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 --speed 2.0
+```
+
+Optional: smooth the metric with an **exponential moving average** before thresholding/feedback:
+
+```bash
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 --metric-smooth 0.5
 ```
 
 Optional: scale bandpower values (bandpower/ratio metrics only)
@@ -542,10 +627,13 @@ PAC neurofeedback examples:
 
 Outputs:
 - `nf_feedback.csv` — time series of metric, threshold and reward
+- `nf_summary.json` — small summary of the run (thresholds, reward stats, wall time)
 - (optional) `bandpower_timeseries.csv` — all bands/channels per update (bandpower mode)
 - (optional) `coherence_timeseries.csv` or `imcoh_timeseries.csv` — all bands for the chosen pair per update (coherence/imcoh mode)
 - (optional) `artifact_gate_timeseries.csv` — artifact gate aligned to NF updates (when `--export-artifacts`)
 - (optional) `nf_reward.wav` — a simple reward-tone audio track (mono PCM16). Use `--audio-wav nf_reward.wav`.
+
+Note: when `--metric-smooth` is enabled, `nf_feedback.csv` appends a `metric_raw` column for debugging. When `--adapt-mode quantile` is used, it also appends a `threshold_desired` column (the running quantile target used for threshold tracking).
 
 ### 7) Connectivity: coherence matrix / pair report
 

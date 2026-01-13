@@ -1,11 +1,14 @@
 #include "qeeg/bandpower.hpp"
 
+#include "qeeg/iaf.hpp"
 #include "qeeg/utils.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <system_error>
 
 namespace {
 
@@ -161,6 +164,94 @@ void maybe_parse_reference_meta_line(const std::string& trimmed_comment_line,
   }
 }
 
+
+static bool is_directory_path(const std::string& path) {
+  std::error_code ec;
+  return std::filesystem::is_directory(std::filesystem::u8path(path), ec);
+}
+
+static bool parse_double_strict(const std::string& s_in, double* out) {
+  if (!out) return false;
+  const std::string s = qeeg::trim(s_in);
+  if (s.empty()) return false;
+  try {
+    size_t pos = 0;
+    const double v = std::stod(s, &pos);
+    if (pos != s.size()) return false;
+    if (!std::isfinite(v)) return false;
+    *out = v;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+static std::string read_first_non_comment_line(const std::string& path) {
+  std::ifstream f(path);
+  if (!f) return std::string();
+
+  std::string line;
+  bool bom_stripped = false;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::string t = qeeg::trim(line);
+    if (!bom_stripped) {
+      t = qeeg::strip_utf8_bom(t);
+      bom_stripped = true;
+    }
+    if (is_comment_or_empty(t)) continue;
+    return t;
+  }
+  return std::string();
+}
+
+static bool try_load_aggregate_iaf_hz_from_summary(const std::string& path, double* out_iaf_hz) {
+  if (!out_iaf_hz) return false;
+  std::ifstream f(path);
+  if (!f) return false;
+
+  std::string line;
+  bool bom_stripped = false;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::string t = qeeg::trim(line);
+    if (!bom_stripped) {
+      t = qeeg::strip_utf8_bom(t);
+      bom_stripped = true;
+    }
+    if (t.empty()) continue;
+
+    const size_t eq = t.find('=');
+    if (eq == std::string::npos) continue;
+
+    const std::string key = qeeg::to_lower(qeeg::trim(t.substr(0, eq)));
+    const std::string val = qeeg::trim(t.substr(eq + 1));
+
+    if (key == "aggregate_iaf_hz") {
+      double v = 0.0;
+      if (parse_double_strict(val, &v)) {
+        *out_iaf_hz = v;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static std::vector<qeeg::BandDefinition> make_iaf_bands(double iaf_hz) {
+  std::vector<qeeg::BandDefinition> out;
+  const std::vector<qeeg::BandDefinition> bands = qeeg::individualized_bands_from_iaf(iaf_hz);
+
+  out.reserve(bands.size());
+  for (const auto& b : bands) {
+    if (b.name.empty()) continue;
+    if (!std::isfinite(b.fmin_hz) || !std::isfinite(b.fmax_hz)) continue;
+    if (!(b.fmin_hz >= 0.0 && b.fmax_hz > b.fmin_hz)) continue;
+    out.push_back(b);
+  }
+  return out;
+}
+
 } // namespace
 
 namespace qeeg {
@@ -199,6 +290,89 @@ static BandDefinition parse_one_band(const std::string& token) {
 std::vector<BandDefinition> parse_band_spec(const std::string& spec) {
   std::string s = trim(spec);
   if (s.empty()) return default_eeg_bands();
+  // Convenience: IAF-relative band specs (based on qeeg_iaf_cli outputs).
+  //
+  // Supported:
+  //   --bands iaf=10.2          (explicit IAF Hz)
+  //   --bands iaf:out_iaf       (reads out_iaf/iaf_band_spec.txt or out_iaf/iaf_summary.txt)
+  //   --bands iaf:out_iaf/iaf_summary.txt
+  //   --bands iaf:out_iaf/iaf_band_spec.txt
+  //
+  const std::string s_low = to_lower(s);
+  if (starts_with(s_low, "iaf=")) {
+    const std::string v_s = trim(s.substr(4));
+    double iaf_hz = 0.0;
+    if (!parse_double_strict(v_s, &iaf_hz)) {
+      throw std::runtime_error("Invalid IAF value for band spec (expected iaf=NUM): " + s);
+    }
+    const auto bands = make_iaf_bands(iaf_hz);
+    if (bands.empty()) {
+      throw std::runtime_error("IAF band spec produced no valid bands (iaf_hz=" + v_s + ")");
+    }
+    return bands;
+  }
+
+  if (starts_with(s_low, "iaf:")) {
+    const std::string path = trim(s.substr(4));
+    if (path.empty()) {
+      throw std::runtime_error("Invalid IAF band spec: 'iaf:' must be followed by a path (outdir or file)");
+    }
+
+    // If the path is a directory, look for qeeg_iaf_cli outputs inside it.
+    if (is_directory_path(path)) {
+      const std::string spec_path = path + "/iaf_band_spec.txt";
+      if (qeeg::file_exists(spec_path)) {
+        return parse_band_spec("@" + spec_path);
+      }
+
+      const std::string summary_path = path + "/iaf_summary.txt";
+      double iaf_hz = 0.0;
+      if (qeeg::file_exists(summary_path) && try_load_aggregate_iaf_hz_from_summary(summary_path, &iaf_hz)) {
+        const auto bands = make_iaf_bands(iaf_hz);
+        if (bands.empty()) {
+          throw std::runtime_error("IAF summary did not yield valid bands (aggregate_iaf_hz=" + std::to_string(iaf_hz) + ")");
+        }
+        return bands;
+      }
+
+      throw std::runtime_error("IAF directory does not contain iaf_band_spec.txt or a readable iaf_summary.txt: " + path);
+    }
+
+    // If it's a file, accept either an iaf_summary.txt, an iaf_band_spec.txt, a
+    // single numeric IAF value, or a band spec text file.
+    if (qeeg::file_exists(path)) {
+      const std::string plow = to_lower(path);
+      if (ends_with(plow, "iaf_band_spec.txt")) {
+        return parse_band_spec("@" + path);
+      }
+      if (ends_with(plow, "iaf_summary.txt")) {
+        double iaf_hz = 0.0;
+        if (!try_load_aggregate_iaf_hz_from_summary(path, &iaf_hz)) {
+          throw std::runtime_error("Failed to parse aggregate_iaf_hz from: " + path);
+        }
+        const auto bands = make_iaf_bands(iaf_hz);
+        if (bands.empty()) {
+          throw std::runtime_error("IAF summary did not yield valid bands (aggregate_iaf_hz=" + std::to_string(iaf_hz) + ")");
+        }
+        return bands;
+      }
+
+      const std::string first = read_first_non_comment_line(path);
+      double iaf_hz = 0.0;
+      if (!first.empty() && parse_double_strict(first, &iaf_hz)) {
+        const auto bands = make_iaf_bands(iaf_hz);
+        if (bands.empty()) {
+          throw std::runtime_error("IAF file did not yield valid bands (iaf_hz=" + std::to_string(iaf_hz) + ")");
+        }
+        return bands;
+      }
+
+      // Fall back: treat it as a band spec file.
+      return parse_band_spec("@" + path);
+    }
+
+    throw std::runtime_error("IAF band spec path does not exist: " + path);
+  }
 
   // Convenience: allow a band spec to be loaded from a text file by prefixing
   // the argument with '@', e.g.:

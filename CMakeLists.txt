@@ -14,6 +14,8 @@ include(GNUInstallDirs)
 
 add_library(qeeg STATIC
   src/utils.cpp
+  src/run_meta.cpp
+  src/ui_dashboard.cpp
   src/csv_io.cpp
   src/line_noise.cpp
   src/resample.cpp
@@ -53,6 +55,7 @@ add_library(qeeg STATIC
   src/montage.cpp
   src/topomap.cpp
   src/channel_qc.cpp
+  src/channel_qc_io.cpp
   src/interpolate.cpp
   src/bmp_writer.cpp
   src/wav_writer.cpp
@@ -134,6 +137,16 @@ target_link_libraries(qeeg_export_brainvision_cli PRIVATE qeeg)
 add_executable(qeeg_export_bids_cli src/export_bids_cli.cpp)
 target_link_libraries(qeeg_export_bids_cli PRIVATE qeeg)
 
+add_executable(qeeg_export_derivatives_cli src/export_derivatives_cli.cpp)
+target_link_libraries(qeeg_export_derivatives_cli PRIVATE qeeg)
+
+
+add_executable(qeeg_ui_cli src/ui_cli.cpp)
+target_link_libraries(qeeg_ui_cli PRIVATE qeeg)
+
+add_executable(qeeg_ui_server_cli src/ui_server_cli.cpp)
+target_link_libraries(qeeg_ui_server_cli PRIVATE qeeg)
+
 
 add_executable(qeeg_clean_cli src/clean_cli.cpp)
 target_link_libraries(qeeg_clean_cli PRIVATE qeeg)
@@ -179,10 +192,13 @@ install(TARGETS
   qeeg_export_bdf_cli
   qeeg_export_brainvision_cli
   qeeg_export_bids_cli
+  qeeg_export_derivatives_cli
   qeeg_preprocess_cli
   qeeg_quality_cli
   qeeg_clean_cli
   qeeg_channel_qc_cli
+  qeeg_ui_cli
+  qeeg_ui_server_cli
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
@@ -243,9 +259,64 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_csv_reader PRIVATE qeeg)
   add_test(NAME qeeg_test_csv_reader COMMAND qeeg_test_csv_reader)
 
+
+  add_executable(qeeg_test_csv_to_tsv tests/test_csv_to_tsv.cpp)
+  target_link_libraries(qeeg_test_csv_to_tsv PRIVATE qeeg)
+  add_test(NAME qeeg_test_csv_to_tsv COMMAND qeeg_test_csv_to_tsv)
+
+  add_executable(qeeg_test_cmdline_split tests/test_cmdline_split.cpp)
+  target_link_libraries(qeeg_test_cmdline_split PRIVATE qeeg)
+  add_test(NAME qeeg_test_cmdline_split COMMAND qeeg_test_cmdline_split)
+
+  add_executable(qeeg_test_random_token tests/test_random_token.cpp)
+  target_link_libraries(qeeg_test_random_token PRIVATE qeeg)
+  add_test(NAME qeeg_test_random_token COMMAND qeeg_test_random_token)
+
+  add_executable(qeeg_test_smoother tests/test_smoother.cpp)
+  target_link_libraries(qeeg_test_smoother PRIVATE qeeg)
+  add_test(NAME qeeg_test_smoother COMMAND qeeg_test_smoother)
+
+  add_executable(qeeg_test_adaptive_threshold tests/test_adaptive_threshold.cpp)
+  target_link_libraries(qeeg_test_adaptive_threshold PRIVATE qeeg)
+  add_test(NAME qeeg_test_adaptive_threshold COMMAND qeeg_test_adaptive_threshold)
+
+  add_executable(qeeg_test_reward_shaper tests/test_reward_shaper.cpp)
+  target_link_libraries(qeeg_test_reward_shaper PRIVATE qeeg)
+  add_test(NAME qeeg_test_reward_shaper COMMAND qeeg_test_reward_shaper)
+
+  add_executable(qeeg_test_feedback_value tests/test_feedback_value.cpp)
+  target_link_libraries(qeeg_test_feedback_value PRIVATE qeeg)
+  add_test(NAME qeeg_test_feedback_value COMMAND qeeg_test_feedback_value)
+
+  add_executable(qeeg_test_hysteresis_gate tests/test_hysteresis_gate.cpp)
+  target_link_libraries(qeeg_test_hysteresis_gate PRIVATE qeeg)
+  add_test(NAME qeeg_test_hysteresis_gate COMMAND qeeg_test_hysteresis_gate)
+
+
+
   add_executable(qeeg_test_channel_map tests/test_channel_map.cpp)
   target_link_libraries(qeeg_test_channel_map PRIVATE qeeg)
   add_test(NAME qeeg_test_channel_map COMMAND qeeg_test_channel_map)
+
+  add_executable(qeeg_test_channel_qc_io tests/test_channel_qc_io.cpp)
+  target_link_libraries(qeeg_test_channel_qc_io PRIVATE qeeg)
+  add_test(NAME qeeg_test_channel_qc_io COMMAND qeeg_test_channel_qc_io)
+
+  add_executable(qeeg_test_topomap_nan tests/test_topomap_nan.cpp)
+  target_link_libraries(qeeg_test_topomap_nan PRIVATE qeeg)
+  add_test(NAME qeeg_test_topomap_nan COMMAND qeeg_test_topomap_nan)
+  add_executable(qeeg_test_run_meta tests/test_run_meta.cpp)
+  target_link_libraries(qeeg_test_run_meta PRIVATE qeeg)
+  add_test(NAME qeeg_test_run_meta COMMAND qeeg_test_run_meta)
+
+
+  add_executable(qeeg_test_ui_dashboard tests/test_ui_dashboard.cpp)
+  target_link_libraries(qeeg_test_ui_dashboard PRIVATE qeeg)
+  add_test(NAME qeeg_test_ui_dashboard COMMAND qeeg_test_ui_dashboard)
+
+  add_executable(qeeg_test_ui_bin_scan tests/test_ui_bin_scan.cpp)
+  target_link_libraries(qeeg_test_ui_bin_scan PRIVATE qeeg)
+  add_test(NAME qeeg_test_ui_bin_scan COMMAND qeeg_test_ui_bin_scan)
 
   add_executable(qeeg_test_reader_extensions tests/test_reader_extensions.cpp)
   target_link_libraries(qeeg_test_reader_extensions PRIVATE qeeg)
@@ -426,6 +497,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_band_spec_file tests/test_band_spec_file.cpp)
   target_link_libraries(qeeg_test_band_spec_file PRIVATE qeeg)
   add_test(NAME qeeg_test_band_spec_file COMMAND qeeg_test_band_spec_file)
+
+  add_executable(qeeg_test_band_spec_iaf tests/test_band_spec_iaf.cpp)
+  target_link_libraries(qeeg_test_band_spec_iaf PRIVATE qeeg)
+  add_test(NAME qeeg_test_band_spec_iaf COMMAND qeeg_test_band_spec_iaf)
 
   add_executable(qeeg_test_baseline_norm tests/test_baseline_norm.cpp)
   target_link_libraries(qeeg_test_baseline_norm PRIVATE qeeg)

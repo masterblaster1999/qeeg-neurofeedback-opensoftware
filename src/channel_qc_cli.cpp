@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -389,6 +390,98 @@ int main(int argc, char** argv) {
     }
 
     write_summary_txt(summary_txt, qc, interp_rep_ptr, dropped, exported);
+
+
+    // Write lightweight run metadata JSON for downstream tool integration
+    // (e.g., qeeg_export_derivatives_cli can copy all outputs listed here).
+    {
+      const std::filesystem::path outdir = std::filesystem::u8path(args.outdir);
+      const std::filesystem::path meta_path = outdir / "qc_run_meta.json";
+      std::ofstream meta(meta_path, std::ios::binary);
+      if (!meta) {
+        std::cerr << "Warning: failed to write qc_run_meta.json to: " << meta_path.u8string() << "\n";
+      } else {
+        meta << std::setprecision(12);
+
+        auto write_string_or_null = [&](const std::string& s) {
+          if (s.empty()) meta << "null";
+          else meta << "\"" << json_escape(s) << "\"";
+        };
+
+        auto in_outdir = [&](const std::string& path) -> bool {
+          if (path.empty()) return false;
+          const std::filesystem::path p = std::filesystem::u8path(path);
+          if (p.has_parent_path()) {
+            const std::filesystem::path parent = p.parent_path();
+            return !parent.empty() && (parent == outdir);
+          }
+          return false;
+        };
+
+        meta << "{\n";
+        meta << "  \"Tool\": \"qeeg_channel_qc_cli\",\n";
+        meta << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+        meta << "  \"Input\": {\n";
+        meta << "    \"Path\": ";
+        write_string_or_null(args.input_path);
+        meta << ",\n";
+        meta << "    \"FsCsvHz\": " << args.fs_csv << "\n";
+        meta << "  },\n";
+        meta << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
+
+        meta << "  \"Options\": {\n";
+        meta << "    \"Interpolate\": " << (args.interpolate ? "true" : "false") << ",\n";
+        meta << "    \"DropBad\": " << (args.drop_bad ? "true" : "false") << ",\n";
+        meta << "    \"ChannelMap\": ";
+        write_string_or_null(args.channel_map_path);
+        meta << ",\n";
+        meta << "    \"Montage\": ";
+        write_string_or_null(args.montage_path);
+        meta << ",\n";
+        meta << "    \"FlatlinePtp\": " << args.flatline_ptp << ",\n";
+        meta << "    \"FlatlineScale\": " << args.flatline_scale << ",\n";
+        meta << "    \"FlatlineScaleFactor\": " << args.flatline_scale_factor << ",\n";
+        meta << "    \"NoisyScaleFactor\": " << args.noisy_scale_factor << ",\n";
+        meta << "    \"ArtifactBadFrac\": " << args.artifact_bad_frac << ",\n";
+        meta << "    \"MinAbsCorr\": " << args.min_abs_corr << ",\n";
+        meta << "    \"MaxSamplesRobust\": " << args.max_samples_robust << ",\n";
+        meta << "    \"WindowSeconds\": " << args.window_seconds << ",\n";
+        meta << "    \"StepSeconds\": " << args.step_seconds << ",\n";
+        meta << "    \"BaselineSeconds\": " << args.baseline_seconds << ",\n";
+        meta << "    \"PtpZ\": " << args.ptp_z << ",\n";
+        meta << "    \"RmsZ\": " << args.rms_z << ",\n";
+        meta << "    \"KurtosisZ\": " << args.kurtosis_z << ",\n";
+        meta << "    \"MinBadChannels\": " << args.min_bad_channels << "\n";
+        meta << "  },\n";
+
+        meta << "  \"BadChannels\": [\n";
+        for (size_t i = 0; i < qc.bad_indices.size(); ++i) {
+          const size_t idx = qc.bad_indices[i];
+          const std::string ch = (idx < qc.channels.size()) ? qc.channels[idx].channel : std::string();
+          const std::string reasons = (idx < qc.channels.size()) ? qc.channels[idx].reasons : std::string();
+          meta << "    { \"Channel\": \"" << json_escape(ch) << "\", \"Reasons\": \"" << json_escape(reasons) << "\" }";
+          if (i + 1 < qc.bad_indices.size()) meta << ",";
+          meta << "\n";
+        }
+        meta << "  ],\n";
+
+        // Outputs: relative to outdir
+        meta << "  \"Outputs\": [\n";
+        meta << "    \"channel_qc.csv\",\n";
+        meta << "    \"bad_channels.txt\",\n";
+        meta << "    \"qc_summary.txt\",\n";
+        meta << "    \"qc_run_meta.json\"";
+        if (in_outdir(exported)) {
+          meta << ",\n    \"" << json_escape(std::filesystem::u8path(exported).filename().u8string()) << "\"";
+        }
+        if (in_outdir(args.events_out_csv)) {
+          meta << ",\n    \"" << json_escape(std::filesystem::u8path(args.events_out_csv).filename().u8string()) << "\"";
+        }
+        meta << "\n  ]\n";
+
+        meta << "}\n";
+      }
+    }
 
     std::cout << "Wrote: " << qc_csv << "\n";
     std::cout << "Wrote: " << bad_txt << "\n";

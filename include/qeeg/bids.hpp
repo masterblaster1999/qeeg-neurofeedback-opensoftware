@@ -39,12 +39,84 @@ std::string format_bids_entity_chain(const BidsEntities& ent);
 // Example suffixes: "eeg", "channels", "events".
 std::string format_bids_filename_stem(const BidsEntities& ent, const std::string& suffix);
 
+// ---- Parsing helpers ----
+
+// Parsed BIDS name components.
+//
+// This helper is intentionally small and only parses the entity keys that
+// qeeg currently uses: sub, ses, task, acq, run.
+//
+// Unknown entities (e.g. desc-...) are ignored.
+struct BidsParsedFilename {
+  BidsEntities ent;
+  // Final suffix token (e.g., "eeg", "events", "channels").
+  // Empty when parsing an entity chain without a suffix.
+  std::string suffix;
+};
+
+// Parse a BIDS-like filename (or stem) and extract the entity chain.
+//
+// The input may be:
+// - a full path ("/path/sub-01_task-rest_eeg.edf")
+// - a filename ("sub-01_task-rest_eeg.edf")
+// - a filename stem ("sub-01_task-rest_eeg")
+// - an entity chain without a suffix ("sub-01_task-rest")
+//
+// Returns nullopt if required entities (sub/task) are not found.
+// Throws if a recognized entity is present but its label is invalid.
+std::optional<BidsParsedFilename> parse_bids_filename(const std::string& filename_or_stem);
+
+// Walk up parent directories looking for dataset_description.json.
+//
+// The input may be a file or directory path. If the dataset root is found,
+// returns its path as a UTF-8 string.
+std::optional<std::string> find_bids_dataset_root(const std::string& path);
+
 // ---- dataset_description.json ----
 
 struct BidsDatasetDescription {
   std::string name{"qeeg-export"};
   std::string bids_version{"1.10.1"};
   std::string dataset_type{"raw"};
+
+  // ---- Derivatives metadata ----
+  //
+  // Per the BIDS specification, derived datasets stored under
+  // <dataset>/derivatives/<pipeline_name>/ MUST include a GeneratedBy array.
+  //
+  // We include a minimal representation here so both qeeg_export_bids_cli and
+  // qeeg_export_derivatives_cli can write conformant dataset_description.json.
+  struct GeneratedByEntry {
+    // REQUIRED
+    std::string name;
+
+    // RECOMMENDED
+    std::string version;
+
+    // OPTIONAL
+    std::string description;
+    std::string code_url;
+
+    // OPTIONAL container metadata (all optional; written only when provided).
+    std::string container_type; // e.g., "docker" / "singularity"
+    std::string container_tag;  // e.g., "org/image:1.2.3"
+    std::string container_uri;  // e.g., "docker://..."
+  };
+
+  // For raw datasets this can be left empty.
+  // For derivative datasets (dataset_type=="derivative"), at least one entry
+  // is REQUIRED.
+  std::vector<GeneratedByEntry> generated_by;
+
+  struct SourceDatasetEntry {
+    // All keys are OPTIONAL per BIDS, but at least one SHOULD be provided.
+    std::string url;
+    std::string doi;
+    std::string version;
+  };
+
+  // RECOMMENDED for derivatives.
+  std::vector<SourceDatasetEntry> source_datasets;
 };
 
 // Create dataset_description.json in dataset_root if it does not exist.
@@ -88,6 +160,26 @@ void write_bids_channels_tsv(const std::string& path,
                              const EEGRecording& rec,
                              const std::vector<std::string>& channel_status = {},
                              const std::vector<std::string>& channel_status_desc = {});
+
+// Write channels.tsv from a provided channel name list.
+//
+// This overload is useful when a tool wants to emit a BIDS-compatible channels.tsv
+// without having access to the full EEGRecording (for example, exporting a
+// derivatives channels.tsv from qeeg_channel_qc_cli output).
+//
+// Channel types and units are inferred from channel names using
+// guess_bids_channel_type().
+void write_bids_channels_tsv(const std::string& path,
+                             const std::vector<std::string>& channel_names,
+                             const std::vector<std::string>& channel_status = {},
+                             const std::vector<std::string>& channel_status_desc = {});
+
+// Load the `name` column from a BIDS *_channels.tsv (or a similar table).
+//
+// This is a tiny helper intended for interoperability (for example,
+// qeeg_export_derivatives_cli can preserve channel ordering by reading the raw
+// dataset's channels.tsv and then writing a derivative channels.tsv with QC labels).
+std::vector<std::string> load_bids_channels_tsv_names(const std::string& path);
 
 // ---- *_events.tsv / *_events.json ----
 
@@ -180,7 +272,8 @@ struct BidsElectrode {
 
 // Load a simple electrode coordinate table (CSV or TSV).
 //
-// The file must contain a header row with at least: name, x, y, z.
+// The file must contain a header row with at least: name, x, y.
+// If a z column is present, it will be parsed; otherwise z is treated as missing.
 // Optional columns: type, material, impedance.
 //
 // Values of "n/a" (case-insensitive) or empty fields are treated as missing.

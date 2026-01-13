@@ -20,48 +20,12 @@ static inline bool is_alnum(char c) {
   return std::isalnum(static_cast<unsigned char>(c)) != 0;
 }
 
-static std::string json_escape(const std::string& s) {
-  std::string out;
-  out.reserve(s.size() + 8);
-  for (unsigned char uc : s) {
-    char c = static_cast<char>(uc);
-    switch (c) {
-    case '\\': out += "\\\\"; break;
-    case '"': out += "\\\""; break;
-    case '\b': out += "\\b"; break;
-    case '\f': out += "\\f"; break;
-    case '\n': out += "\\n"; break;
-    case '\r': out += "\\r"; break;
-    case '\t': out += "\\t"; break;
-    default:
-      if (uc < 0x20) {
-        // Control chars -> \u00XX
-        std::ostringstream oss;
-        oss << "\\u" << std::hex << std::uppercase << std::setw(4) << std::setfill('0')
-            << static_cast<int>(uc);
-        out += oss.str();
-      } else {
-        out.push_back(c);
-      }
-      break;
-    }
-  }
-  return out;
-}
-
 static std::string tsv_sanitize(std::string s) {
   // BIDS TSVs are plain tab-separated, without CSV-style quoting.
   // Replace tabs/newlines with spaces to keep the table well-formed.
   for (char& c : s) {
     if (c == '\t' || c == '\n' || c == '\r') c = ' ';
   }
-  return s;
-}
-
-static std::string to_upper_ascii(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-    return static_cast<char>(std::toupper(c));
-  });
   return s;
 }
 
@@ -106,6 +70,92 @@ std::string format_bids_filename_stem(const BidsEntities& ent, const std::string
   return format_bids_entity_chain(ent) + "_" + suffix;
 }
 
+std::optional<BidsParsedFilename> parse_bids_filename(const std::string& filename_or_stem) {
+  if (trim(filename_or_stem).empty()) return std::nullopt;
+
+  // Accept either a path, a filename, or a bare stem.
+  std::filesystem::path p = std::filesystem::u8path(filename_or_stem);
+  std::string stem = p.stem().u8string();
+
+  // Special-case double extensions like ".nii.gz" by stripping a second time.
+  // (Not strictly needed for EEG, but makes the helper more general.)
+  const std::string ext = to_lower(p.extension().u8string());
+  if (ext == ".gz" || ext == ".bz2" || ext == ".xz") {
+    stem = std::filesystem::path(stem).stem().u8string();
+  }
+
+  if (trim(stem).empty()) return std::nullopt;
+
+  auto parts = split(stem, '_');
+  if (parts.empty()) return std::nullopt;
+
+  std::string suffix;
+  if (!parts.empty() && parts.back().find('-') == std::string::npos) {
+    suffix = parts.back();
+    parts.pop_back();
+  }
+
+  BidsEntities ent;
+  for (const auto& tok : parts) {
+    const auto dash = tok.find('-');
+    if (dash == std::string::npos) continue;
+    const std::string key = tok.substr(0, dash);
+    const std::string val = tok.substr(dash + 1);
+
+    auto set_checked = [&](std::string* dst, const char* what) {
+      if (val.empty()) return;
+      if (!is_valid_bids_label(val)) {
+        throw std::runtime_error(std::string("BIDS: invalid ") + what + " label in filename: '" + val + "'");
+      }
+      *dst = val;
+    };
+
+    if (key == "sub") {
+      set_checked(&ent.sub, "subject");
+    } else if (key == "task") {
+      set_checked(&ent.task, "task");
+    } else if (key == "ses") {
+      set_checked(&ent.ses, "session");
+    } else if (key == "acq") {
+      set_checked(&ent.acq, "acquisition");
+    } else if (key == "run") {
+      set_checked(&ent.run, "run");
+    } else {
+      // Unknown entities are ignored (e.g., desc-*, rec-*, echo-*, ...).
+    }
+  }
+
+  if (ent.sub.empty() || ent.task.empty()) return std::nullopt;
+
+  BidsParsedFilename out;
+  out.ent = ent;
+  out.suffix = suffix;
+  return out;
+}
+
+std::optional<std::string> find_bids_dataset_root(const std::string& path) {
+  if (trim(path).empty()) return std::nullopt;
+
+  std::filesystem::path p = std::filesystem::u8path(path);
+  if (!std::filesystem::exists(p)) return std::nullopt;
+  if (std::filesystem::is_regular_file(p)) {
+    p = p.parent_path();
+  }
+
+  // Walk up until filesystem root.
+  for (;;) {
+    const auto dd = p / "dataset_description.json";
+    if (std::filesystem::exists(dd) && std::filesystem::is_regular_file(dd)) {
+      return p.u8string();
+    }
+    if (!p.has_parent_path()) break;
+    const auto parent = p.parent_path();
+    if (parent == p) break;
+    p = parent;
+  }
+  return std::nullopt;
+}
+
 void write_bids_dataset_description(const std::string& dataset_root,
                                    const BidsDatasetDescription& desc,
                                    bool overwrite) {
@@ -122,15 +172,101 @@ void write_bids_dataset_description(const std::string& dataset_root,
   std::ofstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path.u8string());
 
+  const std::string dtype = trim(desc.dataset_type);
+  const bool is_derivative = (dtype == "derivative");
+  if (is_derivative && desc.generated_by.empty()) {
+    throw std::runtime_error(
+        "BIDS: dataset_description.json for DatasetType=derivative must include GeneratedBy");
+  }
+
+  auto write_generated_by = [&]() {
+    f << "  \"GeneratedBy\": [\n";
+    for (size_t i = 0; i < desc.generated_by.size(); ++i) {
+      const auto& g = desc.generated_by[i];
+      if (trim(g.name).empty()) {
+        throw std::runtime_error("BIDS: GeneratedBy entry is missing required Name");
+      }
+
+      f << "    {\n";
+      f << "      \"Name\": \"" << json_escape(g.name) << "\"";
+      if (!trim(g.version).empty()) {
+        f << ",\n      \"Version\": \"" << json_escape(g.version) << "\"";
+      }
+      if (!trim(g.description).empty()) {
+        f << ",\n      \"Description\": \"" << json_escape(g.description) << "\"";
+      }
+      if (!trim(g.code_url).empty()) {
+        f << ",\n      \"CodeURL\": \"" << json_escape(g.code_url) << "\"";
+      }
+
+      const bool have_container = !trim(g.container_type).empty() || !trim(g.container_tag).empty() ||
+                                  !trim(g.container_uri).empty();
+      if (have_container) {
+        f << ",\n      \"Container\": {\n";
+        bool first = true;
+        auto emit_kv = [&](const char* k, const std::string& v) {
+          if (trim(v).empty()) return;
+          f << (first ? "" : ",\n")
+            << "        \"" << k << "\": \"" << json_escape(v) << "\"";
+          first = false;
+        };
+        emit_kv("Type", g.container_type);
+        emit_kv("Tag", g.container_tag);
+        emit_kv("URI", g.container_uri);
+        f << "\n      }";
+      }
+
+      f << "\n    }";
+      if (i + 1 < desc.generated_by.size()) f << ",";
+      f << "\n";
+    }
+    f << "  ]";
+  };
+
+  auto write_source_datasets = [&]() {
+    f << "  \"SourceDatasets\": [\n";
+    bool first_obj = true;
+    for (const auto& s : desc.source_datasets) {
+      const bool have_any = !trim(s.url).empty() || !trim(s.doi).empty() || !trim(s.version).empty();
+      if (!have_any) continue;
+
+      if (!first_obj) f << ",\n";
+      first_obj = false;
+
+      f << "    {";
+      bool first = true;
+      auto emit_kv = [&](const char* k, const std::string& v) {
+        if (trim(v).empty()) return;
+        f << (first ? "" : ", ")
+          << "\"" << k << "\": \"" << json_escape(v) << "\"";
+        first = false;
+      };
+      emit_kv("URL", s.url);
+      emit_kv("DOI", s.doi);
+      emit_kv("Version", s.version);
+      f << "}";
+    }
+    f << "\n  ]";
+  };
+
+  // --- File ---
   f << "{\n";
   f << "  \"Name\": \"" << json_escape(desc.name) << "\",\n";
   f << "  \"BIDSVersion\": \"" << json_escape(desc.bids_version) << "\"";
-  if (!desc.dataset_type.empty()) {
-    f << ",\n  \"DatasetType\": \"" << json_escape(desc.dataset_type) << "\"\n";
-  } else {
-    f << "\n";
+  if (!dtype.empty()) {
+    f << ",\n  \"DatasetType\": \"" << json_escape(dtype) << "\"";
   }
-  f << "}\n";
+
+  if (!desc.generated_by.empty()) {
+    f << ",\n";
+    write_generated_by();
+  }
+  if (!desc.source_datasets.empty()) {
+    f << ",\n";
+    write_source_datasets();
+  }
+
+  f << "\n}\n";
 }
 
 static std::string units_for_type(const std::string& type_uc) {
@@ -262,9 +398,13 @@ std::vector<BidsElectrode> load_bids_electrodes_table(const std::string& path) {
       }
 
       // Required columns.
+      //
+      // BIDS electrodes.tsv requires x/y/z columns on output, but allows "n/a" values.
+      // For convenience we allow input tables to omit the z column (commonly used 2D
+      // montages with name,x,y). In that case, z is treated as missing (n/a).
       if (col.find("name") == col.end() || col.find("x") == col.end() ||
-          col.find("y") == col.end() || col.find("z") == col.end()) {
-        throw std::runtime_error("BIDS: electrodes table must include header columns: name,x,y,z");
+          col.find("y") == col.end()) {
+        throw std::runtime_error("BIDS: electrodes table must include header columns: name,x,y (z optional)");
       }
 
       have_header = true;
@@ -289,7 +429,11 @@ std::vector<BidsElectrode> load_bids_electrodes_table(const std::string& path) {
 
     e.x = parse_optional_double_strict(get_field("x"), "electrodes.x");
     e.y = parse_optional_double_strict(get_field("y"), "electrodes.y");
-    e.z = parse_optional_double_strict(get_field("z"), "electrodes.z");
+    if (col.find("z") != col.end()) {
+      e.z = parse_optional_double_strict(get_field("z"), "electrodes.z");
+    } else {
+      e.z.reset();
+    }
 
     // Optional columns.
     e.type = is_na_token(get_field("type")) ? std::string() : get_field("type");
@@ -433,6 +577,125 @@ void write_bids_channels_tsv(const std::string& path,
   }
 }
 
+void write_bids_channels_tsv(const std::string& path,
+                            const std::vector<std::string>& channel_names,
+                            const std::vector<std::string>& channel_status,
+                            const std::vector<std::string>& channel_status_desc) {
+  if (path.empty()) throw std::runtime_error("BIDS: channels.tsv path is empty");
+
+  // Validate uniqueness of channel names (BIDS requirement).
+  std::unordered_set<std::string> seen;
+  seen.reserve(channel_names.size());
+  for (const auto& n : channel_names) {
+    if (n.empty()) {
+      throw std::runtime_error("BIDS: empty channel name in channel list");
+    }
+    if (!seen.insert(n).second) {
+      throw std::runtime_error("BIDS: duplicate channel name in channel list: '" + n + "'");
+    }
+  }
+
+  if (!channel_status.empty() && channel_status.size() != channel_names.size()) {
+    throw std::runtime_error("BIDS: channel_status size must match channel count");
+  }
+  if (!channel_status_desc.empty() && channel_status_desc.size() != channel_names.size()) {
+    throw std::runtime_error("BIDS: channel_status_desc size must match channel count");
+  }
+
+  std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
+  if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  // Required columns: name, type, units (in this order).
+  // We also include status/status_description for compatibility with QC tooling.
+  f << "name\ttype\tunits\tstatus\tstatus_description\n";
+
+  for (size_t i = 0; i < channel_names.size(); ++i) {
+    const std::string& name = channel_names[i];
+    const std::string type_uc = guess_bids_channel_type(name);
+    const std::string units = units_for_type(type_uc);
+
+    std::string status = "good";
+    std::string status_desc = "n/a";
+
+    if (!channel_status.empty()) {
+      status = channel_status[i];
+      if (status != "good" && status != "bad" && status != "n/a") {
+        // Keep it strict-ish.
+        throw std::runtime_error("BIDS: invalid channel status (use good/bad/n/a): '" + status + "'");
+      }
+    }
+    if (!channel_status_desc.empty()) {
+      status_desc = channel_status_desc[i].empty() ? "n/a" : channel_status_desc[i];
+    }
+
+    f << tsv_sanitize(name) << "\t";
+    f << tsv_sanitize(type_uc) << "\t";
+    f << tsv_sanitize(units) << "\t";
+    f << tsv_sanitize(status) << "\t";
+    f << tsv_sanitize(status_desc) << "\n";
+  }
+}
+
+std::vector<std::string> load_bids_channels_tsv_names(const std::string& path) {
+  if (path.empty()) throw std::runtime_error("BIDS: channels.tsv path is empty");
+
+  std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
+  if (!f) throw std::runtime_error("BIDS: failed to open channels.tsv: " + path);
+
+  std::string line;
+  bool have_header = false;
+  char delim = '\t';
+  int col_name = -1;
+
+  std::vector<std::string> out;
+  std::unordered_set<std::string> seen;
+
+  while (std::getline(f, line)) {
+    if (!have_header) {
+      line = strip_utf8_bom(line);
+    }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    const std::string t = trim(line);
+    if (t.empty() || (!t.empty() && t[0] == '#')) continue;
+
+    if (!have_header) {
+      // BIDS uses TSV, but tolerate CSV for convenience.
+      delim = (t.find('\t') != std::string::npos) ? '\t' : ',';
+      const auto header_fields = (delim == '\t') ? split(t, delim) : split_csv_row(t, delim);
+      for (size_t i = 0; i < header_fields.size(); ++i) {
+        const std::string h = to_lower(trim(header_fields[i]));
+        if (h == "name" || h == "channel") {
+          col_name = static_cast<int>(i);
+          break;
+        }
+      }
+      if (col_name < 0) {
+        throw std::runtime_error("BIDS: channels.tsv missing required column: name");
+      }
+      have_header = true;
+      continue;
+    }
+
+    const auto fields = (delim == '\t') ? split(t, delim) : split_csv_row(t, delim);
+    if (static_cast<size_t>(col_name) >= fields.size()) continue;
+    const std::string name = trim(fields[static_cast<size_t>(col_name)]);
+    if (name.empty()) continue;
+    const std::string name_lc = to_lower(name);
+    if (name_lc == "n/a" || name_lc == "na") continue;
+
+    if (!seen.insert(name).second) {
+      throw std::runtime_error("BIDS: duplicate channel name in channels.tsv: '" + name + "'");
+    }
+    out.push_back(name);
+  }
+
+  if (!have_header) {
+    throw std::runtime_error("BIDS: channels.tsv missing header row: " + path);
+  }
+
+  return out;
+}
+
 static bool parse_int64_strict(const std::string& s, long long* out) {
   const std::string t = trim(s);
   if (t.empty()) return false;
@@ -549,7 +812,7 @@ void write_bids_events_json(const std::string& path, const BidsEventsTsvOptions&
   if (opts.include_trial_type) {
     write_entry("trial_type",
                 "Event label",
-                "Annotation text carried over from the source recording.",
+                "Event label, typically derived from the recording annotations or produced by a processing pipeline.",
                 "",
                 wrote_any);
   }
@@ -583,7 +846,14 @@ static std::string trial_type_level_description(const std::string& level) {
   if (level == "NF:Reward") return "Neurofeedback reward active.";
   if (level == "NF:Artifact") return "Artifact gate active (data considered contaminated).";
   if (level == "NF:Baseline") return "Baseline estimation segment.";
+  if (level == "NF:Train") return "Neurofeedback training block.";
+  if (level == "NF:Rest") return "Neurofeedback rest block (reinforcement paused).";
   if (level.rfind("NF:", 0) == 0) return "Neurofeedback derived event.";
+  if (level.rfind("MS:", 0) == 0) {
+    const std::string s = level.substr(3);
+    if (!s.empty()) return "Microstate " + s + " segment.";
+    return "Microstate segment.";
+  }
   if (level == "n/a") return "Not applicable / missing label.";
   return "Event label.";
 }
@@ -654,7 +924,7 @@ void write_bids_events_json(const std::string& path,
         ? collect_unique_trial_types_limited(events, opts.trial_type_levels_max, &too_many)
         : std::vector<std::string>{};
 
-    std::string desc = "Annotation text carried over from the source recording.";
+    std::string desc = "Event label, typically derived from the recording annotations or produced by a processing pipeline.";
     if (opts.include_trial_type_levels) {
       if (too_many) {
         desc += " Levels omitted because the number of unique values exceeded the configured maximum.";

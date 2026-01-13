@@ -26,10 +26,12 @@ Grid2D make_topomap_idw(const Montage& montage,
   val.reserve(channel_names.size());
 
   for (size_t i = 0; i < channel_names.size(); ++i) {
+    const double v = channel_values[i];
+    if (!std::isfinite(v)) continue; // allow callers to mask channels with NaN/Inf
     Vec2 p;
     if (!montage.get(channel_names[i], &p)) continue;
     pos.push_back(p);
-    val.push_back(channel_values[i]);
+    val.push_back(v);
   }
 
   if (pos.size() < 3) {
@@ -106,10 +108,12 @@ Grid2D make_topomap_spherical_spline(const Montage& montage,
   val.reserve(channel_names.size());
 
   for (size_t i = 0; i < channel_names.size(); ++i) {
+    const double v = channel_values[i];
+    if (!std::isfinite(v)) continue; // allow callers to mask channels with NaN/Inf
     Vec2 p2;
     if (!montage.get(channel_names[i], &p2)) continue;
     pos.push_back(project_to_unit_sphere(p2));
-    val.push_back(channel_values[i]);
+    val.push_back(v);
   }
 
   if (pos.size() < 3) {

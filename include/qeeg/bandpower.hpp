@@ -17,6 +17,10 @@ std::vector<BandDefinition> default_eeg_bands();
 // path to a text file containing a band spec (one per line or comma-separated).
 // Example:
 //   parse_band_spec("@out_iaf/iaf_band_spec.txt")
+//
+// Convenience: IAF-relative band specs (based on qeeg_iaf_cli outputs):
+//   parse_band_spec("iaf=10.2")        // explicit IAF Hz
+//   parse_band_spec("iaf:out_iaf")     // reads out_iaf/iaf_band_spec.txt or out_iaf/iaf_summary.txt
 std::vector<BandDefinition> parse_band_spec(const std::string& spec);
 
 // Integrate PSD between [fmin_hz, fmax_hz] using trapezoidal rule.

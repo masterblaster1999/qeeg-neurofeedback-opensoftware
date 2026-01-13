@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
+#include <random>
+#include <ctime>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 
@@ -46,6 +50,81 @@ std::vector<std::string> split(const std::string& s, char delim) {
   }
   // Handle trailing empty field
   if (!s.empty() && s.back() == delim) out.emplace_back("");
+  return out;
+}
+
+std::vector<std::string> split_commandline_args(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  cur.reserve(s.size());
+
+  bool in_single = false;
+  bool in_double = false;
+  bool escaping = false;
+
+  auto flush = [&]() {
+    if (!cur.empty()) {
+      out.push_back(cur);
+      cur.clear();
+    }
+  };
+
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+
+    if (escaping) {
+      cur.push_back(c);
+      escaping = false;
+      continue;
+    }
+
+    if (c == '\\') {
+      // Backslash escapes the next character.
+      escaping = true;
+      continue;
+    }
+
+    if (!in_double && c == '\'') {
+      in_single = !in_single;
+      continue;
+    }
+    if (!in_single && c == '"') {
+      in_double = !in_double;
+      continue;
+    }
+
+    if (!in_single && !in_double && is_space(c)) {
+      flush();
+      continue;
+    }
+
+    cur.push_back(c);
+  }
+
+  if (escaping) {
+    // Trailing backslash: keep it literal.
+    cur.push_back('\\');
+  }
+
+  flush();
+  return out;
+}
+
+std::string random_hex_token(size_t n_bytes) {
+  if (n_bytes == 0) n_bytes = 16;
+  static const char* kHex = "0123456789abcdef";
+
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<int> dist(0, 255);
+
+  std::string out;
+  out.reserve(n_bytes * 2);
+  for (size_t i = 0; i < n_bytes; ++i) {
+    const int b = dist(gen);
+    out.push_back(kHex[(b >> 4) & 0x0F]);
+    out.push_back(kHex[b & 0x0F]);
+  }
   return out;
 }
 
@@ -145,6 +224,36 @@ std::vector<std::string> split_csv_row(const std::string& row, char delim) {
   out.push_back(field);
   return out;
 }
+
+void convert_csv_file_to_tsv(const std::string& csv_path, const std::string& tsv_path) {
+  std::ifstream in(csv_path, std::ios::binary);
+  if (!in) throw std::runtime_error("Failed to open CSV: " + csv_path);
+
+  std::ofstream out(tsv_path, std::ios::binary);
+  if (!out) throw std::runtime_error("Failed to write TSV: " + tsv_path);
+
+  std::string line;
+  bool first_line = true;
+  while (std::getline(in, line)) {
+    if (first_line) {
+      line = strip_utf8_bom(line);
+      first_line = false;
+    }
+
+    const std::vector<std::string> fields = split_csv_row(line, ',');
+    for (size_t i = 0; i < fields.size(); ++i) {
+      std::string cell = fields[i];
+      // TSV delimiter safety: replace any literal tab characters inside cells.
+      for (char& c : cell) {
+        if (c == '\t') c = ' ';
+      }
+      out << cell;
+      if (i + 1 < fields.size()) out << '\t';
+    }
+    out << '\n';
+  }
+}
+
 
 std::string to_lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(),
@@ -248,6 +357,55 @@ bool file_exists(const std::string& path) {
 
 void ensure_directory(const std::string& path) {
   std::filesystem::create_directories(std::filesystem::u8path(path));
+}
+
+std::string now_string_local() {
+  std::time_t t = std::time(nullptr);
+  std::string s = std::ctime(&t);
+  if (!s.empty() && s.back() == '\n') s.pop_back();
+  return s;
+}
+
+std::string now_string_utc() {
+  std::time_t t = std::time(nullptr);
+  std::tm* tm = std::gmtime(&t);
+  if (!tm) return std::string();
+  std::ostringstream oss;
+  oss << std::put_time(tm, "%Y-%m-%dT%H:%M:%SZ");
+  return oss.str();
+}
+
+std::string json_escape(const std::string& s) {
+  // Minimal JSON string escape.
+  //
+  // Notes:
+  // - We assume the input is valid UTF-8 if it contains non-ASCII bytes.
+  // - Control characters are escaped; other bytes are preserved.
+  std::ostringstream oss;
+  oss << std::hex << std::uppercase;
+  for (unsigned char uc : s) {
+    const char c = static_cast<char>(uc);
+    switch (c) {
+      case '"': oss << "\\\""; break;
+      case '\\': oss << "\\\\"; break;
+      case '\b': oss << "\\b"; break;
+      case '\f': oss << "\\f"; break;
+      case '\n': oss << "\\n"; break;
+      case '\r': oss << "\\r"; break;
+      case '\t': oss << "\\t"; break;
+      default:
+        if (uc < 0x20) {
+          // JSON requires control chars to be escaped.
+          oss << "\\u" << std::setw(4) << std::setfill('0') << static_cast<int>(uc);
+          // Reset stream state for subsequent formatting.
+          oss << std::setw(0) << std::setfill(' ');
+        } else {
+          oss << c;
+        }
+        break;
+    }
+  }
+  return oss.str();
 }
 
 } // namespace qeeg

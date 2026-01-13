@@ -8,15 +8,24 @@
 #include "qeeg/nf_metric.hpp"
 #include "qeeg/nf_metric_eval.hpp"
 #include "qeeg/nf_threshold.hpp"
+#include "qeeg/hysteresis_gate.hpp"
+#include "qeeg/adaptive_threshold.hpp"
 #include "qeeg/debounce.hpp"
 #include "qeeg/robust_stats.hpp"
+#include "qeeg/running_stats.hpp"
+#include "qeeg/smoother.hpp"
+#include "qeeg/reward_shaper.hpp"
+#include "qeeg/feedback_value.hpp"
 #include "qeeg/csv_io.hpp"
+#include "qeeg/bids.hpp"
+#include "qeeg/channel_qc_io.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/wav_writer.hpp"
 #include "qeeg/osc.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <deque>
@@ -28,7 +37,9 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+#include <unordered_set>
 
 using namespace qeeg;
 
@@ -37,6 +48,14 @@ struct Args {
   std::string outdir{"out_nf"};
   std::string band_spec; // empty => default
   std::string metric_spec{"alpha:Pz"};
+
+  // Optional: channel quality control (qeeg_channel_qc_cli output).
+  // When provided:
+  //  - bad channels are ignored by the artifact gate (to avoid "always bad" sessions due to a known dead channel)
+  //  - bandpower_timeseries.csv masks bad channels as NaN for easier downstream analysis
+  //  - by default, using a bad channel for the NF metric is treated as an error (override with --allow-bad-metric-channels)
+  std::string channel_qc;
+  bool allow_bad_metric_channels{false};
 
   bool demo{false};
   double fs_csv{0.0};
@@ -76,6 +95,10 @@ struct Args {
   RewardDirection reward_direction{RewardDirection::Above};
   double target_reward_rate{0.6};
   double adapt_eta{0.10};
+  std::string adapt_mode{"exp"};
+  double adapt_interval_seconds{0.0};
+  double adapt_window_seconds{30.0};
+  int adapt_min_samples{20};
   double reward_rate_window_seconds{5.0};
   bool no_adaptation{false};
 
@@ -86,8 +109,56 @@ struct Args {
   int reward_on_frames{1};
   int reward_off_frames{1};
 
+  // Optional numeric threshold hysteresis (metric units).
+  //
+  // When >0, qeeg_nf_cli uses a Schmitt-trigger style comparator to
+  // reduce ON/OFF chatter when the metric hovers near the threshold.
+  // Example (reward=above): ON when metric > thr + H, OFF when metric < thr - H.
+  double threshold_hysteresis{0.0};
+
+  // Optional reward shaping (time-domain) on top of metric thresholding.
+  //
+  // - dwell_seconds: require the raw reward condition to remain true for this long
+  //   before reward can turn on.
+  // - refractory_seconds: after reward turns off, require this long before it can
+  //   turn on again.
+  double dwell_seconds{0.0};
+  double refractory_seconds{0.0};
+
+  // Optional continuous feedback value derived from the metric.
+  //
+  // - feedback_mode=binary (default): reward_value is a 0/1 gate (same as reward).
+  // - feedback_mode=continuous: reward_value is a graded value in [0,1] based on
+  //   how far the metric is beyond threshold (direction-aware). This value can be
+  //   exported, sent via OSC, and used for amplitude-modulated audio.
+  //
+  // feedback_span controls the metric delta that maps to full-scale feedback.
+  // If not provided, qeeg_nf_cli will attempt to use a robust baseline scale (MAD).
+  std::string feedback_mode{"binary"};
+  double feedback_span{std::numeric_limits<double>::quiet_NaN()};
+
+  // Optional training block schedule (useful for offline "real-time" practice).
+  // When enabled (train>0 and rest>0), reinforcement is paused during rest blocks.
+  double train_block_seconds{0.0};
+  double rest_block_seconds{0.0};
+  bool start_with_rest{false};
+
   // Playback
   double chunk_seconds{0.10};
+
+  // Optional: pace offline playback to approximate real-time.
+  //
+  // If <= 0, processing runs as fast as possible.
+  // If > 0, the tool will sleep so updates are emitted at (sim_time / playback_speed).
+  //   playback_speed = 1.0 => real-time
+  //   playback_speed = 2.0 => 2x real-time (faster)
+  //   playback_speed = 0.5 => half-speed (slower)
+  double playback_speed{0.0};
+
+  // Optional: smooth the metric prior to thresholding/feedback.
+  // This uses an exponential moving average with a time-constant (seconds).
+  // If <= 0, smoothing is disabled.
+  double metric_smooth_seconds{0.0};
 
   // Debug exports
   bool export_bandpowers{false};   // bandpower mode only
@@ -148,12 +219,16 @@ static void print_help() {
     << "  --fs HZ                   Sampling rate for CSV (optional if first column is time); also used for --demo\n"
     << "  --outdir DIR              Output directory (default: out_nf)\n"
     << "  --bands SPEC              Band spec, e.g. 'delta:0.5-4,theta:4-7,alpha:8-12'\n"
+    << "                             IAF-relative convenience forms:\n"
+    << "                               --bands iaf=10.2\n"
+    << "                               --bands iaf:out_iaf   (reads out_iaf/iaf_band_spec.txt or out_iaf/iaf_summary.txt)\n"
     << "  --metric SPEC             Metric: 'alpha:Pz' (bandpower), 'alpha/beta:Pz' (ratio),\n"
     << "                           'coh:alpha:F3:F4' or 'msc:alpha:F3:F4' (magnitude-squared coherence),\n"
     << "                           'imcoh:alpha:F3:F4' (imaginary coherency),\n"
     << "                           'pac:PHASE:AMP:CH' (Tort MI), or 'mvl:PHASE:AMP:CH'\n"
     << "  --window S                Sliding window seconds (default: 2.0)\n"
     << "  --update S                Update interval seconds (default: 0.25)\n"
+    << "  --metric-smooth S         Optional: EMA smooth the metric before thresholding (time constant seconds; default: 0/off)\n"
     << "  --nperseg N               Welch segment length (default: 512)\n"
     << "  --overlap FRAC            Welch overlap fraction in [0,1) (default: 0.5)\n"
     << "  --log10                   Use log10(power) instead of raw bandpower (bandpower/ratio metrics only)\n"
@@ -167,16 +242,31 @@ static void print_help() {
     << "  --threshold X             Set an explicit initial threshold (skips baseline threshold estimation)\n"
     << "  --reward-direction DIR    Reward direction: above|below (default: above)\n"
     << "  --target-rate R           Target reward rate in (0,1) (default: 0.6)\n"
-    << "  --eta E                   Adaptation speed (default: 0.10)\n"
+    << "  --eta E                   Adaptation speed/gain (default: 0.10)\n"
+    << "  --adapt-mode MODE          Adaptive threshold mode: exp|quantile (default: exp)\n"
+    << "  --adapt-interval S         Only update threshold every S seconds (0 => every frame; default: 0)\n"
+    << "  --adapt-window S           Quantile mode: rolling window seconds for threshold estimation (default: 30)\n"
+    << "  --adapt-min-samples N      Quantile mode: minimum metric samples in the window before adapting (default: 20)\n"
     << "  --rate-window S           Reward-rate window seconds (default: 5)\n"
     << "  --reward-on-frames N      Debounce: require N consecutive reward frames to turn ON (default: 1)\n"
     << "  --reward-off-frames N     Debounce: require N consecutive non-reward frames to turn OFF (default: 1)\n"
+    << "  --threshold-hysteresis H  Optional: numeric hysteresis band (metric units) around threshold to reduce chatter (default: 0/off)\n"
+    << "  --dwell S                 Reward shaping: require raw reward for S seconds before turning ON (default: 0/off)\n"
+    << "  --refractory S            Reward shaping: after reward turns OFF, enforce S seconds before it can turn ON again (default: 0/off)\n"
+    << "  --feedback-mode MODE      Feedback value mode: binary|continuous (default: binary)\n"
+    << "  --feedback-span X         Continuous mode: metric delta that maps to full-scale feedback (value==1).\n"
+    << "                           If omitted, uses a robust baseline scale estimate (MAD) when available.\n"
+    << "  --train-block S           Offline training: training block length in seconds (enables train/rest schedule when used with --rest-block)\n"
+    << "  --rest-block S            Offline training: rest block length in seconds (reinforcement paused during rest blocks)\n"
+    << "  --start-rest              Offline training: start the schedule with a rest block (default: start with train)\n"
     << "  --no-adaptation            Disable adaptive thresholding (fixed threshold from baseline)\n"
     << "  --average-reference        Apply common average reference across channels\n"
     << "  --notch HZ                 Apply a notch filter at HZ (e.g., 50 or 60)\n"
     << "  --notch-q Q                Notch Q factor (default: 30)\n"
     << "  --bandpass LO HI           Apply a simple bandpass (highpass LO then lowpass HI)\n"
     << "  --chunk S                 File playback chunk seconds (default: 0.10)\n"
+    << "  --realtime                 Pace offline playback at 1x real-time (useful for OSC / interactive training)\n"
+    << "  --speed X                  Pace offline playback at X times real-time (X>0; e.g. 2.0 is 2x speed)\n"
     << "  --export-bandpowers        Write bandpower_timeseries.csv (bandpower/ratio modes)\n"
     << "  --export-coherence         Write coherence_timeseries.csv or imcoh_timeseries.csv (coherence mode)\n"
     << "  --artifact-gate            Suppress reward/adaptation during detected artifacts\n"
@@ -185,10 +275,14 @@ static void print_help() {
     << "  --artifact-kurtosis-z Z    Artifact threshold: excess kurtosis robust z (<=0 disables; default: 6)\n"
     << "  --artifact-min-bad-ch N    Artifact frame is bad if >=N channels flagged (default: 1)\n"
     << "  --artifact-ignore LIST     Comma-separated channel names to ignore for artifact gating\n"
+    << "  --channel-qc PATH          Optional: qeeg_channel_qc_cli output (channel_qc.csv, bad_channels.txt, or qc outdir)\n"
+    << "                           Used to ignore bad channels in artifact gating and mask bad channels as NaN in bandpower_timeseries.csv\n"
+    << "                           Also writes bad_channels_used.txt for provenance\n"
+    << "  --allow-bad-metric-channels  Run even if the NF metric uses channels marked bad by --channel-qc (default: error)\n"
     << "  --export-artifacts         Write artifact_gate_timeseries.csv aligned to NF updates\n"
     << "  --biotrace-ui              Write a self-contained BioTrace+ style HTML UI (biotrace_ui.html).\n"
-    << "                           Also writes nf_derived_events.csv and nf_derived_events.tsv for interoperability.\n"
-    << "  --export-derived-events    Write nf_derived_events.csv/.tsv (baseline/reward/artifact segments) even if --biotrace-ui is off.\n"
+    << "                           Also writes nf_derived_events.csv, nf_derived_events.tsv and nf_derived_events.json for interoperability.\n"
+    << "  --export-derived-events    Write nf_derived_events.csv/.tsv/.json (baseline/reward/artifact segments) even if --biotrace-ui is off.\n"
     << "  --audio-wav PATH           Optional: write a reward-tone WAV (mono PCM16)\n"
     << "  --audio-rate HZ            Audio sample rate (default: 44100)\n"
     << "  --audio-tone HZ            Reward tone frequency (default: 440)\n"
@@ -222,12 +316,18 @@ static Args parse_args(int argc, char** argv) {
       a.band_spec = argv[++i];
     } else if (arg == "--metric" && i + 1 < argc) {
       a.metric_spec = argv[++i];
+    } else if (arg == "--channel-qc" && i + 1 < argc) {
+      a.channel_qc = argv[++i];
+    } else if (arg == "--allow-bad-metric-channels") {
+      a.allow_bad_metric_channels = true;
     } else if (arg == "--fs" && i + 1 < argc) {
       a.fs_csv = to_double(argv[++i]);
     } else if (arg == "--window" && i + 1 < argc) {
       a.window_seconds = to_double(argv[++i]);
     } else if (arg == "--update" && i + 1 < argc) {
       a.update_seconds = to_double(argv[++i]);
+    } else if (arg == "--metric-smooth" && i + 1 < argc) {
+      a.metric_smooth_seconds = to_double(argv[++i]);
     } else if (arg == "--nperseg" && i + 1 < argc) {
       a.nperseg = static_cast<size_t>(to_int(argv[++i]));
     } else if (arg == "--overlap" && i + 1 < argc) {
@@ -256,12 +356,36 @@ static Args parse_args(int argc, char** argv) {
       a.target_reward_rate = to_double(argv[++i]);
     } else if (arg == "--eta" && i + 1 < argc) {
       a.adapt_eta = to_double(argv[++i]);
+    } else if (arg == "--adapt-mode" && i + 1 < argc) {
+      a.adapt_mode = argv[++i];
+    } else if (arg == "--adapt-interval" && i + 1 < argc) {
+      a.adapt_interval_seconds = to_double(argv[++i]);
+    } else if (arg == "--adapt-window" && i + 1 < argc) {
+      a.adapt_window_seconds = to_double(argv[++i]);
+    } else if (arg == "--adapt-min-samples" && i + 1 < argc) {
+      a.adapt_min_samples = to_int(argv[++i]);
     } else if (arg == "--rate-window" && i + 1 < argc) {
       a.reward_rate_window_seconds = to_double(argv[++i]);
     } else if (arg == "--reward-on-frames" && i + 1 < argc) {
       a.reward_on_frames = to_int(argv[++i]);
     } else if (arg == "--reward-off-frames" && i + 1 < argc) {
       a.reward_off_frames = to_int(argv[++i]);
+    } else if ((arg == "--threshold-hysteresis" || arg == "--hysteresis") && i + 1 < argc) {
+      a.threshold_hysteresis = to_double(argv[++i]);
+    } else if (arg == "--dwell" && i + 1 < argc) {
+      a.dwell_seconds = to_double(argv[++i]);
+    } else if (arg == "--refractory" && i + 1 < argc) {
+      a.refractory_seconds = to_double(argv[++i]);
+    } else if (arg == "--feedback-mode" && i + 1 < argc) {
+      a.feedback_mode = argv[++i];
+    } else if (arg == "--feedback-span" && i + 1 < argc) {
+      a.feedback_span = to_double(argv[++i]);
+    } else if (arg == "--train-block" && i + 1 < argc) {
+      a.train_block_seconds = to_double(argv[++i]);
+    } else if (arg == "--rest-block" && i + 1 < argc) {
+      a.rest_block_seconds = to_double(argv[++i]);
+    } else if (arg == "--start-rest") {
+      a.start_with_rest = true;
     } else if (arg == "--no-adaptation") {
       a.no_adaptation = true;
     } else if (arg == "--average-reference") {
@@ -275,6 +399,10 @@ static Args parse_args(int argc, char** argv) {
       a.bandpass_high_hz = to_double(argv[++i]);
     } else if (arg == "--chunk" && i + 1 < argc) {
       a.chunk_seconds = to_double(argv[++i]);
+    } else if (arg == "--realtime") {
+      a.playback_speed = 1.0;
+    } else if (arg == "--speed" && i + 1 < argc) {
+      a.playback_speed = to_double(argv[++i]);
     } else if (arg == "--export-bandpowers") {
       a.export_bandpowers = true;
     } else if (arg == "--export-coherence") {
@@ -347,36 +475,16 @@ static std::string resolve_out_path(const std::string& outdir, const std::string
   return path_or_name;
 }
 
-static std::string json_escape(const std::string& s) {
-  std::string out;
-  out.reserve(s.size() + 8);
-  for (char c : s) {
-    switch (c) {
-      case '\\': out += "\\\\"; break;
-      case '"': out += "\\\""; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default: {
-        const unsigned char uc = static_cast<unsigned char>(c);
-        if (uc < 0x20) {
-          char buf[7];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(uc));
-          out += buf;
-        } else {
-          out.push_back(c);
-        }
-      } break;
-    }
-  }
-  return out;
-}
 
 struct NfUiFrame {
   double t_end_sec{0.0};
   double metric{std::numeric_limits<double>::quiet_NaN()};
   double threshold{std::numeric_limits<double>::quiet_NaN()};
   int reward{0};
+  // Optional continuous feedback value in [0,1] (ungated). In binary mode, this is 0/1.
+  double feedback_raw{0.0};
+  // Optional continuous reinforcement value in [0,1] (reward-gated). In binary mode, this is 0/1.
+  double reward_value{0.0};
   double reward_rate{0.0};
 
   // Optional artifact info (only populated when the artifact engine is enabled).
@@ -425,6 +533,89 @@ struct BoolSegmentBuilder {
       out->push_back({start_sec, dur, label});
     }
     open = false;
+  }
+};
+
+// Optional pacing helper for offline playback.
+//
+// When enabled (speed>0), the caller can call wait_until(sim_time_sec) before
+// emitting each update to approximate real-time behavior.
+struct RealtimePacer {
+  bool enabled{false};
+  double speed{1.0}; // sim seconds per wall seconds
+  bool started{false};
+  std::chrono::steady_clock::time_point wall_start;
+  double max_lag_sec{0.0};
+  double total_sleep_sec{0.0};
+
+  explicit RealtimePacer(double playback_speed) {
+    if (std::isfinite(playback_speed) && playback_speed > 0.0) {
+      enabled = true;
+      speed = playback_speed;
+    }
+  }
+
+  void wait_until(double sim_time_sec) {
+    if (!enabled) return;
+    if (!std::isfinite(sim_time_sec)) return;
+    using clock = std::chrono::steady_clock;
+    if (!started) {
+      started = true;
+      wall_start = clock::now();
+    }
+
+    const double scaled = sim_time_sec / speed;
+    const auto target = wall_start + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(scaled));
+    const auto now = clock::now();
+    if (target > now) {
+      const auto d = target - now;
+      total_sleep_sec += std::chrono::duration<double>(d).count();
+      std::this_thread::sleep_for(d);
+    } else {
+      const double lag = std::chrono::duration<double>(now - target).count();
+      if (lag > max_lag_sec) max_lag_sec = lag;
+    }
+  }
+};
+
+// Lightweight run summary accumulator for nf_cli.
+struct NfSummaryStats {
+  // Only counts frames where the metric value is finite.
+  size_t baseline_frames{0};
+  size_t training_frames{0};
+  size_t rest_frames{0};
+  size_t artifact_frames{0};
+  size_t reward_frames{0};
+
+  // Continuous feedback statistics (reward_value in [0,1]).
+  //
+  // In binary mode this is equivalent to reward.
+  double reward_value_sum{0.0};
+  double reward_value_max{0.0};
+
+  // For continuous mode: the span (metric delta) used to map metric->reward_value.
+  double feedback_span_used{std::numeric_limits<double>::quiet_NaN()};
+  bool feedback_span_used_set{false};
+
+  RunningStats metric_stats; // training (non-artifact) frames
+  double metric_min{std::numeric_limits<double>::infinity()};
+  double metric_max{-std::numeric_limits<double>::infinity()};
+
+  double threshold_init{std::numeric_limits<double>::quiet_NaN()};
+  bool threshold_init_set{false};
+
+  void add_training_metric(double v) {
+    metric_stats.add(v);
+    if (std::isfinite(v)) {
+      if (v < metric_min) metric_min = v;
+      if (v > metric_max) metric_max = v;
+    }
+  }
+
+  void add_reward_value(double v) {
+    if (!std::isfinite(v)) return;
+    reward_value_sum += v;
+    if (v > reward_value_max) reward_value_max = v;
   }
 };
 
@@ -495,6 +686,8 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
       << "        <div class=\"big\" id=\"curMetric\">—</div>\n"
       << "        <div class=\"row\"><div class=\"k\">Threshold</div><div class=\"v\" id=\"curThreshold\">—</div></div>\n"
       << "        <div class=\"row\"><div class=\"k\">Reward</div><div class=\"v\" id=\"curReward\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Feedback</div><div class=\"v\" id=\"curFb\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Reinforcement</div><div class=\"v\" id=\"curRV\">—</div></div>\n"
       << "        <div class=\"row\"><div class=\"k\">Reward rate</div><div class=\"v\" id=\"curRR\">—</div></div>\n"
       << "        <div class=\"row\"><div class=\"k\">Artifacts</div><div class=\"v\" id=\"curArt\">—</div></div>\n"
       << "      </div>\n"
@@ -595,6 +788,10 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
     out << ",\"threshold\":";
     write_num_or_null(fr.threshold);
     out << ",\"reward\":" << fr.reward;
+    out << ",\"feedback_raw\":";
+    write_num_or_null(fr.feedback_raw);
+    out << ",\"reward_value\":";
+    write_num_or_null(fr.reward_value);
     out << ",\"reward_rate\":";
     write_num_or_null(fr.reward_rate);
     out << ",\"artifact_ready\":" << (include_artifacts ? fr.artifact_ready : 0);
@@ -656,6 +853,8 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
   const curMetric = document.getElementById('curMetric');
   const curThreshold = document.getElementById('curThreshold');
   const curReward = document.getElementById('curReward');
+  const curFb = document.getElementById('curFb');
+  const curRV = document.getElementById('curRV');
   const curRR = document.getElementById('curRR');
   const curArt = document.getElementById('curArt');
   const curT = document.getElementById('curT');
@@ -1101,6 +1300,8 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
     const f = frames[idx];
     const m = finiteOrNaN(f.metric);
     const th = finiteOrNaN(f.threshold);
+    const fb = finiteOrNaN(f.feedback_raw);
+    const rv = finiteOrNaN(f.reward_value);
     const rr = finiteOrNaN(f.reward_rate);
     curMetric.textContent = Number.isFinite(m) ? m.toPrecision(6) : '—';
     curThreshold.textContent = Number.isFinite(th) ? th.toPrecision(6) : '—';
@@ -1108,6 +1309,16 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
     const rOn = (Number(f.reward) === 1);
     curReward.textContent = rOn ? 'ON' : 'OFF';
     curReward.style.color = rOn ? 'var(--reward)' : 'var(--muted)';
+
+    if (curFb) {
+      curFb.textContent = Number.isFinite(fb) ? fb.toFixed(3) : '—';
+      curFb.style.color = (Number.isFinite(fb) && fb > 0) ? 'var(--accent)' : 'var(--muted)';
+    }
+
+    if (curRV) {
+      curRV.textContent = Number.isFinite(rv) ? rv.toFixed(3) : '—';
+      curRV.style.color = (Number.isFinite(rv) && rv > 0) ? 'var(--reward)' : 'var(--muted)';
+    }
 
     if (Number(data.meta.artifact_engine) === 1) {
       const ready = Number(f.artifact_ready) === 1;
@@ -1205,7 +1416,7 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
 
 
 static void write_reward_tone_wav_if_requested(const Args& args,
-                                              const std::vector<int>& reward_flags) {
+                                              const std::vector<float>& reward_values) {
   if (args.audio_wav.empty()) return;
   if (args.audio_rate <= 0) throw std::runtime_error("--audio-rate must be > 0");
   if (args.audio_tone_hz <= 0.0) throw std::runtime_error("--audio-tone must be > 0");
@@ -1219,56 +1430,197 @@ static void write_reward_tone_wav_if_requested(const Args& args,
   const int sr = args.audio_rate;
   const size_t seg = std::max<size_t>(1, static_cast<size_t>(std::llround(args.update_seconds * sr)));
 
-  const size_t attack = static_cast<size_t>(std::llround(args.audio_attack_sec * sr));
-  const size_t release = static_cast<size_t>(std::llround(args.audio_release_sec * sr));
-
   std::vector<float> mono;
-  mono.reserve(reward_flags.size() * seg);
+  mono.reserve(reward_values.size() * seg);
 
   const double two_pi = 2.0 * std::acos(-1.0);
   const double phase_inc = two_pi * args.audio_tone_hz / static_cast<double>(sr);
   double phase = 0.0;
 
-  // Generate contiguous runs of reward=1 as continuous tones with a simple attack/release envelope.
-  for (size_t i = 0; i < reward_flags.size(); ) {
-    if (reward_flags[i] == 0) {
-      mono.insert(mono.end(), seg, 0.0f);
-      ++i;
-      // Reset phase so re-started beeps are phase-aligned (also avoids large phase accumulation).
-      phase = 0.0;
-      continue;
-    }
+  // Attack/release smoothing at the audio sample rate.
+  //
+  // This keeps the audio click-free even when the NF update interval is coarse.
+  const double dt = 1.0 / static_cast<double>(sr);
+  const auto alpha_from_tau = [&](double tau_sec) {
+    if (!(std::isfinite(tau_sec) && tau_sec > 0.0)) return 1.0; // instantaneous
+    return dt / (tau_sec + dt);
+  };
+  const double a_attack = alpha_from_tau(args.audio_attack_sec);
+  const double a_release = alpha_from_tau(args.audio_release_sec);
 
-    size_t j = i;
-    while (j < reward_flags.size() && reward_flags[j] != 0) ++j;
-    const size_t run_frames = j - i;
-    const size_t run_samples = run_frames * seg;
+  double env = 0.0;
+  for (size_t i = 0; i < reward_values.size(); ++i) {
+    double target = static_cast<double>(reward_values[i]);
+    if (!std::isfinite(target)) target = 0.0;
+    if (target < 0.0) target = 0.0;
+    if (target > 1.0) target = 1.0;
+    target *= args.audio_gain;
 
-    for (size_t k = 0; k < run_samples; ++k) {
-      // Piecewise-linear envelope at the run boundaries.
-      double env = 1.0;
-      if (attack > 0 && k < attack) {
-        env = static_cast<double>(k) / static_cast<double>(attack);
-      }
-      if (release > 0 && k + release > run_samples) {
-        const size_t kr = run_samples - k;
-        const double e2 = static_cast<double>(kr) / static_cast<double>(release);
-        if (e2 < env) env = e2;
-      }
-      if (env < 0.0) env = 0.0;
-      if (env > 1.0) env = 1.0;
-
-      const float s = static_cast<float>(std::sin(phase) * (args.audio_gain * env));
+    for (size_t k = 0; k < seg; ++k) {
+      const double a = (target > env) ? a_attack : a_release;
+      env += (target - env) * a;
+      const float s = static_cast<float>(std::sin(phase) * env);
       mono.push_back(s);
       phase += phase_inc;
       if (phase > two_pi) phase -= two_pi;
     }
 
-    i = j;
+    // Reset phase when we're effectively silent so restarted tones are phase-aligned.
+    if (target == 0.0 && std::fabs(env) < 1e-6) phase = 0.0;
+  }
+
+  // Optional tail so the envelope can decay smoothly to silence.
+  const size_t tail = static_cast<size_t>(std::llround(args.audio_release_sec * sr));
+  for (size_t k = 0; k < tail; ++k) {
+    const double target = 0.0;
+    env += (target - env) * a_release;
+    const float s = static_cast<float>(std::sin(phase) * env);
+    mono.push_back(s);
+    phase += phase_inc;
+    if (phase > two_pi) phase -= two_pi;
   }
 
   write_wav_mono_pcm16(outpath, sr, mono);
   std::cout << "Wrote audio reward tone: " << outpath << "\n";
+}
+
+static void write_nf_summary_json(const Args& args,
+                                 const EEGRecording& rec,
+                                 const NfMetricSpec& metric,
+                                 const NfSummaryStats& stats,
+                                 double threshold_final,
+                                 const AdaptiveThresholdController& adapt,
+                                 const RealtimePacer& pacer,
+                                 double wall_elapsed_sec) {
+  (void)metric;
+  const std::string outpath = args.outdir + "/nf_summary.json";
+  std::ofstream out(outpath);
+  if (!out) {
+    std::cerr << "Warning: failed to write " << outpath << "\n";
+    return;
+  }
+
+  const double file_dur_sec = static_cast<double>(rec.n_samples()) / rec.fs_hz;
+  const double achieved_speed = (wall_elapsed_sec > 0.0) ? (file_dur_sec / wall_elapsed_sec)
+                                                        : std::numeric_limits<double>::quiet_NaN();
+
+  size_t valid_training_frames = stats.training_frames;
+  if (valid_training_frames >= stats.artifact_frames) valid_training_frames -= stats.artifact_frames;
+  else valid_training_frames = 0;
+  if (valid_training_frames >= stats.rest_frames) valid_training_frames -= stats.rest_frames;
+  else valid_training_frames = 0;
+  const double overall_reward_rate = (valid_training_frames > 0)
+                                      ? (static_cast<double>(stats.reward_frames) /
+                                         static_cast<double>(valid_training_frames))
+                                      : std::numeric_limits<double>::quiet_NaN();
+
+  const double reward_value_mean = (valid_training_frames > 0)
+                                    ? (stats.reward_value_sum / static_cast<double>(valid_training_frames))
+                                    : std::numeric_limits<double>::quiet_NaN();
+  const double reward_value_max = (valid_training_frames > 0)
+                                   ? stats.reward_value_max
+                                   : std::numeric_limits<double>::quiet_NaN();
+
+  auto jnum_or_null = [&](double v) {
+    if (std::isfinite(v)) out << v;
+    else out << "null";
+  };
+
+  out << std::setprecision(10);
+  out << "{\n";
+  out << "  \"Tool\": \"qeeg_nf_cli\",\n";
+  out << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+  out << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
+  out << "  \"input_path\": \"" << json_escape(args.input_path) << "\",\n";
+  out << "  \"fs_hz\": " << rec.fs_hz << ",\n";
+  out << "  \"file_duration_sec\": ";
+  jnum_or_null(file_dur_sec);
+  out << ",\n";
+  out << "  \"wall_elapsed_sec\": ";
+  jnum_or_null(wall_elapsed_sec);
+  out << ",\n";
+  out << "  \"playback_speed_arg\": " << args.playback_speed << ",\n";
+  out << "  \"achieved_speed_x\": ";
+  jnum_or_null(achieved_speed);
+  out << ",\n";
+  out << "  \"pacer_enabled\": " << (pacer.enabled ? "true" : "false") << ",\n";
+  out << "  \"pacer_max_lag_sec\": ";
+  jnum_or_null(pacer.max_lag_sec);
+  out << ",\n";
+  out << "  \"pacer_total_sleep_sec\": ";
+  jnum_or_null(pacer.total_sleep_sec);
+  out << ",\n";
+  out << "  \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
+  out << "  \"metric_smooth_seconds\": " << args.metric_smooth_seconds << ",\n";
+  out << "  \"threshold_hysteresis\": " << args.threshold_hysteresis << ",\n";
+  out << "  \"dwell_seconds\": " << args.dwell_seconds << ",\n";
+  out << "  \"refractory_seconds\": " << args.refractory_seconds << ",\n";
+  out << "  \"feedback_mode\": \"" << json_escape(to_lower(args.feedback_mode)) << "\",\n";
+  out << "  \"feedback_span_used\": ";
+  jnum_or_null(stats.feedback_span_used);
+  out << ",\n";
+  out << "  \"train_block_seconds\": " << args.train_block_seconds << ",\n";
+  out << "  \"rest_block_seconds\": " << args.rest_block_seconds << ",\n";
+  out << "  \"start_with_rest\": " << (args.start_with_rest ? "true" : "false") << ",\n";
+  out << "  \"baseline_seconds\": " << args.baseline_seconds << ",\n";
+  out << "  \"target_reward_rate\": " << args.target_reward_rate << ",\n";
+  out << "  \"adapt_mode\": \"" << json_escape(args.adapt_mode) << "\",\n";
+  out << "  \"adapt_eta\": " << args.adapt_eta << ",\n";
+  out << "  \"adapt_interval_seconds\": " << args.adapt_interval_seconds << ",\n";
+  out << "  \"adapt_window_seconds\": " << args.adapt_window_seconds << ",\n";
+  out << "  \"adapt_min_samples\": " << args.adapt_min_samples << ",\n";
+  out << "  \"no_adaptation\": " << (args.no_adaptation ? "true" : "false") << ",\n";
+  out << "  \"adapt_updates\": " << adapt.update_count() << ",\n";
+  out << "  \"adapt_target_quantile\": " << adapt.target_quantile() << ",\n";
+  out << "  \"adapt_last_desired_threshold\": ";
+  jnum_or_null(adapt.last_desired_threshold());
+  out << ",\n";
+  out << "  \"adapt_history_size_final\": " << adapt.history_size() << ",\n";
+
+  out << "  \"threshold_init\": ";
+  jnum_or_null(stats.threshold_init);
+  out << ",\n";
+  out << "  \"threshold_final\": ";
+  jnum_or_null(threshold_final);
+  out << ",\n";
+
+  out << "  \"frames\": {\n";
+  out << "    \"baseline\": " << stats.baseline_frames << ",\n";
+  out << "    \"training\": " << stats.training_frames << ",\n";
+  out << "    \"rest\": " << stats.rest_frames << ",\n";
+  out << "    \"artifact\": " << stats.artifact_frames << ",\n";
+  out << "    \"reward\": " << stats.reward_frames << "\n";
+  out << "  },\n";
+  out << "  \"valid_training_frames\": " << valid_training_frames << ",\n";
+  out << "  \"overall_reward_rate\": ";
+  jnum_or_null(overall_reward_rate);
+  out << ",\n";
+
+  out << "  \"reward_value_mean\": ";
+  jnum_or_null(reward_value_mean);
+  out << ",\n";
+  out << "  \"reward_value_max\": ";
+  jnum_or_null(reward_value_max);
+  out << ",\n";
+
+  out << "  \"metric_training\": {\n";
+  out << "    \"n\": " << stats.metric_stats.n() << ",\n";
+  out << "    \"mean\": ";
+  jnum_or_null(stats.metric_stats.mean());
+  out << ",\n";
+  out << "    \"stddev\": ";
+  jnum_or_null(stats.metric_stats.stddev_population());
+  out << ",\n";
+  out << "    \"min\": ";
+  jnum_or_null(std::isfinite(stats.metric_min) ? stats.metric_min : std::numeric_limits<double>::quiet_NaN());
+  out << ",\n";
+  out << "    \"max\": ";
+  jnum_or_null(std::isfinite(stats.metric_max) ? stats.metric_max : std::numeric_limits<double>::quiet_NaN());
+  out << "\n";
+  out << "  }\n";
+  out << "}\n";
+
+  std::cout << "Wrote NF summary: " << outpath << "\n";
 }
 
 
@@ -1303,6 +1655,22 @@ static void osc_send_info(OscUdpClient* osc, const std::string& prefix, const Ar
     OscMessage m_off(prefix + "/reward_off_frames");
     m_off.add_int32(args.reward_off_frames);
     osc->send(m_off);
+
+    if (args.threshold_hysteresis > 0.0) {
+      OscMessage m_h(prefix + "/threshold_hysteresis");
+      m_h.add_float32(static_cast<float>(args.threshold_hysteresis));
+      osc->send(m_h);
+    }
+
+    OscMessage m_fb(prefix + "/feedback_mode");
+    m_fb.add_string(to_lower(args.feedback_mode));
+    osc->send(m_fb);
+
+    if (std::isfinite(args.feedback_span)) {
+      OscMessage m_fbs(prefix + "/feedback_span");
+      m_fbs.add_float32(static_cast<float>(args.feedback_span));
+      osc->send(m_fbs);
+    }
 
     if (std::isfinite(args.initial_threshold)) {
       OscMessage m4(prefix + "/threshold_init");
@@ -1414,6 +1782,50 @@ static void osc_send_artifact(OscUdpClient* osc,
     OscMessage mb(prefix + "/artifact_bad_channels");
     mb.add_int32(static_cast<int>(fr.bad_channel_count));
     osc->send(mb);
+  } catch (...) {
+    // best-effort
+  }
+}
+
+static void osc_send_feedback_span_used(OscUdpClient* osc,
+                                        const std::string& prefix,
+                                        double span) {
+  if (!osc) return;
+  if (!std::isfinite(span)) return;
+  try {
+    OscMessage m(prefix + "/feedback_span_used");
+    m.add_float32(static_cast<float>(span));
+    osc->send(m);
+  } catch (...) {
+    // best-effort
+  }
+}
+
+static void osc_send_feedback_raw(OscUdpClient* osc,
+                                 const std::string& prefix,
+                                 double t_end_sec,
+                                 double feedback_raw) {
+  if (!osc) return;
+  try {
+    OscMessage m(prefix + "/feedback_raw");
+    m.add_float32(static_cast<float>(t_end_sec));
+    m.add_float32(static_cast<float>(feedback_raw));
+    osc->send(m);
+  } catch (...) {
+    // best-effort
+  }
+}
+
+static void osc_send_reward_value(OscUdpClient* osc,
+                                  const std::string& prefix,
+                                  double t_end_sec,
+                                  double reward_value) {
+  if (!osc) return;
+  try {
+    OscMessage m(prefix + "/reward_value");
+    m.add_float32(static_cast<float>(t_end_sec));
+    m.add_float32(static_cast<float>(reward_value));
+    osc->send(m);
   } catch (...) {
     // best-effort
   }
@@ -1632,11 +2044,52 @@ int main(int argc, char** argv) {
     if (args.adapt_eta < 0.0) {
       throw std::runtime_error("--eta must be >= 0");
     }
+
+    // Validate adaptation settings early so we fail fast on typos.
+    const AdaptMode adapt_mode = parse_adapt_mode(args.adapt_mode);
+    if (!std::isfinite(args.adapt_interval_seconds) || args.adapt_interval_seconds < 0.0) {
+      throw std::runtime_error("--adapt-interval must be a finite value >= 0");
+    }
+    if (!std::isfinite(args.adapt_window_seconds) || args.adapt_window_seconds < 0.0) {
+      throw std::runtime_error("--adapt-window must be a finite value >= 0");
+    }
+    if (args.adapt_min_samples < 1) {
+      throw std::runtime_error("--adapt-min-samples must be >= 1");
+    }
     if (args.reward_on_frames < 1) {
       throw std::runtime_error("--reward-on-frames must be >= 1");
     }
     if (args.reward_off_frames < 1) {
       throw std::runtime_error("--reward-off-frames must be >= 1");
+    }
+
+    if (!std::isfinite(args.threshold_hysteresis) || args.threshold_hysteresis < 0.0) {
+      throw std::runtime_error("--threshold-hysteresis must be a finite value >= 0");
+    }
+
+    if (!std::isfinite(args.dwell_seconds) || args.dwell_seconds < 0.0) {
+      throw std::runtime_error("--dwell must be a finite value >= 0");
+    }
+    if (!std::isfinite(args.refractory_seconds) || args.refractory_seconds < 0.0) {
+      throw std::runtime_error("--refractory must be a finite value >= 0");
+    }
+
+    const std::string fb_mode = to_lower(args.feedback_mode);
+    if (fb_mode != "binary" && fb_mode != "continuous") {
+      throw std::runtime_error("--feedback-mode must be 'binary' or 'continuous'");
+    }
+    if (std::isfinite(args.feedback_span) && args.feedback_span <= 0.0) {
+      throw std::runtime_error("--feedback-span must be a finite value > 0 (or omit it to auto-estimate)");
+    }
+
+    const bool want_blocks = (args.train_block_seconds > 0.0 || args.rest_block_seconds > 0.0);
+    if (want_blocks) {
+      if (!std::isfinite(args.train_block_seconds) || args.train_block_seconds <= 0.0) {
+        throw std::runtime_error("--train-block must be a finite value > 0 when block scheduling is enabled");
+      }
+      if (!std::isfinite(args.rest_block_seconds) || args.rest_block_seconds <= 0.0) {
+        throw std::runtime_error("--rest-block must be a finite value > 0 when block scheduling is enabled");
+      }
     }
     if (args.relative_power && (args.relative_fmin_hz != 0.0 || args.relative_fmax_hz != 0.0)) {
       if (args.relative_fmin_hz < 0.0) {
@@ -1648,6 +2101,17 @@ int main(int argc, char** argv) {
     }
     if (args.artifact_min_bad_channels < 1) {
       throw std::runtime_error("--artifact-min-bad-ch must be >= 1");
+    }
+
+    if (!std::isfinite(args.metric_smooth_seconds) || args.metric_smooth_seconds < 0.0) {
+      throw std::runtime_error("--metric-smooth must be a finite value >= 0");
+    }
+
+    // Playback pacing is opt-in: 0 => disabled. Any non-zero value must be > 0.
+    if (args.playback_speed != 0.0) {
+      if (!std::isfinite(args.playback_speed) || args.playback_speed <= 0.0) {
+        throw std::runtime_error("--speed must be a finite value > 0");
+      }
     }
 
     ensure_directory(args.outdir);
@@ -1666,6 +2130,67 @@ int main(int argc, char** argv) {
     std::cout << "Loaded recording: " << rec.n_channels() << " channels, "
               << rec.n_samples() << " samples, fs=" << rec.fs_hz << " Hz\n";
 
+    // Optional: load channel-level QC labels and use them to improve robustness.
+    // Cross-tool workflow:
+    //   qeeg_channel_qc_cli -> qeeg_nf_cli
+    bool have_qc = false;
+    std::string qc_resolved_path;
+    std::vector<char> qc_bad(rec.n_channels(), 0);
+    std::vector<std::string> qc_reasons(rec.n_channels());
+    std::vector<std::string> qc_bad_names;
+    qc_bad_names.reserve(rec.n_channels());
+    size_t qc_bad_count = 0;
+
+    if (!args.channel_qc.empty()) {
+      std::cout << "Loading channel QC: " << args.channel_qc << "\n";
+      ChannelQcMap qc = load_channel_qc_any(args.channel_qc, &qc_resolved_path);
+      have_qc = true;
+
+      for (size_t c = 0; c < rec.n_channels(); ++c) {
+        const std::string key = normalize_channel_name(rec.channel_names[c]);
+        const auto it = qc.find(key);
+        if (it != qc.end() && it->second.bad) {
+          qc_bad[c] = 1;
+          qc_reasons[c] = it->second.reasons;
+          qc_bad_names.push_back(rec.channel_names[c]);
+          ++qc_bad_count;
+        }
+      }
+
+      std::cout << "Channel QC loaded from: " << qc_resolved_path
+                << " (" << qc_bad_count << "/" << rec.n_channels() << " channels marked bad)\n";
+
+      // Persist the applied mask for provenance.
+      const std::string bad_out = args.outdir + "/bad_channels_used.txt";
+      std::ofstream bout(bad_out);
+      if (!bout) {
+        std::cerr << "Warning: failed to write bad_channels_used.txt to: " << bad_out << "\n";
+      } else {
+        for (size_t c = 0; c < rec.n_channels(); ++c) {
+          if (!qc_bad[c]) continue;
+          bout << rec.channel_names[c];
+          if (!qc_reasons[c].empty()) bout << "\t" << qc_reasons[c];
+          bout << "\n";
+        }
+      }
+    }
+
+    // Merge artifact-ignore list with QC bad channels (deduplicated by normalized name).
+    std::vector<std::string> artifact_ignore = args.artifact_ignore_channels;
+    if (have_qc && !qc_bad_names.empty()) {
+      artifact_ignore.insert(artifact_ignore.end(), qc_bad_names.begin(), qc_bad_names.end());
+      std::unordered_set<std::string> seen;
+      seen.reserve(artifact_ignore.size());
+      std::vector<std::string> uniq;
+      uniq.reserve(artifact_ignore.size());
+      for (const auto& nm : artifact_ignore) {
+        const std::string key = normalize_channel_name(nm);
+        if (key.empty()) continue;
+        if (seen.insert(key).second) uniq.push_back(nm);
+      }
+      artifact_ignore.swap(uniq);
+    }
+
     // Convenience: write run parameters to JSON for easy downstream parsing.
     {
       const std::string meta_path = args.outdir + "/nf_run_meta.json";
@@ -1674,8 +2199,52 @@ int main(int argc, char** argv) {
         std::cerr << "Warning: failed to write " << meta_path << "\n";
       } else {
         meta << "{\n";
+        const bool derived_events_written = (args.biotrace_ui || args.export_derived_events);
+        meta << "  \"Tool\": \"qeeg_nf_cli\",\n";
+        meta << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+        meta << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
+        meta << "  \"Outputs\": [\n";
+        bool first_out = true;
+        auto emit_out = [&](const std::string& rel) {
+          if (!first_out) meta << ",\n";
+          first_out = false;
+          meta << "    \"" << json_escape(rel) << "\"";
+        };
+        emit_out("nf_run_meta.json");
+        emit_out("nf_feedback.csv");
+        emit_out("nf_summary.json");
+        if (have_qc) emit_out("bad_channels_used.txt");
+        if (args.export_artifacts) emit_out("artifact_gate_timeseries.csv");
+        if (args.export_bandpowers) emit_out("bandpower_timeseries.csv");
+        if (args.export_coherence) {
+          emit_out("coherence_timeseries.csv");
+          emit_out("imcoh_timeseries.csv");
+        }
+        if (derived_events_written) {
+          emit_out("nf_derived_events.csv");
+          emit_out("nf_derived_events.tsv");
+          emit_out("nf_derived_events.json");
+        }
+        if (args.biotrace_ui) emit_out("biotrace_ui.html");
+        meta << "\n  ],\n";
         meta << "  \"demo\": " << (args.demo ? "true" : "false") << ",\n";
         meta << "  \"input_path\": \"" << json_escape(args.input_path) << "\",\n";
+        meta << "  \"channel_qc\": ";
+        if (!args.channel_qc.empty()) meta << "\"" << json_escape(args.channel_qc) << "\"";
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"channel_qc_resolved\": ";
+        if (have_qc) meta << "\"" << json_escape(qc_resolved_path) << "\"";
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"qc_bad_channel_count\": " << qc_bad_count << ",\n";
+        meta << "  \"qc_bad_channels\": [";
+        for (size_t i = 0; i < qc_bad_names.size(); ++i) {
+          if (i) meta << ", ";
+          meta << "\"" << json_escape(qc_bad_names[i]) << "\"";
+        }
+        meta << "],\n";
+        meta << "  \"allow_bad_metric_channels\": " << (args.allow_bad_metric_channels ? "true" : "false") << ",\n";
         meta << "  \"fs_hz\": " << rec.fs_hz << ",\n";
         meta << "  \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
         meta << "  \"band_spec\": \"" << json_escape(args.band_spec) << "\",\n";
@@ -1692,11 +2261,28 @@ int main(int argc, char** argv) {
         meta << "  \"baseline_quantile_used\": " << baseline_quantile_used(args) << ",\n";
         meta << "  \"target_reward_rate\": " << args.target_reward_rate << ",\n";
         meta << "  \"adapt_eta\": " << args.adapt_eta << ",\n";
+        meta << "  \"adapt_mode\": \"" << json_escape(args.adapt_mode) << "\",\n";
+        meta << "  \"adapt_interval_seconds\": " << args.adapt_interval_seconds << ",\n";
+        meta << "  \"adapt_window_seconds\": " << args.adapt_window_seconds << ",\n";
+        meta << "  \"adapt_min_samples\": " << args.adapt_min_samples << ",\n";
         meta << "  \"reward_rate_window_seconds\": " << args.reward_rate_window_seconds << ",\n";
         meta << "  \"reward_on_frames\": " << args.reward_on_frames << ",\n";
         meta << "  \"reward_off_frames\": " << args.reward_off_frames << ",\n";
+        meta << "  \"threshold_hysteresis\": " << args.threshold_hysteresis << ",\n";
+        meta << "  \"dwell_seconds\": " << args.dwell_seconds << ",\n";
+        meta << "  \"refractory_seconds\": " << args.refractory_seconds << ",\n";
+        meta << "  \"feedback_mode\": \"" << json_escape(args.feedback_mode) << "\",\n";
+        meta << "  \"feedback_span\": ";
+        if (std::isfinite(args.feedback_span)) meta << args.feedback_span;
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"train_block_seconds\": " << args.train_block_seconds << ",\n";
+        meta << "  \"rest_block_seconds\": " << args.rest_block_seconds << ",\n";
+        meta << "  \"start_with_rest\": " << (args.start_with_rest ? "true" : "false") << ",\n";
         meta << "  \"window_seconds\": " << args.window_seconds << ",\n";
         meta << "  \"update_seconds\": " << args.update_seconds << ",\n";
+        meta << "  \"metric_smooth_seconds\": " << args.metric_smooth_seconds << ",\n";
+        meta << "  \"playback_speed\": " << args.playback_speed << ",\n";
         meta << "  \"nperseg\": " << args.nperseg << ",\n";
         meta << "  \"log10_power\": " << (args.log10_power ? "true" : "false") << ",\n";
         meta << "  \"relative_power\": " << (args.relative_power ? "true" : "false") << ",\n";
@@ -1709,12 +2295,11 @@ int main(int argc, char** argv) {
         meta << "  \"artifact_kurtosis_z\": " << args.artifact_kurtosis_z << ",\n";
         meta << "  \"artifact_min_bad_channels\": " << args.artifact_min_bad_channels << ",\n";
         meta << "  \"artifact_ignore_channels\": [";
-        for (size_t i = 0; i < args.artifact_ignore_channels.size(); ++i) {
+        for (size_t i = 0; i < artifact_ignore.size(); ++i) {
           if (i) meta << ", ";
-          meta << "\"" << json_escape(args.artifact_ignore_channels[i]) << "\"";
+          meta << "\"" << json_escape(artifact_ignore[i]) << "\"";
         }
         meta << "],\n";
-        const bool derived_events_written = (args.biotrace_ui || args.export_derived_events);
         meta << "  \"biotrace_ui\": " << (args.biotrace_ui ? "true" : "false") << ",\n";
         meta << "  \"export_derived_events\": " << (args.export_derived_events ? "true" : "false") << ",\n";
         meta << "  \"derived_events_written\": " << (derived_events_written ? "true" : "false") << ",\n";
@@ -1723,6 +2308,9 @@ int main(int argc, char** argv) {
              << ",\n";
         meta << "  \"derived_events_tsv\": "
              << (derived_events_written ? "\"" + json_escape("nf_derived_events.tsv") + "\"" : "null")
+             << ",\n";
+        meta << "  \"derived_events_json\": "
+             << (derived_events_written ? "\"" + json_escape("nf_derived_events.json") + "\"" : "null")
              << "\n";
         meta << "}\n";
       }
@@ -1783,6 +2371,35 @@ int main(int argc, char** argv) {
     const std::vector<BandDefinition> bands = parse_band_spec(args.band_spec);
     const NfMetricSpec metric = parse_nf_metric_spec(args.metric_spec);
 
+    // If channel QC is provided, optionally fail fast when the selected metric uses bad channels.
+    auto qc_is_bad = [&](int idx) -> bool {
+      return have_qc && idx >= 0 && static_cast<size_t>(idx) < qc_bad.size() && qc_bad[static_cast<size_t>(idx)];
+    };
+
+    if (have_qc) {
+      std::vector<std::string> bad_metric_channels;
+      if (metric.type == NfMetricSpec::Type::Coherence) {
+        const int ia = find_channel_index(rec.channel_names, metric.channel_a);
+        const int ib = find_channel_index(rec.channel_names, metric.channel_b);
+        if (qc_is_bad(ia)) bad_metric_channels.push_back(rec.channel_names[static_cast<size_t>(ia)]);
+        if (qc_is_bad(ib)) bad_metric_channels.push_back(rec.channel_names[static_cast<size_t>(ib)]);
+      } else {
+        const int ich = find_channel_index(rec.channel_names, metric.channel);
+        if (qc_is_bad(ich)) bad_metric_channels.push_back(rec.channel_names[static_cast<size_t>(ich)]);
+      }
+
+      if (!bad_metric_channels.empty()) {
+        std::string msg = "NF metric uses channel(s) marked bad by channel QC:";
+        for (const auto& ch : bad_metric_channels) msg += " " + ch;
+        msg += " (use --allow-bad-metric-channels to override)";
+        if (args.allow_bad_metric_channels) {
+          std::cerr << "Warning: " << msg << "\n";
+        } else {
+          throw std::runtime_error(msg);
+        }
+      }
+    }
+
     if ((args.log10_power || args.relative_power) &&
         (metric.type != NfMetricSpec::Type::Band && metric.type != NfMetricSpec::Type::Ratio)) {
       throw std::runtime_error("--log10 / --relative are only supported for bandpower and ratio metrics");
@@ -1793,6 +2410,8 @@ int main(int argc, char** argv) {
     if (!out) throw std::runtime_error("Failed to write nf_feedback.csv");
 
     const bool do_artifacts = args.artifact_gate || args.export_artifacts;
+    const std::string feedback_mode = to_lower(args.feedback_mode);
+    const bool continuous_feedback = (feedback_mode == "continuous");
 
     // Cross-tool integration: optionally export derived events (reward/artifact/baseline)
     // as duration annotations that can be consumed by trace_plot_cli / export_bids_cli.
@@ -1801,10 +2420,39 @@ int main(int argc, char** argv) {
     if (want_derived_events) derived_events.reserve(512);
     BoolSegmentBuilder reward_seg("NF:Reward");
     BoolSegmentBuilder artifact_seg("NF:Artifact");
+    BoolSegmentBuilder train_seg("NF:Train");
+    BoolSegmentBuilder rest_seg("NF:Rest");
     double prev_frame_end_sec = std::numeric_limits<double>::quiet_NaN();
     double last_frame_end_sec = std::numeric_limits<double>::quiet_NaN();
 
-    auto derived_update = [&](double t_end_sec, bool reward_on, bool artifact_on) {
+    enum class NfPhase { Baseline, Train, Rest };
+    auto phase_name = [&](NfPhase p) -> const char* {
+      switch (p) {
+        case NfPhase::Baseline: return "baseline";
+        case NfPhase::Train: return "train";
+        case NfPhase::Rest: return "rest";
+      }
+      return "unknown";
+    };
+
+    const bool blocks_enabled = (args.train_block_seconds > 0.0 && args.rest_block_seconds > 0.0);
+    const double schedule_start_sec = std::isfinite(args.initial_threshold) ? 0.0 : args.baseline_seconds;
+    auto phase_of = [&](double t_end_sec) -> NfPhase {
+      if (!std::isfinite(t_end_sec) || t_end_sec < 0.0) t_end_sec = 0.0;
+      if (t_end_sec < schedule_start_sec) return NfPhase::Baseline;
+      if (!blocks_enabled) return NfPhase::Train;
+      const double cycle = args.train_block_seconds + args.rest_block_seconds;
+      if (!(cycle > 0.0)) return NfPhase::Train;
+      const double trel = t_end_sec - schedule_start_sec;
+      const double m = std::fmod(trel, cycle);
+      const double mm = (m < 0.0) ? (m + cycle) : m;
+      if (args.start_with_rest) {
+        return (mm < args.rest_block_seconds) ? NfPhase::Rest : NfPhase::Train;
+      }
+      return (mm < args.train_block_seconds) ? NfPhase::Train : NfPhase::Rest;
+    };
+
+    auto derived_update = [&](double t_end_sec, bool reward_on, bool artifact_on, NfPhase phase) {
       if (!want_derived_events) return;
       double frame_end = t_end_sec;
       double frame_start = std::isfinite(prev_frame_end_sec) ? prev_frame_end_sec : (frame_end - args.update_seconds);
@@ -1814,6 +2462,11 @@ int main(int argc, char** argv) {
       reward_seg.update(reward_on, frame_start, frame_end, &derived_events);
       if (do_artifacts) {
         artifact_seg.update(artifact_on, frame_start, frame_end, &derived_events);
+      }
+      // Training/rest schedule segments are useful for offline training and for downstream annotation.
+      if (blocks_enabled) {
+        train_seg.update(phase == NfPhase::Train, frame_start, frame_end, &derived_events);
+        rest_seg.update(phase == NfPhase::Rest, frame_start, frame_end, &derived_events);
       }
       prev_frame_end_sec = frame_end;
       last_frame_end_sec = frame_end;
@@ -1825,6 +2478,10 @@ int main(int argc, char** argv) {
       const double end_sec = std::isfinite(last_frame_end_sec) ? last_frame_end_sec : file_dur;
       reward_seg.finish(end_sec, &derived_events);
       if (do_artifacts) artifact_seg.finish(end_sec, &derived_events);
+      if (blocks_enabled) {
+        train_seg.finish(end_sec, &derived_events);
+        rest_seg.finish(end_sec, &derived_events);
+      }
 
       // Mark the initial threshold estimation baseline period (only when threshold is not forced).
       if (!std::isfinite(args.initial_threshold) && args.baseline_seconds > 0.0) {
@@ -1842,10 +2499,17 @@ int main(int argc, char** argv) {
       if (args.export_derived_events || args.biotrace_ui) {
         const std::string p_csv = args.outdir + "/nf_derived_events.csv";
         const std::string p_tsv = args.outdir + "/nf_derived_events.tsv";
+        const std::string p_json = args.outdir + "/nf_derived_events.json";
         write_events_csv(p_csv, derived_events);
         write_events_tsv(p_tsv, derived_events);
+        // BIDS-style sidecar describing columns (and trial_type Levels).
+        BidsEventsTsvOptions ev_opt;
+        ev_opt.include_trial_type = true;
+        ev_opt.include_trial_type_levels = true;
+        write_bids_events_json(p_json, ev_opt, derived_events);
         std::cout << "Wrote derived events: " << p_csv << " (" << derived_events.size() << ")" << std::endl;
         std::cout << "Wrote derived events: " << p_tsv << " (" << derived_events.size() << ")" << std::endl;
+        std::cout << "Wrote derived events: " << p_json << " (" << derived_events.size() << ")" << std::endl;
       }
     };
 
@@ -1854,13 +2518,16 @@ int main(int argc, char** argv) {
     ui_frames.reserve(4096);
 
     auto ui_push = [&](double t_end_sec, double metric_val, double thr, bool thr_ready,
-                       int reward, double rr, const OnlineArtifactFrame& af) {
+                       double feedback_raw, double reward_value, int reward, double rr,
+                       const OnlineArtifactFrame& af) {
       if (!args.biotrace_ui) return;
       NfUiFrame uf;
       uf.t_end_sec = t_end_sec;
       uf.metric = metric_val;
       uf.threshold = thr_ready ? thr : std::numeric_limits<double>::quiet_NaN();
       uf.reward = reward;
+      uf.feedback_raw = feedback_raw;
+      uf.reward_value = reward_value;
       uf.reward_rate = rr;
       if (do_artifacts) {
         uf.artifact_ready = af.baseline_ready ? 1 : 0;
@@ -1874,6 +2541,13 @@ int main(int argc, char** argv) {
     if (do_artifacts) {
       out << ",artifact_ready,artifact,bad_channels";
     }
+    if (blocks_enabled) {
+      out << ",phase";
+    }
+    const bool want_raw_reward_col = (args.dwell_seconds > 0.0 || args.refractory_seconds > 0.0);
+    if (want_raw_reward_col) {
+      out << ",raw_reward";
+    }
     if (metric.type == NfMetricSpec::Type::Band) {
       out << ",band,channel";
     } else if (metric.type == NfMetricSpec::Type::Ratio) {
@@ -1882,6 +2556,16 @@ int main(int argc, char** argv) {
       out << ",band,channel_a,channel_b,measure";
     } else {
       out << ",phase_band,amp_band,channel,method";
+    }
+
+    if (adapt_mode == AdaptMode::Quantile) {
+      out << ",threshold_desired";
+    }
+    if (args.metric_smooth_seconds > 0.0) {
+      out << ",metric_raw";
+    }
+    if (continuous_feedback) {
+      out << ",feedback_raw,reward_value";
     }
     out << "\n";
 
@@ -1906,6 +2590,9 @@ int main(int argc, char** argv) {
                               static_cast<size_t>(args.reward_off_frames),
                               /*initial_state=*/false);
 
+    // Optional numeric hysteresis band around the threshold to reduce chatter.
+    HysteresisGate thr_hyst(args.threshold_hysteresis, args.reward_direction, /*initial_state=*/false);
+
     auto reward_rate = [&]() {
       if (reward_hist.empty()) return 0.0;
       int sum = 0;
@@ -1913,9 +2600,64 @@ int main(int argc, char** argv) {
       return static_cast<double>(sum) / static_cast<double>(reward_hist.size());
     };
 
-    // Optional audio export: one 0/1 flag per emitted NF update (including baseline frames).
-    std::vector<int> audio_reward_flags;
-    audio_reward_flags.reserve(1024);
+    RewardShaper reward_shaper(args.dwell_seconds, args.refractory_seconds);
+    double prev_shaper_time = std::numeric_limits<double>::quiet_NaN();
+    auto shaper_dt = [&](double t_end_sec) -> double {
+      double dt = args.update_seconds;
+      if (std::isfinite(prev_shaper_time) && std::isfinite(t_end_sec)) {
+        const double d = t_end_sec - prev_shaper_time;
+        if (std::isfinite(d) && d > 0.0) dt = d;
+      }
+      prev_shaper_time = t_end_sec;
+      return dt;
+    };
+    auto shape_reward = [&](bool raw_reward, double t_end_sec, bool freeze) -> bool {
+      return reward_shaper.update(raw_reward, shaper_dt(t_end_sec), t_end_sec, freeze);
+    };
+    auto append_phase_and_raw = [&](NfPhase phase, bool raw_reward) {
+      if (blocks_enabled) {
+        out << "," << phase_name(phase);
+      }
+      if (want_raw_reward_col) {
+        out << "," << (raw_reward ? 1 : 0);
+      }
+    };
+
+    AdaptiveThresholdConfig adapt_cfg;
+    adapt_cfg.mode = adapt_mode;
+    adapt_cfg.reward_direction = args.reward_direction;
+    adapt_cfg.target_reward_rate = args.target_reward_rate;
+    adapt_cfg.eta = args.adapt_eta;
+    adapt_cfg.update_interval_seconds = args.adapt_interval_seconds;
+    adapt_cfg.quantile_window_seconds = args.adapt_window_seconds;
+    adapt_cfg.quantile_min_samples = static_cast<size_t>(std::max(1, args.adapt_min_samples));
+    AdaptiveThresholdController adapt_ctrl(adapt_cfg);
+    double feedback_span_used = std::numeric_limits<double>::quiet_NaN();
+    bool feedback_span_ready = false;
+    if (continuous_feedback && std::isfinite(args.feedback_span) && args.feedback_span > 0.0) {
+      feedback_span_used = args.feedback_span;
+      feedback_span_ready = true;
+    }
+
+    if (!args.no_adaptation && args.adapt_eta > 0.0) {
+      std::cout << "Adaptive threshold: mode=" << adapt_mode_name(adapt_cfg.mode)
+                << ", eta=" << args.adapt_eta;
+      if (adapt_cfg.mode == AdaptMode::Quantile) {
+        std::cout << ", window=" << adapt_cfg.quantile_window_seconds
+                  << "s, min_samples=" << adapt_cfg.quantile_min_samples;
+      }
+      if (args.adapt_interval_seconds > 0.0) {
+        std::cout << ", interval=" << args.adapt_interval_seconds << "s";
+      }
+      std::cout << "\n";
+    }
+
+    // Optional audio export: one feedback value per emitted NF update (including baseline frames).
+    //
+    // - binary feedback => values are 0/1
+    // - continuous feedback => values are in [0,1] (gated by reward)
+    std::vector<float> audio_reward_values;
+    audio_reward_values.reserve(1024);
 
     // Optional artifact engine (aligned to NF updates).
     std::unique_ptr<OnlineArtifactGate> artifact_gate;
@@ -1932,7 +2674,7 @@ int main(int argc, char** argv) {
       aopt.rms_z = args.artifact_rms_z;
       aopt.kurtosis_z = args.artifact_kurtosis_z;
       aopt.min_bad_channels = static_cast<size_t>(args.artifact_min_bad_channels);
-      aopt.ignore_channels = args.artifact_ignore_channels;
+      aopt.ignore_channels = artifact_ignore;
       artifact_gate = std::make_unique<OnlineArtifactGate>(rec.channel_names, rec.fs_hz, aopt);
       art = artifact_gate.get();
       if (args.export_artifacts) {
@@ -1946,6 +2688,61 @@ int main(int argc, char** argv) {
 
     const size_t chunk_samples = std::max<size_t>(1, sec_to_samples(args.chunk_seconds, rec.fs_hz));
     std::vector<std::vector<float>> block(rec.n_channels());
+
+    // Optional offline real-time pacing / metric smoothing.
+    RealtimePacer pacer(args.playback_speed);
+    const auto wall_start = std::chrono::steady_clock::now();
+
+    const bool do_smooth = (args.metric_smooth_seconds > 0.0);
+    ExponentialSmoother smoother(args.metric_smooth_seconds);
+    double prev_metric_time = std::numeric_limits<double>::quiet_NaN();
+
+    NfSummaryStats summary;
+    if (have_threshold) {
+      summary.threshold_init = threshold;
+      summary.threshold_init_set = true;
+    }
+    if (feedback_span_ready) {
+      summary.feedback_span_used = feedback_span_used;
+      summary.feedback_span_used_set = true;
+    }
+
+    auto smooth_metric = [&](double raw, double t_end_sec, bool freeze) -> double {
+      // Track dt between updates for proper time-constant behavior.
+      double dt = args.update_seconds;
+      if (std::isfinite(prev_metric_time) && std::isfinite(t_end_sec)) {
+        const double d = t_end_sec - prev_metric_time;
+        if (std::isfinite(d) && d > 0.0) dt = d;
+      }
+      prev_metric_time = t_end_sec;
+
+      // Never convert invalid raw values into a "valid" smoothed value.
+      if (!std::isfinite(raw)) return raw;
+
+      if (!do_smooth) {
+        return raw;
+      }
+      if (freeze) {
+        // Hold the previous smoothed value during artifacts.
+        return smoother.has_value() ? smoother.value() : raw;
+      }
+      return smoother.update(raw, dt);
+    };
+
+    auto append_feedback_optional_cols = [&](double metric_raw) {
+      if (adapt_mode == AdaptMode::Quantile) {
+        out << "," << adapt_ctrl.last_desired_threshold();
+      }
+      if (do_smooth) {
+        out << "," << metric_raw;
+      }
+    };
+
+    auto append_reward_value_cols = [&](double feedback_raw, double reward_value) {
+      if (continuous_feedback) {
+        out << "," << feedback_raw << "," << reward_value;
+      }
+    };
 
     if (metric.type == NfMetricSpec::Type::Coherence) {
       // Resolve pair indices from the recording.
@@ -2026,23 +2823,64 @@ int main(int argc, char** argv) {
           const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
           const bool artifact_state = (do_artifacts && af.baseline_ready && af.bad);
 
-          const double val = fr.coherences[static_cast<size_t>(b_idx)][0];
+          const double val_raw = fr.coherences[static_cast<size_t>(b_idx)][0];
+          const double val = smooth_metric(val_raw, fr.t_end_sec, artifact_hit);
+
+          const NfPhase phase = phase_of(fr.t_end_sec);
+
+          // Optional pacing for interactive offline runs (OSC / UI watchers).
+          pacer.wait_until(fr.t_end_sec);
+
           if (!std::isfinite(val)) {
+            (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
             reward_gate.reset(false);
-            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+            thr_hyst.reset(false);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
             if (art) osc_send_artifact(osc, osc_prefix, af);
-            audio_reward_flags.push_back(0);
+            audio_reward_values.push_back(0);
             continue;
           }
 
           if (!have_threshold) {
+            (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
             reward_gate.reset(false);
+            thr_hyst.reset(false);
             if (fr.t_end_sec <= args.baseline_seconds) {
-              baseline_values.push_back(val);
+              ++summary.baseline_frames;
+              // If artifact gating is enabled, avoid contaminating the baseline estimate.
+              if (!artifact_hit) {
+                baseline_values.push_back(val);
+              }
             } else {
               double q_used = 0.5;
               threshold = initial_threshold_from_baseline(args, baseline_values, val, &q_used);
               have_threshold = true;
+              if (!summary.threshold_init_set) {
+                summary.threshold_init = threshold;
+                summary.threshold_init_set = true;
+              }
+
+              if (continuous_feedback && !feedback_span_ready) {
+                if (!baseline_values.empty()) {
+                  std::vector<double> tmp = baseline_values;
+                  const double med = median_inplace(tmp);
+                  const double sc = robust_scale(baseline_values, med);
+                  if (std::isfinite(sc) && sc > 0.0) {
+                    feedback_span_used = sc;
+                  } else {
+                    feedback_span_used = 1.0;
+                    std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
+                  }
+                } else {
+                  feedback_span_used = 1.0;
+                  std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+                }
+                feedback_span_ready = true;
+                summary.feedback_span_used = feedback_span_used;
+                summary.feedback_span_used_set = true;
+                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+                std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
+              }
               std::cout << "Initial threshold set to: " << threshold
                         << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
                         << ", n=" << baseline_values.size() << ")\n";
@@ -2051,20 +2889,30 @@ int main(int argc, char** argv) {
             osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,
                           have_threshold ? 1 : 0);
             if (art) osc_send_artifact(osc, osc_prefix, af);
-            audio_reward_flags.push_back(0);
-            ui_push(fr.t_end_sec, val, threshold, have_threshold, /*reward=*/0, /*rr=*/0.0, af);
-            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+            audio_reward_values.push_back(0);
+            ui_push(fr.t_end_sec, val, threshold, have_threshold, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, /*rr=*/0.0, af);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
             continue;
           }
 
           if (artifact_hit) {
+            (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
             reward_gate.reset(false);
+            thr_hyst.reset(false);
+            ++summary.training_frames;
+            ++summary.artifact_frames;
+            if (phase == NfPhase::Rest) ++summary.rest_frames;
+            summary.add_reward_value(0.0);
+            reward_hist.push_back(0);
+            while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
             const double rr = reward_rate();
             osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
                           0, rr, 1);
             if (art) osc_send_artifact(osc, osc_prefix, af);
-            audio_reward_flags.push_back(0);
-            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+            audio_reward_values.push_back(0);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+
+            adapt_ctrl.prune(fr.t_end_sec);
 
             out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
             if (do_artifacts) {
@@ -2072,44 +2920,117 @@ int main(int argc, char** argv) {
                   << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
                   << "," << af.bad_channel_count;
             }
+            append_phase_and_raw(phase, /*raw_reward=*/false);
             out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
                 << "," << coherence_measure_name(metric.coherence_measure);
+            append_feedback_optional_cols(val_raw);
+            append_reward_value_cols(0.0, 0.0);
             out << "\n";
-            ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/0, rr, af);
+            ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
           }
 
-          const bool raw_reward = is_reward(val, threshold, args.reward_direction);
-          const bool reward = reward_gate.update(raw_reward);
-          derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state);
-          audio_reward_flags.push_back(reward ? 1 : 0);
+          if (phase == NfPhase::Rest) {
+            // During rest blocks, keep displaying metrics but pause reinforcement and adaptation.
+            (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
+            reward_gate.reset(false);
+            thr_hyst.reset(false);
+            ++summary.training_frames;
+            ++summary.rest_frames;
+            summary.add_reward_value(0.0);
+            reward_hist.push_back(0);
+            while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
+            const double rr = reward_rate();
+
+            osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                          0, rr, 1);
+            if (art) osc_send_artifact(osc, osc_prefix, af);
+            audio_reward_values.push_back(0);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+
+            adapt_ctrl.prune(fr.t_end_sec);
+
+            out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
+            if (do_artifacts) {
+              out << "," << (af.baseline_ready ? 1 : 0)
+                  << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                  << "," << af.bad_channel_count;
+            }
+            append_phase_and_raw(phase, /*raw_reward=*/false);
+            out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
+                << "," << coherence_measure_name(metric.coherence_measure);
+            append_feedback_optional_cols(val_raw);
+            append_reward_value_cols(0.0, 0.0);
+            out << "\n";
+            ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
+            continue;
+          }
+
+          ++summary.training_frames;
+          summary.add_training_metric(val);
+
+          const double thr_used = threshold;
+          const bool raw_reward = thr_hyst.update(val, thr_used);
+          const bool shaped_raw = shape_reward(raw_reward, fr.t_end_sec, /*freeze=*/false);
+          const bool reward = reward_gate.update(shaped_raw);
+          derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state, phase);
+          if (reward) ++summary.reward_frames;
+          if (continuous_feedback && (!feedback_span_ready || !std::isfinite(feedback_span_used) || feedback_span_used <= 0.0)) {
+            feedback_span_used = 1.0;
+            feedback_span_ready = true;
+            summary.feedback_span_used = feedback_span_used;
+            summary.feedback_span_used_set = true;
+            osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+            std::cerr << "Warning: feedback_span was not initialized; using 1.0\n";
+          }
+
+          const double feedback_raw = continuous_feedback
+                                        ? feedback_value(val, thr_used, args.reward_direction, feedback_span_used)
+                                        : (raw_reward ? 1.0 : 0.0);
+          const double reward_value = continuous_feedback ? (reward ? feedback_raw : 0.0) : (reward ? 1.0 : 0.0);
+          summary.add_reward_value(reward_value);
+          audio_reward_values.push_back(static_cast<float>(reward_value));
           reward_hist.push_back(reward ? 1 : 0);
           while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
           const double rr = reward_rate();
 
+          // Collect training samples for quantile adaptation (noop for other modes).
+          adapt_ctrl.observe(fr.t_end_sec, val);
+
           if (!args.no_adaptation && args.adapt_eta > 0.0) {
-            threshold = adapt_threshold(threshold, rr, args.target_reward_rate, args.adapt_eta, args.reward_direction);
+            threshold = adapt_ctrl.update(thr_used, rr, fr.t_end_sec);
           }
 
-          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_used,
                         (reward ? 1 : 0), rr, 1);
           if (art) osc_send_artifact(osc, osc_prefix, af);
+          if (continuous_feedback) {
+            osc_send_feedback_raw(osc, osc_prefix, fr.t_end_sec, feedback_raw);
+            osc_send_reward_value(osc, osc_prefix, fr.t_end_sec, reward_value);
+          }
 
-          out << fr.t_end_sec << "," << val << "," << threshold << "," << (reward ? 1 : 0) << "," << rr;
+          out << fr.t_end_sec << "," << val << "," << thr_used << "," << (reward ? 1 : 0) << "," << rr;
           if (do_artifacts) {
             out << "," << (af.baseline_ready ? 1 : 0)
                 << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
                 << "," << af.bad_channel_count;
           }
+          append_phase_and_raw(phase, raw_reward);
           out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
-                << "," << coherence_measure_name(metric.coherence_measure);
+              << "," << coherence_measure_name(metric.coherence_measure);
+          append_feedback_optional_cols(val_raw);
+          append_reward_value_cols(feedback_raw, reward_value);
           out << "\n";
-          ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/(reward ? 1 : 0), rr, af);
+          ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
         }
       }
 
+      const double wall_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+      write_nf_summary_json(args, rec, metric, summary, threshold, adapt_ctrl, pacer, wall_elapsed);
+
       finalize_derived_events();
-      write_reward_tone_wav_if_requested(args, audio_reward_flags);
+      write_reward_tone_wav_if_requested(args, audio_reward_values);
       write_biotrace_ui_html_if_requested(args, rec, metric, ui_frames, do_artifacts,
                                           want_derived_events ? &derived_events : nullptr);
       std::cout << "Done. Outputs written to: " << args.outdir << "\n";
@@ -2164,23 +3085,61 @@ int main(int argc, char** argv) {
           const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
           const bool artifact_state = (do_artifacts && af.baseline_ready && af.bad);
 
-          const double val = fr.value;
+          const double val_raw = fr.value;
+          const double val = smooth_metric(val_raw, fr.t_end_sec, artifact_hit);
+
+          const NfPhase phase = phase_of(fr.t_end_sec);
+
+          pacer.wait_until(fr.t_end_sec);
+
           if (!std::isfinite(val)) {
+            (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
             reward_gate.reset(false);
-            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+            thr_hyst.reset(false);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
             if (art) osc_send_artifact(osc, osc_prefix, af);
-            audio_reward_flags.push_back(0);
+            audio_reward_values.push_back(0);
             continue;
           }
 
           if (!have_threshold) {
+            (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
             reward_gate.reset(false);
+            thr_hyst.reset(false);
             if (fr.t_end_sec <= args.baseline_seconds) {
-              baseline_values.push_back(val);
+              ++summary.baseline_frames;
+              if (!artifact_hit) {
+                baseline_values.push_back(val);
+              }
             } else {
               double q_used = 0.5;
               threshold = initial_threshold_from_baseline(args, baseline_values, val, &q_used);
               have_threshold = true;
+              if (!summary.threshold_init_set) {
+                summary.threshold_init = threshold;
+                summary.threshold_init_set = true;
+              }
+              if (continuous_feedback && !feedback_span_ready) {
+                if (!baseline_values.empty()) {
+                  std::vector<double> tmp = baseline_values;
+                  const double med = median_inplace(tmp);
+                  const double sc = robust_scale(baseline_values, med);
+                  if (std::isfinite(sc) && sc > 0.0) {
+                    feedback_span_used = sc;
+                  } else {
+                    feedback_span_used = 1.0;
+                    std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
+                  }
+                } else {
+                  feedback_span_used = 1.0;
+                  std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+                }
+                feedback_span_ready = true;
+                summary.feedback_span_used = feedback_span_used;
+                summary.feedback_span_used_set = true;
+                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+                std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
+              }
               std::cout << "Initial threshold set to: " << threshold
                         << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
                         << ", n=" << baseline_values.size() << ")\n";
@@ -2189,20 +3148,30 @@ int main(int argc, char** argv) {
             osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,
                           have_threshold ? 1 : 0);
             if (art) osc_send_artifact(osc, osc_prefix, af);
-            audio_reward_flags.push_back(0);
-            ui_push(fr.t_end_sec, val, threshold, have_threshold, /*reward=*/0, /*rr=*/0.0, af);
-            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+            audio_reward_values.push_back(0);
+            ui_push(fr.t_end_sec, val, threshold, have_threshold, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, /*rr=*/0.0, af);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
             continue;
           }
 
           if (artifact_hit) {
+            (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
             reward_gate.reset(false);
+            thr_hyst.reset(false);
+            ++summary.training_frames;
+            ++summary.artifact_frames;
+            if (phase == NfPhase::Rest) ++summary.rest_frames;
+            summary.add_reward_value(0.0);
+            reward_hist.push_back(0);
+            while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
             const double rr = reward_rate();
             osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
                           0, rr, 1);
             if (art) osc_send_artifact(osc, osc_prefix, af);
-            audio_reward_flags.push_back(0);
-            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+            audio_reward_values.push_back(0);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+
+            adapt_ctrl.prune(fr.t_end_sec);
 
             out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
             if (do_artifacts) {
@@ -2210,44 +3179,117 @@ int main(int argc, char** argv) {
                   << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
                   << "," << af.bad_channel_count;
             }
+            append_phase_and_raw(phase, /*raw_reward=*/false);
             out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel;
             out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
+            append_feedback_optional_cols(val_raw);
+            append_reward_value_cols(0.0, 0.0);
             out << "\n";
-            ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/0, rr, af);
+            ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
           }
 
-          const bool raw_reward = is_reward(val, threshold, args.reward_direction);
-          const bool reward = reward_gate.update(raw_reward);
-          derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state);
-          audio_reward_flags.push_back(reward ? 1 : 0);
+          if (phase == NfPhase::Rest) {
+            // During rest blocks, keep displaying metrics but pause reinforcement and adaptation.
+            (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
+            reward_gate.reset(false);
+            thr_hyst.reset(false);
+            ++summary.training_frames;
+            ++summary.rest_frames;
+            summary.add_reward_value(0.0);
+            reward_hist.push_back(0);
+            while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
+            const double rr = reward_rate();
+
+            osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                          0, rr, 1);
+            if (art) osc_send_artifact(osc, osc_prefix, af);
+            audio_reward_values.push_back(0);
+            derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+
+            adapt_ctrl.prune(fr.t_end_sec);
+
+            out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
+            if (do_artifacts) {
+              out << "," << (af.baseline_ready ? 1 : 0)
+                  << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                  << "," << af.bad_channel_count;
+            }
+            append_phase_and_raw(phase, /*raw_reward=*/false);
+            out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel;
+            out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
+            append_feedback_optional_cols(val_raw);
+            append_reward_value_cols(0.0, 0.0);
+            out << "\n";
+            ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
+            continue;
+          }
+
+          ++summary.training_frames;
+          summary.add_training_metric(val);
+
+          const double thr_used = threshold;
+          const bool raw_reward = thr_hyst.update(val, thr_used);
+          const bool shaped_raw = shape_reward(raw_reward, fr.t_end_sec, /*freeze=*/false);
+          const bool reward = reward_gate.update(shaped_raw);
+          derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state, phase);
+          if (reward) ++summary.reward_frames;
+          if (continuous_feedback && (!feedback_span_ready || !std::isfinite(feedback_span_used) || feedback_span_used <= 0.0)) {
+            feedback_span_used = 1.0;
+            feedback_span_ready = true;
+            summary.feedback_span_used = feedback_span_used;
+            summary.feedback_span_used_set = true;
+            osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+            std::cerr << "Warning: feedback_span was not initialized; using 1.0\n";
+          }
+
+          const double feedback_raw = continuous_feedback
+                                        ? feedback_value(val, thr_used, args.reward_direction, feedback_span_used)
+                                        : (raw_reward ? 1.0 : 0.0);
+          const double reward_value = continuous_feedback ? (reward ? feedback_raw : 0.0) : (reward ? 1.0 : 0.0);
+          summary.add_reward_value(reward_value);
+          audio_reward_values.push_back(static_cast<float>(reward_value));
           reward_hist.push_back(reward ? 1 : 0);
           while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
           const double rr = reward_rate();
 
+          // Collect training samples for quantile adaptation (noop for other modes).
+          adapt_ctrl.observe(fr.t_end_sec, val);
+
           if (!args.no_adaptation && args.adapt_eta > 0.0) {
-            threshold = adapt_threshold(threshold, rr, args.target_reward_rate, args.adapt_eta, args.reward_direction);
+            threshold = adapt_ctrl.update(thr_used, rr, fr.t_end_sec);
           }
 
-          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_used,
                         (reward ? 1 : 0), rr, 1);
           if (art) osc_send_artifact(osc, osc_prefix, af);
+          if (continuous_feedback) {
+            osc_send_feedback_raw(osc, osc_prefix, fr.t_end_sec, feedback_raw);
+            osc_send_reward_value(osc, osc_prefix, fr.t_end_sec, reward_value);
+          }
 
-          out << fr.t_end_sec << "," << val << "," << threshold << "," << (reward ? 1 : 0) << "," << rr;
+          out << fr.t_end_sec << "," << val << "," << thr_used << "," << (reward ? 1 : 0) << "," << rr;
           if (do_artifacts) {
             out << "," << (af.baseline_ready ? 1 : 0)
                 << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
                 << "," << af.bad_channel_count;
           }
+          append_phase_and_raw(phase, raw_reward);
           out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel;
           out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
+          append_feedback_optional_cols(val_raw);
+          append_reward_value_cols(feedback_raw, reward_value);
           out << "\n";
-          ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/(reward ? 1 : 0), rr, af);
+          ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
         }
       }
 
+      const double wall_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+      write_nf_summary_json(args, rec, metric, summary, threshold, adapt_ctrl, pacer, wall_elapsed);
+
       finalize_derived_events();
-      write_reward_tone_wav_if_requested(args, audio_reward_flags);
+      write_reward_tone_wav_if_requested(args, audio_reward_values);
       write_biotrace_ui_html_if_requested(args, rec, metric, ui_frames, do_artifacts,
                                           want_derived_events ? &derived_events : nullptr);
       std::cout << "Done. Outputs written to: " << args.outdir << "\n";
@@ -2332,23 +3374,60 @@ int main(int argc, char** argv) {
         const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
         const bool artifact_state = (do_artifacts && af.baseline_ready && af.bad);
 
-        const double val = compute_metric_band_or_ratio(fr, metric, ch_idx, b_idx, b_num, b_den);
+        const double val_raw = compute_metric_band_or_ratio(fr, metric, ch_idx, b_idx, b_num, b_den);
+        const double val = smooth_metric(val_raw, fr.t_end_sec, artifact_hit);
+
+        const NfPhase phase = phase_of(fr.t_end_sec);
+
+        pacer.wait_until(fr.t_end_sec);
+
         if (!std::isfinite(val)) {
+          (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
           reward_gate.reset(false);
-          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+          thr_hyst.reset(false);
+          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
           if (art) osc_send_artifact(osc, osc_prefix, af);
-          audio_reward_flags.push_back(0);
+          audio_reward_values.push_back(0);
           continue;
         }
 
         if (!have_threshold) {
+          (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
           reward_gate.reset(false);
+          thr_hyst.reset(false);
           if (fr.t_end_sec <= args.baseline_seconds) {
-            baseline_values.push_back(val);
+            ++summary.baseline_frames;
+            if (!artifact_hit) {
+              baseline_values.push_back(val);
+            }
           } else {
             double q_used = 0.5;
             threshold = initial_threshold_from_baseline(args, baseline_values, val, &q_used);
             have_threshold = true;
+            if (!summary.threshold_init_set) {
+              summary.threshold_init = threshold;
+              summary.threshold_init_set = true;
+            }
+            if (continuous_feedback && !feedback_span_ready) {
+              if (!baseline_values.empty()) {
+                std::vector<double> tmp = baseline_values;
+                const double med = median_inplace(tmp);
+                const double scale = robust_scale(baseline_values, med);
+                if (std::isfinite(scale) && scale > 0.0) {
+                  feedback_span_used = scale;
+                } else {
+                  feedback_span_used = 1.0;
+                  std::cerr << "Warning: could not estimate baseline scale for continuous feedback; using feedback_span=1.0\n";
+                }
+              } else {
+                feedback_span_used = 1.0;
+                std::cerr << "Warning: no baseline samples for continuous feedback; using feedback_span=1.0\n";
+              }
+              feedback_span_ready = true;
+              summary.feedback_span_used = feedback_span_used;
+              summary.feedback_span_used_set = true;
+              osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+            }
             std::cout << "Initial threshold set to: " << threshold
                       << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
                       << ", n=" << baseline_values.size() << ")\n";
@@ -2357,20 +3436,30 @@ int main(int argc, char** argv) {
           osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_send, 0, 0.0,
                         have_threshold ? 1 : 0);
           if (art) osc_send_artifact(osc, osc_prefix, af);
-          audio_reward_flags.push_back(0);
-          ui_push(fr.t_end_sec, val, threshold, have_threshold, /*reward=*/0, /*rr=*/0.0, af);
-          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+          audio_reward_values.push_back(0);
+          ui_push(fr.t_end_sec, val, threshold, have_threshold, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, /*rr=*/0.0, af);
+          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
           continue;
         }
 
         if (artifact_hit) {
+          (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
           reward_gate.reset(false);
+          thr_hyst.reset(false);
+          ++summary.training_frames;
+          ++summary.artifact_frames;
+          if (phase == NfPhase::Rest) ++summary.rest_frames;
+          summary.add_reward_value(0.0);
+          reward_hist.push_back(0);
+          while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
           const double rr = reward_rate();
           osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
                         0, rr, 1);
           if (art) osc_send_artifact(osc, osc_prefix, af);
-          audio_reward_flags.push_back(0);
-          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state);
+          audio_reward_values.push_back(0);
+          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+
+          adapt_ctrl.prune(fr.t_end_sec);
 
           out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
           if (do_artifacts) {
@@ -2378,52 +3467,125 @@ int main(int argc, char** argv) {
                 << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
                 << "," << af.bad_channel_count;
           }
+          append_phase_and_raw(phase, /*raw_reward=*/false);
           if (metric.type == NfMetricSpec::Type::Band) {
             out << "," << metric.band << "," << metric.channel;
           } else {
             out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
           }
+          append_feedback_optional_cols(val_raw);
+          append_reward_value_cols(0.0, 0.0);
           out << "\n";
-          ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/0, rr, af);
+          ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
           continue;
         }
 
-        const bool raw_reward = is_reward(val, threshold, args.reward_direction);
-        const bool reward = reward_gate.update(raw_reward);
-        derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state);
-        audio_reward_flags.push_back(reward ? 1 : 0);
+        if (phase == NfPhase::Rest) {
+          // During rest blocks, keep displaying metrics but pause reinforcement and adaptation.
+          (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
+          reward_gate.reset(false);
+          thr_hyst.reset(false);
+          ++summary.training_frames;
+          ++summary.rest_frames;
+          summary.add_reward_value(0.0);
+          reward_hist.push_back(0);
+          while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
+          const double rr = reward_rate();
+
+          osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+                        0, rr, 1);
+          if (art) osc_send_artifact(osc, osc_prefix, af);
+          audio_reward_values.push_back(0);
+          derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+
+          adapt_ctrl.prune(fr.t_end_sec);
+
+          out << fr.t_end_sec << "," << val << "," << threshold << ",0," << rr;
+          if (do_artifacts) {
+            out << "," << (af.baseline_ready ? 1 : 0)
+                << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                << "," << af.bad_channel_count;
+          }
+          append_phase_and_raw(phase, /*raw_reward=*/false);
+          if (metric.type == NfMetricSpec::Type::Band) {
+            out << "," << metric.band << "," << metric.channel;
+          } else {
+            out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
+          }
+          append_feedback_optional_cols(val_raw);
+          append_reward_value_cols(0.0, 0.0);
+          out << "\n";
+          ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
+          continue;
+        }
+
+        ++summary.training_frames;
+        summary.add_training_metric(val);
+
+        const double thr_used = threshold;
+        const bool raw_reward = thr_hyst.update(val, thr_used);
+        const bool shaped_raw = shape_reward(raw_reward, fr.t_end_sec, /*freeze=*/false);
+        const bool reward = reward_gate.update(shaped_raw);
+        derived_update(fr.t_end_sec, /*reward_on=*/reward, artifact_state, phase);
+        if (reward) ++summary.reward_frames;
+        if (continuous_feedback && (!feedback_span_ready || !std::isfinite(feedback_span_used) ||
+                                   feedback_span_used <= 0.0)) {
+          feedback_span_used = 1.0;
+          feedback_span_ready = true;
+          summary.feedback_span_used = feedback_span_used;
+          summary.feedback_span_used_set = true;
+          osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+        }
+
+        const double feedback_raw = continuous_feedback
+                                ? feedback_value(val, thr_used, args.reward_direction, feedback_span_used)
+                                : (raw_reward ? 1.0 : 0.0);
+        const double reward_value = continuous_feedback ? (reward ? feedback_raw : 0.0) : (reward ? 1.0 : 0.0);
+        summary.add_reward_value(reward_value);
+        audio_reward_values.push_back(static_cast<float>(reward_value));
         reward_hist.push_back(reward ? 1 : 0);
         while (reward_hist.size() > rate_window_frames) reward_hist.pop_front();
         const double rr = reward_rate();
 
+        // Collect training samples for quantile adaptation (noop for other modes).
+        adapt_ctrl.observe(fr.t_end_sec, val);
+
         if (!args.no_adaptation && args.adapt_eta > 0.0) {
-          threshold = adapt_threshold(threshold, rr, args.target_reward_rate, args.adapt_eta, args.reward_direction);
+          threshold = adapt_ctrl.update(thr_used, rr, fr.t_end_sec);
         }
 
-        osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, threshold,
+        osc_send_state(osc, osc_prefix, osc_mode, fr.t_end_sec, val, thr_used,
                       (reward ? 1 : 0), rr, 1);
         if (art) osc_send_artifact(osc, osc_prefix, af);
+        if (continuous_feedback) {
+          osc_send_feedback_raw(osc, osc_prefix, fr.t_end_sec, feedback_raw);
+          osc_send_reward_value(osc, osc_prefix, fr.t_end_sec, reward_value);
+        }
 
-        out << fr.t_end_sec << "," << val << "," << threshold << "," << (reward ? 1 : 0) << "," << rr;
+        out << fr.t_end_sec << "," << val << "," << thr_used << "," << (reward ? 1 : 0) << "," << rr;
         if (do_artifacts) {
           out << "," << (af.baseline_ready ? 1 : 0)
               << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
               << "," << af.bad_channel_count;
         }
+        append_phase_and_raw(phase, raw_reward);
         if (metric.type == NfMetricSpec::Type::Band) {
           out << "," << metric.band << "," << metric.channel;
         } else {
           out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
         }
+        append_feedback_optional_cols(val_raw);
+        append_reward_value_cols(feedback_raw, reward_value);
         out << "\n";
 
-        ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*reward=*/(reward ? 1 : 0), rr, af);
+        ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
 
         if (args.export_bandpowers) {
           out_bp << fr.t_end_sec;
           for (size_t b = 0; b < fr.bands.size(); ++b) {
             for (size_t c = 0; c < fr.channel_names.size(); ++c) {
-              out_bp << "," << fr.powers[b][c];
+              if (have_qc && c < qc_bad.size() && qc_bad[c]) out_bp << ",nan";
+              else out_bp << "," << fr.powers[b][c];
             }
           }
           out_bp << "\n";
@@ -2431,8 +3593,12 @@ int main(int argc, char** argv) {
       }
     }
 
+    const double wall_elapsed = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - wall_start).count();
+    write_nf_summary_json(args, rec, metric, summary, threshold, adapt_ctrl, pacer, wall_elapsed);
+
     finalize_derived_events();
-    write_reward_tone_wav_if_requested(args, audio_reward_flags);
+    write_reward_tone_wav_if_requested(args, audio_reward_values);
     write_biotrace_ui_html_if_requested(args, rec, metric, ui_frames, do_artifacts,
                                         want_derived_events ? &derived_events : nullptr);
     std::cout << "Done. Outputs written to: " << args.outdir << "\n";

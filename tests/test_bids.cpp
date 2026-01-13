@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 static std::string slurp(const std::filesystem::path& p) {
   std::ifstream f(p, std::ios::binary);
@@ -43,6 +44,121 @@ int main() {
     assert(ch_stem == "sub-01_ses-A_task-rest_acq-high_run-01_channels");
   }
 
+  // Filename parsing helpers.
+  {
+    const auto p1 = parse_bids_filename("sub-01_ses-A_task-rest_acq-high_run-01_eeg.edf");
+    assert(p1.has_value());
+    assert(p1->ent.sub == "01");
+    assert(p1->ent.ses == "A");
+    assert(p1->ent.task == "rest");
+    assert(p1->ent.acq == "high");
+    assert(p1->ent.run == "01");
+    assert(p1->suffix == "eeg");
+
+    // Works on a bare stem without extension.
+    const auto p2 = parse_bids_filename("sub-02_task-nback_events");
+    assert(p2.has_value());
+    assert(p2->ent.sub == "02");
+    assert(p2->ent.task == "nback");
+    assert(p2->suffix == "events");
+
+    // Ignores unknown entities (e.g. desc-*) and still extracts the required ones.
+    const auto p3 = parse_bids_filename("sub-01_task-rest_desc-qeegmap_bandpowers.csv");
+    assert(p3.has_value());
+    assert(p3->ent.sub == "01");
+    assert(p3->ent.task == "rest");
+    assert(p3->suffix == "bandpowers");
+
+    // Double-extension convenience (e.g. compressed TSVs).
+    const auto p4 = parse_bids_filename("sub-01_task-rest_events.tsv.gz");
+    assert(p4.has_value());
+    assert(p4->suffix == "events");
+
+    // Entity chain without suffix.
+    const auto p5 = parse_bids_filename("sub-03_task-rest");
+    assert(p5.has_value());
+    assert(p5->suffix.empty());
+
+    // Missing required entities.
+    assert(!parse_bids_filename("task-rest_eeg.edf").has_value());
+  }
+
+  // Dataset root finder.
+  {
+    const auto root = std::filesystem::temp_directory_path() / "qeeg_test_bids_root_finder";
+    std::filesystem::create_directories(root / "sub-01" / "eeg");
+
+    // dataset_description.json marks the dataset root.
+    {
+      std::ofstream f(root / "dataset_description.json", std::ios::binary);
+      assert(static_cast<bool>(f));
+      f << "{}\n";
+    }
+
+    // Create a dummy BIDS file.
+    const auto eeg = root / "sub-01" / "eeg" / "sub-01_task-rest_eeg.edf";
+    {
+      std::ofstream f(eeg, std::ios::binary);
+      assert(static_cast<bool>(f));
+      f << "dummy";
+    }
+
+    const auto found_from_file = find_bids_dataset_root(eeg.u8string());
+    assert(found_from_file.has_value());
+    assert(*found_from_file == root.u8string());
+
+    const auto found_from_dir = find_bids_dataset_root((root / "sub-01").u8string());
+    assert(found_from_dir.has_value());
+    assert(*found_from_dir == root.u8string());
+  }
+
+  // dataset_description.json helpers.
+  {
+    const auto tmp = std::filesystem::temp_directory_path() / "qeeg_test_bids_dataset_description";
+    std::filesystem::create_directories(tmp);
+
+    // Derivative datasets MUST include GeneratedBy.
+    {
+      BidsDatasetDescription desc;
+      desc.name = "qeeg-derivatives";
+      desc.dataset_type = "derivative";
+
+      bool threw = false;
+      try {
+        write_bids_dataset_description(tmp.u8string(), desc, /*overwrite=*/true);
+      } catch (const std::exception&) {
+        threw = true;
+      }
+      assert(threw);
+    }
+
+    // With a GeneratedBy entry, the writer should succeed and emit the key.
+    {
+      BidsDatasetDescription desc;
+      desc.name = "qeeg-derivatives";
+      desc.dataset_type = "derivative";
+
+      BidsDatasetDescription::GeneratedByEntry g;
+      g.name = "qeeg";
+      g.version = "0.1.0";
+      g.code_url = "https://github.com/masterblaster1999/qeeg-neurofeedback-opensoftware";
+      desc.generated_by.push_back(g);
+
+      // Optional provenance.
+      BidsDatasetDescription::SourceDatasetEntry s;
+      s.url = "file://./";
+      desc.source_datasets.push_back(s);
+
+      write_bids_dataset_description(tmp.u8string(), desc, /*overwrite=*/true);
+      const std::string dd = slurp(tmp / "dataset_description.json");
+      assert(dd.find("\"DatasetType\": \"derivative\"") != std::string::npos);
+      assert(dd.find("\"GeneratedBy\"") != std::string::npos);
+      assert(dd.find("\"Name\": \"qeeg\"") != std::string::npos);
+      assert(dd.find("\"CodeURL\"") != std::string::npos);
+      assert(dd.find("\"SourceDatasets\"") != std::string::npos);
+    }
+  }
+
   // Round-trip write minimal sidecars.
   {
     EEGRecording rec;
@@ -54,6 +170,12 @@ int main() {
     rec.data[2] = {0.0f, 5.0f, 0.0f};
     rec.events.push_back({1.0, 0.0, "stim"});
     rec.events.push_back({0.5, 0.1, "5"});
+    rec.events.push_back({2.0, 0.5, "NF:Reward"});
+    rec.events.push_back({3.0, 0.5, "NF:Artifact"});
+    rec.events.push_back({4.0, 0.5, "NF:Baseline"});
+    rec.events.push_back({5.0, 0.5, "NF:Train"});
+    rec.events.push_back({6.0, 0.5, "NF:Rest"});
+    rec.events.push_back({5.0, 0.5, "MS:A"});
 
     BidsEegJsonMetadata meta;
     meta.eeg_reference = "Cz";
@@ -97,6 +219,29 @@ int main() {
     assert(ch.find("VEOG\tVEOG\tuV") != std::string::npos);
     assert(ch.find("TRIG\tTRIG\tV") != std::string::npos);
 
+    // Load channels.tsv name list (used by derivatives exporters to preserve ordering).
+    {
+      const auto names = load_bids_channels_tsv_names(channels_tsv.u8string());
+      assert(names.size() == 3);
+      assert(names[0] == "Cz");
+      assert(names[1] == "VEOG");
+      assert(names[2] == "TRIG");
+    }
+
+    // Also test the overload that writes channels.tsv from a channel name list.
+    {
+      const auto channels2_tsv = tmp / "sub-01_task-rest_desc-qeegqc_channels.tsv";
+      std::vector<std::string> names = {"Cz", "VEOG", "TRIG"};
+      std::vector<std::string> status = {"good", "bad", "good"};
+      std::vector<std::string> desc = {"", "qeeg_channel_qc:noisy", ""};
+
+      write_bids_channels_tsv(channels2_tsv.u8string(), names, status, desc);
+      const std::string ch2 = slurp(channels2_tsv);
+      assert(ch2.find("VEOG\tVEOG\tuV\tbad\tqeeg_channel_qc:noisy") != std::string::npos);
+      assert(ch2.find("Cz\tEEG\tuV\tgood") != std::string::npos);
+      assert(ch2.find("TRIG\tTRIG\tV\tgood") != std::string::npos);
+    }
+
     const std::string ev = slurp(events_tsv);
     assert(ev.find("onset\tduration\ttrial_type") != std::string::npos);
     assert(ev.find("1") != std::string::npos);
@@ -117,6 +262,17 @@ int main() {
     assert(evxj.find("\"Levels\"") != std::string::npos);
     assert(evxj.find("\"stim\"") != std::string::npos);
     assert(evxj.find("\"5\"") != std::string::npos);
+    assert(evxj.find("\"NF:Reward\"") != std::string::npos);
+    assert(evxj.find("\"NF:Artifact\"") != std::string::npos);
+    assert(evxj.find("\"NF:Baseline\"") != std::string::npos);
+    assert(evxj.find("\"NF:Train\"") != std::string::npos);
+    assert(evxj.find("\"NF:Rest\"") != std::string::npos);
+    assert(evxj.find("\"MS:A\"") != std::string::npos);
+    // NF-specific level descriptions are hard-coded for nicer interoperability.
+    assert(evxj.find("Neurofeedback reward active.") != std::string::npos);
+    assert(evxj.find("Artifact gate active (data considered contaminated).") != std::string::npos);
+    assert(evxj.find("Baseline estimation segment.") != std::string::npos);
+    assert(evxj.find("Microstate A segment.") != std::string::npos);
   }
 
   // Electrodes + coordsystem helpers.
@@ -147,6 +303,27 @@ int main() {
     assert(!loaded[1].x.has_value());
     assert(!loaded[1].y.has_value());
     assert(!loaded[1].z.has_value());
+
+    // Also allow simple 2D montage-style input (name,x,y without z). z should be treated as missing.
+    const auto in_xy = tmp / "electrodes_in_xy.csv";
+    {
+      std::ofstream f(in_xy, std::ios::binary);
+      assert(static_cast<bool>(f));
+      f << "name,x,y\n";
+      f << "Fp1,-0.5,0.92\n";
+      f << "REF,n/a,n/a\n";
+    }
+
+    const auto loaded_xy = load_bids_electrodes_table(in_xy.u8string());
+    assert(loaded_xy.size() == 2);
+    assert(loaded_xy[0].name == "Fp1");
+    assert(loaded_xy[0].x.has_value());
+    assert(loaded_xy[0].y.has_value());
+    assert(!loaded_xy[0].z.has_value());
+    assert(loaded_xy[1].name == "REF");
+    assert(!loaded_xy[1].x.has_value());
+    assert(!loaded_xy[1].y.has_value());
+    assert(!loaded_xy[1].z.has_value());
 
     // Write electrodes.tsv.
     const auto electrodes_tsv = tmp / "sub-01_task-rest_electrodes.tsv";

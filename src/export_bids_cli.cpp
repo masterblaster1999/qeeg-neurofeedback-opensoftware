@@ -1,10 +1,12 @@
 #include "qeeg/bids.hpp"
 #include "qeeg/brainvision_writer.hpp"
 #include "qeeg/csv_io.hpp"
+#include "qeeg/channel_qc_io.hpp"
 #include "qeeg/channel_map.hpp"
 #include "qeeg/edf_writer.hpp"
 #include "qeeg/event_ops.hpp"
 #include "qeeg/line_noise.hpp"
+#include "qeeg/montage.hpp"
 #include "qeeg/nf_session.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/types.hpp"
@@ -55,6 +57,13 @@ struct Args {
   // without having to specify --extra-events explicitly.
   std::string nf_outdir;
 
+  // Optional: mark bad channels in BIDS channels.tsv based on qeeg_channel_qc_cli output.
+  // Accepts a path to:
+  //   - channel_qc.csv
+  //   - bad_channels.txt
+  //   - the channel_qc_cli outdir containing those files
+  std::string channel_qc;
+
   // Optional extra columns in *_events.tsv
   bool events_sample{false};
   int events_sample_base{0}; // 0 or 1
@@ -65,7 +74,10 @@ struct Args {
 
   // Optional: electrode positions (digitized) and coordinate system.
   // When provided, writes *_electrodes.tsv and *_coordsystem.json.
-  std::string electrodes_in;     // CSV/TSV with header: name,x,y,z[,type,material,impedance]
+  std::string electrodes_in;     // CSV/TSV with header: name,x,y(,z)[,type,material,impedance]
+  // Convenience: generate electrodes.tsv from a qeeg montage spec (builtin or montage CSV).
+  // Writes x/y from montage positions and sets z=n/a.
+  std::string electrodes_from_montage;
   std::string eeg_coord_system;  // e.g., CapTrak / EEGLAB / EEGLAB-HJ / Other
   std::string eeg_coord_units;   // m|mm|cm|n/a
   std::string eeg_coord_desc;    // required if eeg_coord_system == Other
@@ -78,7 +90,7 @@ static void print_help() {
       << "qeeg_export_bids_cli\n\n"
       << "Export a recording (EDF/BDF/CSV/BrainVision) into a BIDS EEG folder layout.\n"
       << "Writes: data file (EDF or BrainVision) + *_eeg.json + *_channels.tsv (+ events.tsv/json if present).\n"
-      << "Optionally writes *_electrodes.tsv and *_coordsystem.json when --electrodes is provided.\n\n"
+      << "Optionally writes *_electrodes.tsv and *_coordsystem.json when --electrodes or --electrodes-from-montage is provided.\n\n"
       << "Usage:\n"
       << "  qeeg_export_bids_cli --input <in.edf|in.bdf|in.csv|in.txt|in.vhdr> --out-dir <bids_root> --sub <label> --task <label> [options]\n\n"
       << "Required:\n"
@@ -104,15 +116,20 @@ static void print_help() {
       << "  --extra-events <file.{csv|tsv}> Load additional events and merge them before writing events.tsv\n"
       << "                               (repeatable; supports qeeg events CSV or BIDS events.tsv).\n"
       << "  --nf-outdir <dir>               Convenience: merge nf_cli derived events from <dir>/nf_derived_events.tsv/.csv\n"
+      << "  --channel-qc <path>            Mark bad channels in *_channels.tsv using qeeg_channel_qc_cli output\n"
+      << "                               (path can be channel_qc.csv, bad_channels.txt, or the channel_qc_cli outdir).\n"
       << "  --events-sample                Add a 'sample' column to *_events.tsv (derived from onset * SamplingFrequency).\n"
       << "  --events-sample-base <0|1>     Base for the 'sample' column (default: 0).\n"
       << "  --events-value                 Add a 'value' column (integer parsed from annotation text when possible).\n"
       << "  --events-levels                Include a trial_type Levels map in *_events.json (only if unique values are few).\n"
-      << "  --electrodes <file.{tsv|csv}>  Input digitized electrode positions table; writes *_electrodes.tsv and *_coordsystem.json.\n"
-      << "                               Header must include: name,x,y,z (optional: type,material,impedance).\n"
+      << "  --electrodes <file.{tsv|csv}>  Input electrode positions table; writes *_electrodes.tsv and *_coordsystem.json.\n"
+      << "                               Header must include: name,x,y (z optional; optional: type,material,impedance).\n"
+      << "  --electrodes-from-montage <SPEC> Generate electrodes.tsv from a qeeg montage spec (builtin:standard_1020_19 or montage CSV name,x,y).\n"
+      << "                               This writes x/y from the montage and sets z to n/a.\n"
       << "  --eeg-coord-system <value>     EEGCoordinateSystem for *_coordsystem.json (e.g., CapTrak, EEGLAB, EEGLAB-HJ, Other).\n"
       << "  --eeg-coord-units <m|mm|cm|n/a> EEGCoordinateUnits for *_coordsystem.json.\n"
       << "  --eeg-coord-desc <text>        EEGCoordinateSystemDescription (REQUIRED if --eeg-coord-system Other).\n"
+      << "                               If not provided, qeeg_export_bids_cli defaults to Other / n/a with an auto-generated description.\n"
       << "  --overwrite                    Overwrite output files if they already exist.\n"
       << "  -h, --help                     Show this help.\n\n"
       << "Notes:\n"
@@ -156,6 +173,15 @@ static int parse_int_or_throw(const std::string& s, const std::string& flag) {
   } catch (const std::exception&) {
     throw std::runtime_error("Failed to parse integer value for " + flag + ": '" + s + "'");
   }
+}
+
+static Montage load_montage_spec(const std::string& spec) {
+  const std::string low = to_lower(spec);
+  if (low == "builtin:standard_1020_19" || low == "standard_1020_19" ||
+      low == "builtin" || low == "default") {
+    return Montage::builtin_standard_1020_19();
+  }
+  return Montage::load_csv(spec);
 }
 
 } // namespace
@@ -215,6 +241,8 @@ int main(int argc, char** argv) {
         args.extra_events.push_back(require_value(i, argc, argv, a));
       } else if (a == "--nf-outdir") {
         args.nf_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--channel-qc") {
+        args.channel_qc = require_value(i, argc, argv, a);
       } else if (a == "--events-sample") {
         args.events_sample = true;
       } else if (a == "--events-sample-base") {
@@ -225,6 +253,8 @@ int main(int argc, char** argv) {
         args.events_levels = true;
       } else if (a == "--electrodes") {
         args.electrodes_in = require_value(i, argc, argv, a);
+      } else if (a == "--electrodes-from-montage") {
+        args.electrodes_from_montage = require_value(i, argc, argv, a);
       } else if (a == "--eeg-coord-system") {
         args.eeg_coord_system = require_value(i, argc, argv, a);
       } else if (a == "--eeg-coord-units") {
@@ -267,6 +297,10 @@ int main(int argc, char** argv) {
       throw std::runtime_error("Invalid --events-sample-base (use 0 or 1): " + std::to_string(args.events_sample_base));
     }
 
+    if (!args.electrodes_in.empty() && !args.electrodes_from_montage.empty()) {
+      throw std::runtime_error("Use only one of --electrodes or --electrodes-from-montage");
+    }
+
     // Load recording.
     EEGRecording rec = read_recording_auto(args.input_path, args.fs_csv);
 
@@ -299,6 +333,35 @@ int main(int argc, char** argv) {
     }
     // Also normalizes + de-duplicates source events for deterministic exports.
     merge_events(&rec.events, extra_all);
+
+    // Optional: prepare electrodes + coordsystem sidecars. This can be driven either
+    // by a digitized electrode table (CSV/TSV) or by a qeeg montage spec.
+    const bool want_electrodes = !args.electrodes_in.empty() || !args.electrodes_from_montage.empty();
+    std::vector<BidsElectrode> electrodes;
+    std::string electrodes_source;
+    if (want_electrodes) {
+      if (!args.electrodes_in.empty()) {
+        electrodes = load_bids_electrodes_table(args.electrodes_in);
+        electrodes_source = args.electrodes_in;
+      } else {
+        // Generate electrodes from montage positions, matching the *exported* channel names.
+        const Montage m = load_montage_spec(args.electrodes_from_montage);
+        electrodes.reserve(rec.channel_names.size());
+        for (const auto& ch : rec.channel_names) {
+          Vec2 p;
+          BidsElectrode e;
+          e.name = ch;
+          if (m.get(ch, &p)) {
+            e.x = p.x;
+            e.y = p.y;
+          }
+          // Montage is 2D; z is unknown.
+          e.z.reset();
+          electrodes.push_back(std::move(e));
+        }
+        electrodes_source = std::string("montage:") + args.electrodes_from_montage;
+      }
+    }
 
     // Prepare BIDS paths.
     BidsEntities ent;
@@ -358,7 +421,7 @@ int main(int argc, char** argv) {
       ensure_writable(events_json, args.overwrite);
     }
 
-    if (!args.electrodes_in.empty()) {
+    if (want_electrodes) {
       ensure_writable(electrodes_tsv, args.overwrite);
       ensure_writable(coordsystem_json, args.overwrite);
     }
@@ -386,7 +449,47 @@ int main(int argc, char** argv) {
     }
 
     // Write channels.tsv.
-    write_bids_channels_tsv(channels_tsv.u8string(), rec);
+    // Optionally apply channel-level QC results so BIDS validators + downstream tooling
+    // can detect and act on bad channels.
+    if (!args.channel_qc.empty()) {
+      std::string resolved;
+      const ChannelQcMap qc = load_channel_qc_any(args.channel_qc, &resolved);
+
+      std::vector<std::string> status(rec.channel_names.size(), "good");
+      std::vector<std::string> status_desc(rec.channel_names.size());
+
+      size_t matched = 0;
+      size_t bad = 0;
+      for (size_t i = 0; i < rec.channel_names.size(); ++i) {
+        const std::string key = normalize_channel_name(rec.channel_names[i]);
+        if (key.empty()) continue;
+        const auto it = qc.find(key);
+        if (it == qc.end()) continue;
+        ++matched;
+        if (it->second.bad) {
+          status[i] = "bad";
+          ++bad;
+          if (!it->second.reasons.empty()) {
+            status_desc[i] = "qeeg_channel_qc:" + it->second.reasons;
+          } else {
+            status_desc[i] = "qeeg_channel_qc:bad";
+          }
+        }
+      }
+
+      if (matched == 0) {
+        std::cerr << "Warning: --channel-qc loaded from '" << resolved
+                  << "', but no channels matched the exported recording.\n"
+                  << "         Ensure qeeg_channel_qc_cli was run on the same (mapped) channels.\n";
+      } else {
+        std::cout << "Channel QC: loaded '" << resolved << "' (matched=" << matched
+                  << ", bad=" << bad << ")\n";
+      }
+
+      write_bids_channels_tsv(channels_tsv.u8string(), rec, status, status_desc);
+    } else {
+      write_bids_channels_tsv(channels_tsv.u8string(), rec);
+    }
 
     // Write eeg.json metadata.
     BidsEegJsonMetadata meta;
@@ -436,22 +539,24 @@ int main(int argc, char** argv) {
       write_bids_events_json(events_json.u8string(), ev_opts, rec.events);
     }
 
-    // Optional: electrodes.tsv + coordsystem.json (digitized positions).
-    if (!args.electrodes_in.empty()) {
-      if (trim(args.eeg_coord_system).empty()) {
-        throw std::runtime_error("--eeg-coord-system is required when --electrodes is provided");
-      }
-      if (trim(args.eeg_coord_units).empty()) {
-        throw std::runtime_error("--eeg-coord-units is required when --electrodes is provided");
-      }
-
+    // Optional: electrodes.tsv + coordsystem.json (electrode positions).
+    if (want_electrodes) {
       BidsCoordsystemJsonEegMetadata cs;
       cs.eeg_coordinate_system = trim(args.eeg_coord_system);
       cs.eeg_coordinate_units = trim(args.eeg_coord_units);
       cs.eeg_coordinate_system_description = trim(args.eeg_coord_desc);
-      write_bids_coordsystem_json(coordsystem_json.u8string(), cs);
 
-      const auto electrodes = load_bids_electrodes_table(args.electrodes_in);
+      // Provide sensible BIDS-compliant defaults so users can export quick-and-dirty
+      // electrode layouts (e.g., 2D montage coordinates) without extra flags.
+      if (cs.eeg_coordinate_system.empty()) cs.eeg_coordinate_system = "Other";
+      if (cs.eeg_coordinate_units.empty()) cs.eeg_coordinate_units = "n/a";
+      if (cs.eeg_coordinate_system == "Other" && cs.eeg_coordinate_system_description.empty()) {
+        cs.eeg_coordinate_system_description =
+            "Auto-generated by qeeg_export_bids_cli from " + electrodes_source +
+            ". Provide --eeg-coord-system/--eeg-coord-units for digitized coordinates.";
+      }
+
+      write_bids_coordsystem_json(coordsystem_json.u8string(), cs);
       write_bids_electrodes_tsv(electrodes_tsv.u8string(), electrodes);
     }
 
@@ -466,7 +571,7 @@ int main(int argc, char** argv) {
     if (!args.no_events && !rec.events.empty()) {
       std::cout << "  Events: " << events_tsv.u8string() << "\n";
     }
-    if (!args.electrodes_in.empty()) {
+    if (want_electrodes) {
       std::cout << "  Electrodes: " << electrodes_tsv.u8string() << "\n";
       std::cout << "  Coordsystem: " << coordsystem_json.u8string() << "\n";
     }
