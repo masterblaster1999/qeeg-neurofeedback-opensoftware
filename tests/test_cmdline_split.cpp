@@ -25,10 +25,22 @@ int main() {
   }
 
   {
-    const auto v = split_commandline_args("--path C:\\\\temp\\\\file.txt");
+    const auto v = split_commandline_args("--path C:\\temp\\file.txt");
     assert(v.size() == 2);
     assert(v[0] == "--path");
-    assert(v[1].find("temp") != std::string::npos);
+    // Windows-style paths should be preserved without requiring the caller to
+    // double-escape every backslash.
+    assert(v[1] == "C:\\temp\\file.txt");
+  }
+
+  {
+    // Backslash escaping of whitespace should still work (useful in the UI server).
+    const auto v = split_commandline_args("--input my\\ file.edf --outdir out");
+    assert(v.size() == 4);
+    assert(v[0] == "--input");
+    assert(v[1] == "my file.edf");
+    assert(v[2] == "--outdir");
+    assert(v[3] == "out");
   }
 
   std::cout << "ok\n";

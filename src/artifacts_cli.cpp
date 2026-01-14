@@ -1,6 +1,8 @@
 #include "qeeg/artifacts.hpp"
+#include "qeeg/bids.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
+#include "qeeg/run_meta.hpp"
 #include "qeeg/utils.hpp"
 
 #include <algorithm>
@@ -33,6 +35,10 @@ struct Args {
   // bad windows into contiguous artifact segments.
   double merge_gap_sec{0.0};
 
+  // Optional: write artifact_events.tsv / artifact_events.json as a
+  // BIDS-style events file describing the merged artifact segments.
+  bool export_bids_events{false};
+
   bool average_reference{false};
 
   // Optional preprocessing filters
@@ -61,6 +67,7 @@ static void print_help() {
     << "  --kurtosis-z Z          Kurtosis robust z threshold (default: 6; <=0 disables)\n"
     << "  --min-bad-channels N    Mark window bad if >=N channels are flagged (default: 1)\n"
     << "  --merge-gap SEC         Merge bad windows with gaps <=SEC into segments (default: 0)\n"
+    << "  --export-bids-events     Write artifact_events.tsv and artifact_events.json (merged segments)\n"
     << "  --average-reference      Apply common average reference across channels\n"
     << "  --notch HZ               Apply a notch filter at HZ (e.g., 50 or 60)\n"
     << "  --notch-q Q              Notch Q factor (default: 30)\n"
@@ -98,6 +105,8 @@ static Args parse_args(int argc, char** argv) {
       a.min_bad_channels = static_cast<size_t>(to_int(argv[++i]));
     } else if (arg == "--merge-gap" && i + 1 < argc) {
       a.merge_gap_sec = to_double(argv[++i]);
+    } else if (arg == "--export-bids-events") {
+      a.export_bids_events = true;
     } else if (arg == "--average-reference") {
       a.average_reference = true;
     } else if (arg == "--notch" && i + 1 < argc) {
@@ -287,12 +296,58 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Optional: BIDS-style events export describing the merged artifact segments.
+    if (args.export_bids_events) {
+      std::vector<AnnotationEvent> ev;
+      ev.reserve(segments.size());
+      for (const auto& s : segments) {
+        AnnotationEvent e;
+        e.onset_sec = s.t_start_sec;
+        e.duration_sec = std::max(0.0, s.t_end_sec - s.t_start_sec);
+        e.text = "artifact";
+        ev.push_back(std::move(e));
+      }
+
+      BidsEventsTsvOptions eopt;
+      eopt.include_trial_type = true;
+      eopt.include_trial_type_levels = true;
+      eopt.include_sample = true;
+      eopt.sample_index_base = 0;
+
+      write_bids_events_tsv(args.outdir + "/artifact_events.tsv", ev, eopt, rec.fs_hz);
+      write_bids_events_json(args.outdir + "/artifact_events.json", eopt, ev);
+    }
+
+    // Lightweight run manifest for qeeg_ui_cli / qeeg_ui_server_cli.
+    {
+      const std::string meta_path = args.outdir + "/artifact_run_meta.json";
+      std::vector<std::string> outs;
+      outs.push_back("artifact_windows.csv");
+      outs.push_back("artifact_channels.csv");
+      outs.push_back("artifact_channel_summary.csv");
+      outs.push_back("artifact_segments.csv");
+      outs.push_back("artifact_summary.txt");
+      if (args.export_bids_events) {
+        outs.push_back("artifact_events.tsv");
+        outs.push_back("artifact_events.json");
+      }
+      outs.push_back("artifact_run_meta.json");
+      if (!write_run_meta_json(meta_path, "qeeg_artifacts_cli", args.outdir, args.input_path, outs)) {
+        std::cerr << "Warning: failed to write run meta JSON: " << meta_path << "\n";
+      }
+    }
+
     std::cout << "Wrote artifact report to: " << args.outdir << "\n";
     std::cout << "  - artifact_windows.csv\n";
     std::cout << "  - artifact_channels.csv\n";
     std::cout << "  - artifact_channel_summary.csv\n";
     std::cout << "  - artifact_segments.csv\n";
     std::cout << "  - artifact_summary.txt\n";
+    if (args.export_bids_events) {
+      std::cout << "  - artifact_events.tsv\n";
+      std::cout << "  - artifact_events.json\n";
+    }
+    std::cout << "  - artifact_run_meta.json\n";
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << "\n";

@@ -56,6 +56,13 @@ int main() {
     return 1;
   }
 
+  // The dashboard should embed lightweight previews for CSV/text outputs so you
+  // can sanity-check artifacts without opening them in another tool.
+  if (html.find("channel,alpha") == std::string::npos || html.find("Cz,1") == std::string::npos) {
+    std::cerr << "Expected CSV preview content in dashboard HTML\n";
+    return 1;
+  }
+
   std::cout << "test_ui_dashboard: OK\n";
   return 0;
 }

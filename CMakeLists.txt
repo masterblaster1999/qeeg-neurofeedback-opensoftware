@@ -9,6 +9,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(QEEG_BUILD_TESTS "Build tests" ON)
+option(QEEG_BUILD_CLI "Build CLI tools" ON)
+option(QEEG_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+option(QEEG_ENABLE_SANITIZERS "Enable Address/Undefined sanitizers (best-effort; non-MSVC)" OFF)
 
 include(GNUInstallDirs)
 
@@ -35,6 +38,7 @@ add_library(qeeg STATIC
   src/fft.cpp
   src/signal.cpp
   src/spectrogram.cpp
+  src/spectral_features.cpp
   src/biquad.cpp
   src/preprocess.cpp
   src/welch_psd.cpp
@@ -77,88 +81,113 @@ else()
   target_compile_options(qeeg PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+if (QEEG_WARNINGS_AS_ERRORS)
+  if (MSVC)
+    target_compile_options(qeeg PRIVATE /WX)
+  else()
+    target_compile_options(qeeg PRIVATE -Werror)
+  endif()
+endif()
+
+if (QEEG_ENABLE_SANITIZERS AND NOT MSVC)
+  # Enable ASan + UBSan for all targets that link against qeeg.
+  target_compile_options(qeeg PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(qeeg PUBLIC -fsanitize=address,undefined)
+endif()
+
 # Sockets (OSC) on Windows
 if (WIN32)
   target_link_libraries(qeeg PUBLIC ws2_32)
 endif()
 
-add_executable(qeeg_map_cli src/main.cpp)
-target_link_libraries(qeeg_map_cli PRIVATE qeeg)
+if (QEEG_BUILD_CLI)
+  add_executable(qeeg_map_cli src/main.cpp)
+  target_link_libraries(qeeg_map_cli PRIVATE qeeg)
 
-add_executable(qeeg_nf_cli src/nf_cli.cpp)
-target_link_libraries(qeeg_nf_cli PRIVATE qeeg)
+  add_executable(qeeg_bandpower_cli src/bandpower_cli.cpp)
+  target_link_libraries(qeeg_bandpower_cli PRIVATE qeeg)
 
-add_executable(qeeg_coherence_cli src/coherence_cli.cpp)
-target_link_libraries(qeeg_coherence_cli PRIVATE qeeg)
+  add_executable(qeeg_bandratios_cli src/bandratios_cli.cpp)
+  target_link_libraries(qeeg_bandratios_cli PRIVATE qeeg)
 
-add_executable(qeeg_plv_cli src/plv_cli.cpp)
-target_link_libraries(qeeg_plv_cli PRIVATE qeeg)
+  add_executable(qeeg_nf_cli src/nf_cli.cpp)
+  target_link_libraries(qeeg_nf_cli PRIVATE qeeg)
 
-add_executable(qeeg_epoch_cli src/epoch_cli.cpp)
-target_link_libraries(qeeg_epoch_cli PRIVATE qeeg)
+  add_executable(qeeg_coherence_cli src/coherence_cli.cpp)
+  target_link_libraries(qeeg_coherence_cli PRIVATE qeeg)
 
-add_executable(qeeg_spectrogram_cli src/spectrogram_cli.cpp)
-target_link_libraries(qeeg_spectrogram_cli PRIVATE qeeg)
+  add_executable(qeeg_plv_cli src/plv_cli.cpp)
+  target_link_libraries(qeeg_plv_cli PRIVATE qeeg)
 
-add_executable(qeeg_trace_plot_cli src/trace_plot_cli.cpp)
-target_link_libraries(qeeg_trace_plot_cli PRIVATE qeeg)
+  add_executable(qeeg_epoch_cli src/epoch_cli.cpp)
+  target_link_libraries(qeeg_epoch_cli PRIVATE qeeg)
 
+  add_executable(qeeg_spectrogram_cli src/spectrogram_cli.cpp)
+  target_link_libraries(qeeg_spectrogram_cli PRIVATE qeeg)
 
-add_executable(qeeg_iaf_cli src/iaf_cli.cpp)
-target_link_libraries(qeeg_iaf_cli PRIVATE qeeg)
+  add_executable(qeeg_trace_plot_cli src/trace_plot_cli.cpp)
+  target_link_libraries(qeeg_trace_plot_cli PRIVATE qeeg)
 
-add_executable(qeeg_microstates_cli src/microstates_cli.cpp)
-target_link_libraries(qeeg_microstates_cli PRIVATE qeeg)
+  add_executable(qeeg_spectral_features_cli src/spectral_features_cli.cpp)
+  target_link_libraries(qeeg_spectral_features_cli PRIVATE qeeg)
 
-add_executable(qeeg_pac_cli src/pac_cli.cpp)
-target_link_libraries(qeeg_pac_cli PRIVATE qeeg)
+  add_executable(qeeg_iaf_cli src/iaf_cli.cpp)
+  target_link_libraries(qeeg_iaf_cli PRIVATE qeeg)
 
-add_executable(qeeg_artifacts_cli src/artifacts_cli.cpp)
-target_link_libraries(qeeg_artifacts_cli PRIVATE qeeg)
+  add_executable(qeeg_microstates_cli src/microstates_cli.cpp)
+  target_link_libraries(qeeg_microstates_cli PRIVATE qeeg)
 
-add_executable(qeeg_reference_cli src/reference_cli.cpp)
-target_link_libraries(qeeg_reference_cli PRIVATE qeeg)
+  add_executable(qeeg_pac_cli src/pac_cli.cpp)
+  target_link_libraries(qeeg_pac_cli PRIVATE qeeg)
 
-add_executable(qeeg_info_cli src/info_cli.cpp)
-target_link_libraries(qeeg_info_cli PRIVATE qeeg)
+  add_executable(qeeg_artifacts_cli src/artifacts_cli.cpp)
+  target_link_libraries(qeeg_artifacts_cli PRIVATE qeeg)
 
-add_executable(qeeg_convert_cli src/convert_cli.cpp)
-target_link_libraries(qeeg_convert_cli PRIVATE qeeg)
+  add_executable(qeeg_reference_cli src/reference_cli.cpp)
+  target_link_libraries(qeeg_reference_cli PRIVATE qeeg)
 
-add_executable(qeeg_export_edf_cli src/export_edf_cli.cpp)
-target_link_libraries(qeeg_export_edf_cli PRIVATE qeeg)
+  add_executable(qeeg_info_cli src/info_cli.cpp)
+  target_link_libraries(qeeg_info_cli PRIVATE qeeg)
 
-add_executable(qeeg_export_bdf_cli src/export_bdf_cli.cpp)
-target_link_libraries(qeeg_export_bdf_cli PRIVATE qeeg)
+  add_executable(qeeg_convert_cli src/convert_cli.cpp)
+  target_link_libraries(qeeg_convert_cli PRIVATE qeeg)
 
-add_executable(qeeg_export_brainvision_cli src/export_brainvision_cli.cpp)
-target_link_libraries(qeeg_export_brainvision_cli PRIVATE qeeg)
+  add_executable(qeeg_export_edf_cli src/export_edf_cli.cpp)
+  target_link_libraries(qeeg_export_edf_cli PRIVATE qeeg)
 
-add_executable(qeeg_export_bids_cli src/export_bids_cli.cpp)
-target_link_libraries(qeeg_export_bids_cli PRIVATE qeeg)
+  add_executable(qeeg_export_bdf_cli src/export_bdf_cli.cpp)
+  target_link_libraries(qeeg_export_bdf_cli PRIVATE qeeg)
 
-add_executable(qeeg_export_derivatives_cli src/export_derivatives_cli.cpp)
-target_link_libraries(qeeg_export_derivatives_cli PRIVATE qeeg)
+  add_executable(qeeg_export_brainvision_cli src/export_brainvision_cli.cpp)
+  target_link_libraries(qeeg_export_brainvision_cli PRIVATE qeeg)
 
+  add_executable(qeeg_export_bids_cli src/export_bids_cli.cpp)
+  target_link_libraries(qeeg_export_bids_cli PRIVATE qeeg)
 
-add_executable(qeeg_ui_cli src/ui_cli.cpp)
-target_link_libraries(qeeg_ui_cli PRIVATE qeeg)
+  add_executable(qeeg_bids_scan_cli src/bids_scan_cli.cpp)
+  target_link_libraries(qeeg_bids_scan_cli PRIVATE qeeg)
 
-add_executable(qeeg_ui_server_cli src/ui_server_cli.cpp)
-target_link_libraries(qeeg_ui_server_cli PRIVATE qeeg)
+  add_executable(qeeg_export_derivatives_cli src/export_derivatives_cli.cpp)
+  target_link_libraries(qeeg_export_derivatives_cli PRIVATE qeeg)
 
+  add_executable(qeeg_ui_cli src/ui_cli.cpp)
+  target_link_libraries(qeeg_ui_cli PRIVATE qeeg)
 
-add_executable(qeeg_clean_cli src/clean_cli.cpp)
-target_link_libraries(qeeg_clean_cli PRIVATE qeeg)
+  add_executable(qeeg_ui_server_cli src/ui_server_cli.cpp)
+  target_link_libraries(qeeg_ui_server_cli PRIVATE qeeg)
 
-add_executable(qeeg_quality_cli src/quality_cli.cpp)
-target_link_libraries(qeeg_quality_cli PRIVATE qeeg)
+  add_executable(qeeg_clean_cli src/clean_cli.cpp)
+  target_link_libraries(qeeg_clean_cli PRIVATE qeeg)
 
-add_executable(qeeg_preprocess_cli src/preprocess_cli.cpp)
-target_link_libraries(qeeg_preprocess_cli PRIVATE qeeg)
+  add_executable(qeeg_quality_cli src/quality_cli.cpp)
+  target_link_libraries(qeeg_quality_cli PRIVATE qeeg)
 
-add_executable(qeeg_channel_qc_cli src/channel_qc_cli.cpp)
-target_link_libraries(qeeg_channel_qc_cli PRIVATE qeeg)
+  add_executable(qeeg_preprocess_cli src/preprocess_cli.cpp)
+  target_link_libraries(qeeg_preprocess_cli PRIVATE qeeg)
+
+  add_executable(qeeg_channel_qc_cli src/channel_qc_cli.cpp)
+  target_link_libraries(qeeg_channel_qc_cli PRIVATE qeeg)
+endif()
 
 
 # Install + package config (so downstream projects can use find_package(qeeg))
@@ -172,35 +201,41 @@ install(TARGETS qeeg
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-# Install CLI tools
-install(TARGETS
-  qeeg_map_cli
-  qeeg_nf_cli
-  qeeg_coherence_cli
-  qeeg_plv_cli
-  qeeg_epoch_cli
-  qeeg_spectrogram_cli
-  qeeg_trace_plot_cli
-  qeeg_iaf_cli
-  qeeg_microstates_cli
-  qeeg_pac_cli
-  qeeg_artifacts_cli
-  qeeg_reference_cli
-  qeeg_info_cli
-  qeeg_convert_cli
-  qeeg_export_edf_cli
-  qeeg_export_bdf_cli
-  qeeg_export_brainvision_cli
-  qeeg_export_bids_cli
-  qeeg_export_derivatives_cli
-  qeeg_preprocess_cli
-  qeeg_quality_cli
-  qeeg_clean_cli
-  qeeg_channel_qc_cli
-  qeeg_ui_cli
-  qeeg_ui_server_cli
-  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
+if (QEEG_BUILD_CLI)
+  # Install CLI tools
+  install(TARGETS
+    qeeg_map_cli
+    qeeg_bandpower_cli
+    qeeg_bandratios_cli
+    qeeg_nf_cli
+    qeeg_coherence_cli
+    qeeg_plv_cli
+    qeeg_epoch_cli
+    qeeg_spectrogram_cli
+    qeeg_trace_plot_cli
+    qeeg_spectral_features_cli
+    qeeg_iaf_cli
+    qeeg_microstates_cli
+    qeeg_pac_cli
+    qeeg_artifacts_cli
+    qeeg_reference_cli
+    qeeg_info_cli
+    qeeg_convert_cli
+    qeeg_export_edf_cli
+    qeeg_export_bdf_cli
+    qeeg_export_brainvision_cli
+    qeeg_export_bids_cli
+    qeeg_bids_scan_cli
+    qeeg_export_derivatives_cli
+    qeeg_preprocess_cli
+    qeeg_quality_cli
+    qeeg_clean_cli
+    qeeg_channel_qc_cli
+    qeeg_ui_cli
+    qeeg_ui_server_cli
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+endif()
 
 include(CMakePackageConfigHelpers)
 
@@ -309,6 +344,10 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_run_meta PRIVATE qeeg)
   add_test(NAME qeeg_test_run_meta COMMAND qeeg_test_run_meta)
 
+  add_executable(qeeg_test_run_meta_write tests/test_run_meta_write.cpp)
+  target_link_libraries(qeeg_test_run_meta_write PRIVATE qeeg)
+  add_test(NAME qeeg_test_run_meta_write COMMAND qeeg_test_run_meta_write)
+
 
   add_executable(qeeg_test_ui_dashboard tests/test_ui_dashboard.cpp)
   target_link_libraries(qeeg_test_ui_dashboard PRIVATE qeeg)
@@ -398,6 +437,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_spectrogram tests/test_spectrogram.cpp)
   target_link_libraries(qeeg_test_spectrogram PRIVATE qeeg)
   add_test(NAME qeeg_test_spectrogram COMMAND qeeg_test_spectrogram)
+
+  add_executable(qeeg_test_spectral_features tests/test_spectral_features.cpp)
+  target_link_libraries(qeeg_test_spectral_features PRIVATE qeeg)
+  add_test(NAME qeeg_test_spectral_features COMMAND qeeg_test_spectral_features)
 
   add_executable(qeeg_test_iaf tests/test_iaf.cpp)
   target_link_libraries(qeeg_test_iaf PRIVATE qeeg)

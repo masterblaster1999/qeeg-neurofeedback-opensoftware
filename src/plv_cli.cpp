@@ -3,6 +3,7 @@
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
+#include "qeeg/run_meta.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -65,7 +66,8 @@ static void print_help() {
       << "  --bands SPEC             Band spec, e.g. 'alpha:8-12,beta:13-30' (default: built-in EEG bands)\n"
       << "  --band NAME|FMIN-FMAX     Which band to report (default: alpha)\n"
       << "  --measure plv|pli|wpli|wpli2_debiased    Which measure to compute (default: plv)\n"
-      << "  --pair CH1:CH2           If set, compute only this pair (otherwise output a full matrix)\n"
+      << "  --pair CH1:CH2           If set, compute only this pair (otherwise output a full matrix).\n"
+      << "                          CH1/CH2 may be channel labels or numeric indices (0- or 1-based).\n"
       << "  --trim FRAC              Edge trim fraction per channel window in [0,0.49] (default: 0.10)\n"
       << "  --plv-zero-phase         Use zero-phase filtering for the PLV internal bandpass (default)\n"
       << "  --plv-causal             Use causal filtering for the PLV internal bandpass\n"
@@ -133,10 +135,27 @@ static std::string normalize_measure(const std::string& m) {
 }
 
 static int find_channel_index(const std::vector<std::string>& channels, const std::string& name) {
-  const std::string target = to_lower(trim(name));
+  if (channels.empty()) return -1;
+  if (name.empty()) return -1;
+
+  // Prefer robust name matching that tolerates common variations like
+  // "EEG Fp1-REF" vs "Fp1".
+  const std::string want = normalize_channel_name(name);
   for (size_t i = 0; i < channels.size(); ++i) {
-    if (to_lower(channels[i]) == target) return static_cast<int>(i);
+    if (normalize_channel_name(channels[i]) == want) return static_cast<int>(i);
   }
+
+  // Convenience: accept numeric indices (0-based or 1-based).
+  bool all_digits = true;
+  for (char c : name) {
+    if (!(c >= '0' && c <= '9')) { all_digits = false; break; }
+  }
+  if (all_digits) {
+    const int idx = to_int(name);
+    if (idx >= 0 && idx < static_cast<int>(channels.size())) return idx;
+    if (idx >= 1 && idx <= static_cast<int>(channels.size())) return idx - 1;
+  }
+
   return -1;
 }
 
@@ -292,6 +311,16 @@ int main(int argc, char** argv) {
         f << band.name << "," << pr_names.first << "," << pr_names.second << "," << v << "\n";
       }
 
+      {
+        const std::string meta_path = args.outdir + "/plv_run_meta.json";
+        std::vector<std::string> outs;
+        outs.push_back("plv_run_meta.json");
+        outs.push_back(measure + "_band.csv");
+        if (!write_run_meta_json(meta_path, "qeeg_plv_cli", args.outdir, args.input_path, outs)) {
+          std::cerr << "Warning: failed to write " << meta_path << "\n";
+        }
+      }
+
       std::cout << "Done. Outputs written to: " << args.outdir << "\n";
       return 0;
     }
@@ -349,6 +378,17 @@ int main(int argc, char** argv) {
         for (size_t j = i + 1; j < C; ++j) {
           f << rec.channel_names[i] << "," << rec.channel_names[j] << "," << mat[i][j] << "\n";
         }
+      }
+    }
+
+    {
+      const std::string meta_path = args.outdir + "/plv_run_meta.json";
+      std::vector<std::string> outs;
+      outs.push_back("plv_run_meta.json");
+      outs.push_back(measure + "_matrix_" + to_lower(band.name) + ".csv");
+      outs.push_back(measure + "_pairs.csv");
+      if (!write_run_meta_json(meta_path, "qeeg_plv_cli", args.outdir, args.input_path, outs)) {
+        std::cerr << "Warning: failed to write " << meta_path << "\n";
       }
     }
 

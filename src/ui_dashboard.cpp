@@ -88,7 +88,7 @@ static std::string infer_group_from_name(const std::string& tool) {
   if (tool.find("plv") != std::string::npos || tool.find("coherence") != std::string::npos || tool.find("pac") != std::string::npos) {
     return "Connectivity";
   }
-  if (tool.find("map") != std::string::npos || tool.find("spectrogram") != std::string::npos || tool.find("epoch") != std::string::npos || tool.find("iaf") != std::string::npos || tool.find("reference") != std::string::npos) {
+  if (tool.find("map") != std::string::npos || tool.find("spectrogram") != std::string::npos || tool.find("spectral_features") != std::string::npos || tool.find("epoch") != std::string::npos || tool.find("iaf") != std::string::npos || tool.find("reference") != std::string::npos || tool.find("bandpower") != std::string::npos || tool.find("bandratios") != std::string::npos) {
     return "Spectral & Maps";
   }
   if (tool.find("channel_qc") != std::string::npos || tool.find("preprocess") != std::string::npos || tool.find("clean") != std::string::npos || tool.find("artifact") != std::string::npos) {
@@ -139,7 +139,7 @@ static std::vector<ToolSpec> default_tools() {
      "qeeg_export_bids_cli --input session.edf --bids-root bids --sub 01 --task rest"},
 
     {"qeeg_export_derivatives_cli", "Inspect & Convert",
-     "Package qeeg outputs (map/qc/iaf/nf/microstates) into a BIDS derivatives layout.",
+     "Package qeeg outputs (map/spec/qc/iaf/nf/microstates) into a BIDS derivatives layout.",
      "qeeg_export_derivatives_cli --bids-root bids --pipeline qeeg --sub 01 --task rest --map-outdir out_map"},
 
     {"qeeg_preprocess_cli", "Preprocess & Clean",
@@ -161,6 +161,18 @@ static std::vector<ToolSpec> default_tools() {
     {"qeeg_map_cli", "Spectral & Maps",
      "Compute per-channel bandpowers and render topographic scalp maps.",
      "qeeg_map_cli --input session.edf --outdir out_map --html-report"},
+
+    {"qeeg_bandpower_cli", "Spectral & Maps",
+     "Compute per-channel bandpower features (CSV + JSON sidecar).",
+     "qeeg_bandpower_cli --input session.edf --outdir out_bp"},
+
+    {"qeeg_bandratios_cli", "Spectral & Maps",
+     "Derive common neurofeedback band ratios from a bandpowers.csv table.",
+     "qeeg_bandratios_cli --bandpowers out_bp/bandpowers.csv --outdir out_ratios --ratio theta/beta"},
+
+    {"qeeg_spectral_features_cli", "Spectral & Maps",
+     "Spectral summary table per channel (entropy, SEF95, peak frequency, ...).",
+     "qeeg_spectral_features_cli --input session.edf --outdir out_spec"},
 
     {"qeeg_reference_cli", "Spectral & Maps",
      "Build a reference CSV (mean/std) for z-scoring bandpowers/topomaps.",
@@ -355,6 +367,55 @@ static std::string capture_stdout(const std::string& cmd, size_t max_bytes) {
   return out;
 }
 
+static std::string read_text_file_head(const std::filesystem::path& path,
+                                      size_t max_bytes,
+                                      size_t max_lines,
+                                      bool* out_truncated) {
+  if (out_truncated) *out_truncated = false;
+  if (max_bytes == 0) max_bytes = 16 * 1024;
+  if (max_lines == 0) max_lines = 80;
+
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return std::string();
+
+  std::string out;
+  out.reserve(std::min<size_t>(max_bytes, 4096));
+
+  std::string line;
+  size_t n_lines = 0;
+  bool truncated = false;
+
+  while (n_lines < max_lines && std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    // Ensure we always leave room for a newline.
+    if (out.size() + line.size() + 1 > max_bytes) {
+      const size_t remain = (max_bytes > out.size()) ? (max_bytes - out.size()) : 0;
+      if (remain > 0) {
+        const size_t take = std::min(remain, line.size());
+        out.append(line.data(), take);
+        if (out.size() < max_bytes) out.push_back('\n');
+      }
+      truncated = true;
+      break;
+    }
+    out += line;
+    out.push_back('\n');
+    ++n_lines;
+    if (out.size() >= max_bytes) {
+      truncated = true;
+      break;
+    }
+  }
+
+  // If we hit the line cap and there's more content, mark as truncated.
+  if (!truncated && n_lines >= max_lines && !f.eof()) {
+    truncated = true;
+  }
+
+  if (out_truncated) *out_truncated = truncated;
+  return out;
+}
+
 static std::filesystem::path resolve_exe_path(const std::filesystem::path& bin_dir,
                                               const std::string& exe_name) {
   std::filesystem::path p = bin_dir / exe_name;
@@ -370,6 +431,7 @@ static std::filesystem::path resolve_exe_path(const std::filesystem::path& bin_d
 struct RunInfo {
   std::filesystem::path meta_path;   // absolute
   std::filesystem::path meta_dir;    // absolute
+  std::string input_path;            // as stored in JSON (best-effort)
   std::vector<std::string> outputs;  // as stored in JSON
   std::filesystem::file_time_type mtime{};
 };
@@ -395,6 +457,7 @@ static std::unordered_map<std::string, RunInfo> scan_latest_runs_by_tool(
     RunInfo info;
     info.meta_path = p;
     info.meta_dir = p.parent_path();
+    info.input_path = read_run_meta_input_path(p.u8string());
     info.outputs = read_run_meta_outputs(p.u8string());
     info.mtime = std::filesystem::last_write_time(p, ec);
     if (ec) info.mtime = std::filesystem::file_time_type{};
@@ -703,12 +766,26 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
           << "Run meta: <a href=\"" << html_escape(rel_link(out_dir, ri.meta_path)) << "\">"
           << html_escape(rel_link(out_dir, ri.meta_path)) << "</a></div>\n";
 
+        if (!ri.input_path.empty()) {
+          std::string base = ri.input_path;
+          try {
+            const std::filesystem::path ip = std::filesystem::u8path(ri.input_path);
+            if (!ip.filename().empty()) base = ip.filename().u8string();
+          } catch (...) {
+            // Keep the raw string.
+          }
+          o << "          <div style=\"color:var(--muted);font-size:12px;margin-bottom:6px\">"
+            << "Input: <code title=\"" << html_escape(ri.input_path) << "\">"
+            << html_escape(base) << "</code></div>\n";
+        }
+
         // Always list the meta itself and outputs.
         if (ri.outputs.empty()) {
           o << "          <div style=\"color:var(--muted);font-size:13px\">No Outputs[] listed in the run meta.</div>\n";
         } else {
           // Separate images for lightweight previews.
           std::vector<std::filesystem::path> image_paths;
+          std::vector<std::filesystem::path> text_paths;
           for (const auto& rel : ri.outputs) {
             const std::filesystem::path p = ri.meta_dir / std::filesystem::u8path(rel);
             const std::string href = rel_link(out_dir, p);
@@ -716,6 +793,9 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
             const std::string ext = to_lower(p.extension().u8string());
             if (ext == ".bmp" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp") {
               image_paths.push_back(p);
+            }
+            if (ext == ".csv" || ext == ".tsv" || ext == ".json" || ext == ".txt" || ext == ".log" || ext == ".md") {
+              text_paths.push_back(p);
             }
           }
           // Preview a small subset of images (avoid bloating the page).
@@ -729,6 +809,26 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
                 << "</a>\n";
             }
             o << "          </div>\n";
+          }
+
+          // Lightweight text previews for small artifacts (CSV/TSV/JSON/TXT).
+          const size_t max_text_previews = 4;
+          if (!text_paths.empty()) {
+            for (size_t k = 0; k < text_paths.size() && k < max_text_previews; ++k) {
+              std::error_code tec;
+              if (!std::filesystem::exists(text_paths[k], tec)) continue;
+              bool truncated = false;
+              const std::string preview = read_text_file_head(text_paths[k], 24 * 1024, 80, &truncated);
+              if (preview.empty()) continue;
+
+              const std::string label = text_paths[k].filename().u8string();
+              o << "          <details>\n";
+              o << "            <summary>Preview " << html_escape(label);
+              if (truncated) o << " (truncated)";
+              o << "</summary>\n";
+              o << "            <pre><code>" << html_escape(preview) << "</code></pre>\n";
+              o << "          </details>\n";
+            }
           }
         }
       }

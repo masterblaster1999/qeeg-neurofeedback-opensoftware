@@ -6,6 +6,7 @@
 #include "qeeg/nf_session.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
+#include "qeeg/run_meta.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/pattern.hpp"
 #include "qeeg/welch_psd.hpp"
@@ -487,6 +488,25 @@ int main(int argc, char** argv) {
     if (do_baseline) {
       std::cout << "Wrote epoch_bandpowers_norm.csv and epoch_bandpowers_norm_summary.csv (mode="
                 << baseline_mode_str << ") to: " << a.outdir << "\n";
+    }
+
+    // Run meta for qeeg_ui_cli
+    {
+      const std::string meta_path = a.outdir + "/epoch_run_meta.json";
+      std::vector<std::string> outs;
+      outs.push_back("events.csv");
+      outs.push_back("events_table.csv");
+      outs.push_back("events_table.tsv");
+      outs.push_back("epoch_bandpowers.csv");
+      outs.push_back("epoch_bandpowers_summary.csv");
+      if (do_baseline) {
+        outs.push_back("epoch_bandpowers_norm.csv");
+        outs.push_back("epoch_bandpowers_norm_summary.csv");
+      }
+      outs.push_back("epoch_run_meta.json");
+      if (!write_run_meta_json(meta_path, "qeeg_epoch_cli", a.outdir, a.input_path, outs)) {
+        std::cerr << "Warning: failed to write run meta JSON: " << meta_path << "\n";
+      }
     }
 
     return 0;

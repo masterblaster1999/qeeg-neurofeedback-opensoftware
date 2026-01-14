@@ -3,6 +3,7 @@
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
+#include "qeeg/run_meta.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -278,6 +279,17 @@ int main(int argc, char** argv) {
         }
       }
 
+      {
+        const std::string meta_path = args.outdir + "/coherence_run_meta.json";
+        std::vector<std::string> outs;
+        outs.push_back("coherence_run_meta.json");
+        outs.push_back(stem + "_band.csv");
+        if (args.export_spectrum) outs.push_back(stem + "_spectrum.csv");
+        if (!write_run_meta_json(meta_path, "qeeg_coherence_cli", args.outdir, args.input_path, outs)) {
+          std::cerr << "Warning: failed to write " << meta_path << "\n";
+        }
+      }
+
       std::cout << "Done. Outputs written to: " << args.outdir << "\n";
       return 0;
     }
@@ -327,6 +339,17 @@ int main(int argc, char** argv) {
         for (size_t j = i + 1; j < C; ++j) {
           f << rec.channel_names[i] << "," << rec.channel_names[j] << "," << mat[i][j] << "\n";
         }
+      }
+    }
+
+    {
+      const std::string meta_path = args.outdir + "/coherence_run_meta.json";
+      std::vector<std::string> outs;
+      outs.push_back("coherence_run_meta.json");
+      outs.push_back(stem + "_matrix_" + to_lower(band.name) + ".csv");
+      outs.push_back(stem + "_pairs.csv");
+      if (!write_run_meta_json(meta_path, "qeeg_coherence_cli", args.outdir, args.input_path, outs)) {
+        std::cerr << "Warning: failed to write " << meta_path << "\n";
       }
     }
 

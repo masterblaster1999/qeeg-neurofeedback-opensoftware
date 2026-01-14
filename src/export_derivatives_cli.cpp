@@ -26,8 +26,28 @@ struct Args {
   BidsEntities ent;
 
   std::string map_outdir;
+  // Outputs from qeeg_bandpower_cli (bandpowers.csv + JSON sidecar)
+  std::string bandpower_outdir;
+
+  // Outputs from qeeg_bandratios_cli (bandratios.csv + JSON sidecar)
+  std::string bandratios_outdir;
+
+  // Outputs from qeeg_spectral_features_cli (spectral_features.csv + JSON sidecar)
+  std::string spectral_features_outdir;
+
+  // Optional connectivity outputs.
+  std::string coherence_outdir;
+  std::string plv_outdir;
+  std::string pac_outdir;
+
   std::string qc_outdir;
+
+  // Optional: outputs from qeeg_artifacts_cli.
+  std::string artifacts_outdir;
+
   std::string nf_outdir;
+  // Outputs from qeeg_epoch_cli (epoch_bandpowers.csv, events_table.tsv, ...)
+  std::string epoch_outdir;
   std::string iaf_outdir;
 
   // Optional: outputs from qeeg_microstates_cli.
@@ -47,8 +67,16 @@ static void print_help() {
       << "Copy qeeg tool outputs into a BIDS Derivatives folder layout.\n\n"
       << "This tool is designed to integrate outputs from:\n"
       << "  - qeeg_map_cli (bandpowers.csv, topomaps, report.html, ...)\n"
+      << "  - qeeg_bandpower_cli (bandpowers.csv, bandpowers.json, ...)\n"
+      << "  - qeeg_bandratios_cli (bandratios.csv, bandratios.json, ...)\n"
+      << "  - qeeg_spectral_features_cli (spectral_features.csv, spectral_features.json, ...)\n"
+      << "  - qeeg_coherence_cli (coherence matrices / edge lists, ...)\n"
+      << "  - qeeg_plv_cli (PLV/PLI/wPLI matrices / edge lists, ...)\n"
+      << "  - qeeg_pac_cli (PAC time series / phase distributions, ...)\n"
       << "  - qeeg_channel_qc_cli (channel_qc.csv, bad_channels.txt, ...)\n"
-      << "  - qeeg_nf_cli (nf_run_meta.json, nf_derived_events.tsv, bandpower_timeseries.csv, ...)\n\n"
+      << "  - qeeg_artifacts_cli (artifact_windows.csv, artifact_segments.csv, artifact_events.tsv, ...)\n"
+      << "  - qeeg_nf_cli (nf_run_meta.json, nf_derived_events.tsv, bandpower_timeseries.csv, ...)\n"
+      << "  - qeeg_epoch_cli (epoch_bandpowers.csv, events_table.tsv, ...)\n\n"
       << "  - qeeg_iaf_cli (iaf_summary.txt, iaf_band_spec.txt, topomap_iaf.bmp, ...)\n"
       << "  - qeeg_microstates_cli (templates, time series, topomap_microstate_*.bmp, ...)\n\n"
       << "When channel QC outputs are provided, it also emits a BIDS-style\n"
@@ -71,8 +99,16 @@ static void print_help() {
       << "  --run <index>               Run index label (alphanumeric; typically digits).\n\n"
       << "Inputs (tool output folders):\n"
       << "  --map-outdir <dir>          Output folder from qeeg_map_cli.\n"
+      << "  --bandpower-outdir <dir>    Output folder from qeeg_bandpower_cli.\n"
+      << "  --bandratios-outdir <dir>   Output folder from qeeg_bandratios_cli.\n"
+      << "  --spectral-features-outdir <dir> Output folder from qeeg_spectral_features_cli.\n"
+      << "  --coherence-outdir <dir>    Output folder from qeeg_coherence_cli.\n"
+      << "  --plv-outdir <dir>          Output folder from qeeg_plv_cli.\n"
+      << "  --pac-outdir <dir>          Output folder from qeeg_pac_cli.\n"
       << "  --qc-outdir <dir>           Output folder from qeeg_channel_qc_cli.\n"
-      << "  --nf-outdir <dir>           Output folder from qeeg_nf_cli.\n\n"
+      << "  --artifacts-outdir <dir>    Output folder from qeeg_artifacts_cli.\n"
+      << "  --nf-outdir <dir>           Output folder from qeeg_nf_cli.\n"
+      << "  --epoch-outdir <dir>        Output folder from qeeg_epoch_cli.\n\n"
       << "  --iaf-outdir <dir>          Output folder from qeeg_iaf_cli.\n\n"
       << "  --microstates-outdir <dir>  Output folder from qeeg_microstates_cli.\n\n"
       << "Derivatives metadata:\n"
@@ -191,6 +227,7 @@ static void write_readme_if_missing(const std::filesystem::path& dir,
   f << "This folder contains derivative outputs produced by the qeeg-neurofeedback-opensoftware toolkit.\n\n";
   f << "Common contents (per recording):\n";
   f << "- qEEG map outputs (bandpowers, PSD exports, topomaps, HTML report)\n";
+  f << "- Spectral summary tables (entropy, edge frequency, peak frequency)\n";
   f << "- Channel quality control summaries\n";
   f << "- Individual Alpha Frequency (IAF) estimates and derived band specs\n";
   f << "- Neurofeedback session logs and derived events\n";
@@ -232,10 +269,26 @@ int main(int argc, char** argv) {
         args.ent.run = require_value(i, argc, argv, a);
       } else if (a == "--map-outdir") {
         args.map_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--bandpower-outdir") {
+        args.bandpower_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--bandratios-outdir") {
+        args.bandratios_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--spectral-features-outdir") {
+        args.spectral_features_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--coherence-outdir") {
+        args.coherence_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--plv-outdir") {
+        args.plv_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--pac-outdir") {
+        args.pac_outdir = require_value(i, argc, argv, a);
       } else if (a == "--qc-outdir") {
         args.qc_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--artifacts-outdir") {
+        args.artifacts_outdir = require_value(i, argc, argv, a);
       } else if (a == "--nf-outdir") {
         args.nf_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--epoch-outdir") {
+        args.epoch_outdir = require_value(i, argc, argv, a);
       } else if (a == "--iaf-outdir") {
         args.iaf_outdir = require_value(i, argc, argv, a);
       } else if (a == "--microstates-outdir") {
@@ -395,6 +448,115 @@ int main(int argc, char** argv) {
 
     }
 
+    // --- Copy bandpower-only outputs (qeeg_bandpower_cli) ---
+    if (!args.bandpower_outdir.empty()) {
+      const std::filesystem::path bp = std::filesystem::u8path(args.bandpower_outdir);
+      if (!std::filesystem::exists(bp) || !std::filesystem::is_directory(bp)) {
+        throw std::runtime_error("--bandpower-outdir is not a directory: " + bp.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(bp, "bandpower_run_meta.json", eeg_dir, stem, "qeegbp", args.overwrite);
+      if (!used_meta) {
+        copy_if_exists(bp / "bandpowers.csv", eeg_dir / (stem + "_desc-qeegbp_bandpowers.csv"), args.overwrite);
+        copy_if_exists(bp / "bandpowers.json", eeg_dir / (stem + "_desc-qeegbp_bandpowers.json"), args.overwrite);
+        copy_if_exists(bp / "bandpower_run_meta.json", eeg_dir / (stem + "_desc-qeegbp_bandpower_run_meta.json"), args.overwrite);
+      }
+
+      // BIDS-friendly TSV alias.
+      if (std::filesystem::exists(bp / "bandpowers.csv")) {
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegbp_bandpowers.tsv");
+        ensure_writable(dst, args.overwrite);
+        convert_csv_file_to_tsv((bp / "bandpowers.csv").u8string(), dst.u8string());
+      }
+    }
+
+    // --- Copy band ratios outputs (qeeg_bandratios_cli) ---
+    if (!args.bandratios_outdir.empty()) {
+      const std::filesystem::path br = std::filesystem::u8path(args.bandratios_outdir);
+      if (!std::filesystem::exists(br) || !std::filesystem::is_directory(br)) {
+        throw std::runtime_error("--bandratios-outdir is not a directory: " + br.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(br, "bandratios_run_meta.json", eeg_dir, stem, "qeegratio", args.overwrite);
+      if (!used_meta) {
+        copy_if_exists(br / "bandratios.csv", eeg_dir / (stem + "_desc-qeegratio_bandratios.csv"), args.overwrite);
+        copy_if_exists(br / "bandratios.json", eeg_dir / (stem + "_desc-qeegratio_bandratios.json"), args.overwrite);
+        copy_if_exists(br / "bandratios.tsv", eeg_dir / (stem + "_desc-qeegratio_bandratios.tsv"), args.overwrite);
+        copy_if_exists(br / "bandratios_run_meta.json", eeg_dir / (stem + "_desc-qeegratio_bandratios_run_meta.json"), args.overwrite);
+      }
+
+      // BIDS-friendly TSV alias (generate if missing; skip if already present from manifest/tool).
+      if (std::filesystem::exists(br / "bandratios.csv")) {
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegratio_bandratios.tsv");
+        if (args.overwrite || !std::filesystem::exists(dst)) {
+          ensure_directory(dst.parent_path().u8string());
+          ensure_writable(dst, args.overwrite);
+          convert_csv_file_to_tsv((br / "bandratios.csv").u8string(), dst.u8string());
+        }
+      }
+    }
+
+    // --- Copy spectral summary outputs (qeeg_spectral_features_cli) ---
+    if (!args.spectral_features_outdir.empty()) {
+      const std::filesystem::path sf = std::filesystem::u8path(args.spectral_features_outdir);
+      if (!std::filesystem::exists(sf) || !std::filesystem::is_directory(sf)) {
+        throw std::runtime_error("--spectral-features-outdir is not a directory: " + sf.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(sf, "spectral_features_run_meta.json", eeg_dir, stem, "qeegspec", args.overwrite);
+      if (!used_meta) {
+        copy_if_exists(sf / "spectral_features.csv", eeg_dir / (stem + "_desc-qeegspec_spectral_features.csv"), args.overwrite);
+        copy_if_exists(sf / "spectral_features.json", eeg_dir / (stem + "_desc-qeegspec_spectral_features.json"), args.overwrite);
+        copy_if_exists(sf / "spectral_features_run_meta.json",
+                       eeg_dir / (stem + "_desc-qeegspec_spectral_features_run_meta.json"),
+                       args.overwrite);
+      }
+
+      // BIDS-friendly TSV alias.
+      if (std::filesystem::exists(sf / "spectral_features.csv")) {
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegspec_spectral_features.tsv");
+        ensure_writable(dst, args.overwrite);
+        convert_csv_file_to_tsv((sf / "spectral_features.csv").u8string(), dst.u8string());
+      }
+    }
+
+    // --- Copy connectivity outputs ---
+    // These tools emit lightweight *_run_meta.json manifests which we prefer.
+    auto copy_connectivity_tool = [&](const std::string& flag,
+                                      const std::string& outdir,
+                                      const std::string& meta_name,
+                                      const std::string& desc) {
+      if (outdir.empty()) return;
+      const std::filesystem::path d = std::filesystem::u8path(outdir);
+      if (!std::filesystem::exists(d) || !std::filesystem::is_directory(d)) {
+        throw std::runtime_error(flag + " is not a directory: " + d.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(d, meta_name, eeg_dir, stem, desc, args.overwrite);
+      if (!used_meta) {
+        // Fallback: copy any CSV outputs and the run meta file if present.
+        for (const auto& p : list_matching_files(d, "", ".csv")) {
+          const std::string fname = p.filename().u8string();
+          copy_file_or_throw(p, eeg_dir / (stem + "_desc-" + desc + "_" + fname), args.overwrite);
+        }
+        copy_if_exists(d / meta_name, eeg_dir / (stem + "_desc-" + desc + "_" + meta_name), args.overwrite);
+      }
+
+      // TSV aliases for any CSV tables in the source outdir.
+      for (const auto& p : list_matching_files(d, "", ".csv")) {
+        const std::string fname = p.filename().u8string();
+        if (fname.size() < 4) continue;
+        std::string tsv_name = fname.substr(0, fname.size() - 4) + ".tsv";
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-" + desc + "_" + tsv_name);
+        ensure_writable(dst, args.overwrite);
+        convert_csv_file_to_tsv(p.u8string(), dst.u8string());
+      }
+    };
+
+    copy_connectivity_tool("--coherence-outdir", args.coherence_outdir, "coherence_run_meta.json", "qeegcoh");
+    copy_connectivity_tool("--plv-outdir", args.plv_outdir, "plv_run_meta.json", "qeegplv");
+    copy_connectivity_tool("--pac-outdir", args.pac_outdir, "pac_run_meta.json", "qeegpac");
+
     // --- Copy channel QC outputs ---
     if (!args.qc_outdir.empty()) {
       const std::filesystem::path qc = std::filesystem::u8path(args.qc_outdir);
@@ -497,6 +659,41 @@ int main(int argc, char** argv) {
       }
     }
 
+    // --- Copy artifact detection outputs ---
+    if (!args.artifacts_outdir.empty()) {
+      const std::filesystem::path art = std::filesystem::u8path(args.artifacts_outdir);
+      if (!std::filesystem::exists(art) || !std::filesystem::is_directory(art)) {
+        throw std::runtime_error("--artifacts-outdir is not a directory: " + art.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(art, "artifact_run_meta.json", eeg_dir, stem, "qeegart", args.overwrite);
+      if (!used_meta) {
+        // Fallback: copy any CSV/TXT/JSON outputs we recognize.
+        for (const auto& p : list_matching_files(art, "", ".csv")) {
+          const std::string fname = p.filename().u8string();
+          copy_file_or_throw(p, eeg_dir / (stem + "_desc-qeegart_" + fname), args.overwrite);
+        }
+        for (const auto& p : list_matching_files(art, "", ".txt")) {
+          const std::string fname = p.filename().u8string();
+          copy_file_or_throw(p, eeg_dir / (stem + "_desc-qeegart_" + fname), args.overwrite);
+        }
+        for (const auto& p : list_matching_files(art, "", ".json")) {
+          const std::string fname = p.filename().u8string();
+          copy_file_or_throw(p, eeg_dir / (stem + "_desc-qeegart_" + fname), args.overwrite);
+        }
+      }
+
+      // TSV aliases for any CSV tables in the source outdir.
+      for (const auto& p : list_matching_files(art, "", ".csv")) {
+        const std::string fname = p.filename().u8string();
+        if (fname.size() < 4) continue;
+        std::string tsv_name = fname.substr(0, fname.size() - 4) + ".tsv";
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegart_" + tsv_name);
+        ensure_writable(dst, args.overwrite);
+        convert_csv_file_to_tsv(p.u8string(), dst.u8string());
+      }
+    }
+
     // --- Copy neurofeedback outputs ---
     if (!args.nf_outdir.empty()) {
       const std::filesystem::path nf = std::filesystem::u8path(args.nf_outdir);
@@ -535,7 +732,7 @@ int main(int argc, char** argv) {
       copy_if_exists(nf / "nf_derived_events.tsv", eeg_dir / (stem + "_desc-qeegnf_events.tsv"), args.overwrite);
       copy_if_exists(nf / "nf_derived_events.json", eeg_dir / (stem + "_desc-qeegnf_events.json"), args.overwrite);
 
-// Copy any additional *_timeseries.csv outputs (e.g., coherence modes) not already listed.
+      // Copy any additional *_timeseries.csv outputs (e.g., coherence modes) not already listed.
       for (const auto& p : list_matching_files(nf, "", "_timeseries.csv")) {
         const std::string fname = p.filename().u8string();
         if (listed.find(fname) != listed.end()) continue;
@@ -546,6 +743,41 @@ int main(int argc, char** argv) {
     }
 
 
+
+    // --- Copy epoch/segment feature outputs (qeeg_epoch_cli) ---
+    if (!args.epoch_outdir.empty()) {
+      const std::filesystem::path ep = std::filesystem::u8path(args.epoch_outdir);
+      if (!std::filesystem::exists(ep) || !std::filesystem::is_directory(ep)) {
+        throw std::runtime_error("--epoch-outdir is not a directory: " + ep.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(ep, "epoch_run_meta.json", eeg_dir, stem, "qeegepoch", args.overwrite);
+      if (!used_meta) {
+        // Fallback: copy known outputs.
+        copy_if_exists(ep / "events.csv", eeg_dir / (stem + "_desc-qeegepoch_events.csv"), args.overwrite);
+        copy_if_exists(ep / "events_table.csv", eeg_dir / (stem + "_desc-qeegepoch_events_table.csv"), args.overwrite);
+        copy_if_exists(ep / "events_table.tsv", eeg_dir / (stem + "_desc-qeegepoch_events_table.tsv"), args.overwrite);
+        copy_if_exists(ep / "epoch_bandpowers.csv", eeg_dir / (stem + "_desc-qeegepoch_epoch_bandpowers.csv"), args.overwrite);
+        copy_if_exists(ep / "epoch_bandpowers_summary.csv", eeg_dir / (stem + "_desc-qeegepoch_epoch_bandpowers_summary.csv"), args.overwrite);
+        copy_if_exists(ep / "epoch_bandpowers_norm.csv", eeg_dir / (stem + "_desc-qeegepoch_epoch_bandpowers_norm.csv"), args.overwrite);
+        copy_if_exists(ep / "epoch_bandpowers_norm_summary.csv", eeg_dir / (stem + "_desc-qeegepoch_epoch_bandpowers_norm_summary.csv"), args.overwrite);
+        copy_if_exists(ep / "epoch_run_meta.json", eeg_dir / (stem + "_desc-qeegepoch_epoch_run_meta.json"), args.overwrite);
+      }
+
+      // Emit a BIDS-style events.tsv alias for the (BIDS-style) events table if present.
+      // qeeg_epoch_cli writes events_table.tsv with onset/duration/trial_type columns.
+      copy_if_exists(ep / "events_table.tsv", eeg_dir / (stem + "_desc-qeegepoch_events.tsv"), args.overwrite);
+
+      // TSV aliases for any CSV tables in the source outdir.
+      for (const auto& p : list_matching_files(ep, "", ".csv")) {
+        const std::string fname = p.filename().u8string();
+        if (fname.size() < 4) continue;
+        std::string tsv_name = fname.substr(0, fname.size() - 4) + ".tsv";
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegepoch_" + tsv_name);
+        ensure_writable(dst, args.overwrite);
+        convert_csv_file_to_tsv(p.u8string(), dst.u8string());
+      }
+    }
 
     // --- Copy IAF outputs ---
     if (!args.iaf_outdir.empty()) {

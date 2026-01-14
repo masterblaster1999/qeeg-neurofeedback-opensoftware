@@ -2863,7 +2863,7 @@ int main(int argc, char** argv) {
               if (continuous_feedback && !feedback_span_ready) {
                 if (!baseline_values.empty()) {
                   std::vector<double> tmp = baseline_values;
-                  const double med = median_inplace(tmp);
+                  const double med = median_inplace(&tmp);
                   const double sc = robust_scale(baseline_values, med);
                   if (std::isfinite(sc) && sc > 0.0) {
                     feedback_span_used = sc;
@@ -3122,7 +3122,7 @@ int main(int argc, char** argv) {
               if (continuous_feedback && !feedback_span_ready) {
                 if (!baseline_values.empty()) {
                   std::vector<double> tmp = baseline_values;
-                  const double med = median_inplace(tmp);
+                  const double med = median_inplace(&tmp);
                   const double sc = robust_scale(baseline_values, med);
                   if (std::isfinite(sc) && sc > 0.0) {
                     feedback_span_used = sc;
@@ -3411,7 +3411,7 @@ int main(int argc, char** argv) {
             if (continuous_feedback && !feedback_span_ready) {
               if (!baseline_values.empty()) {
                 std::vector<double> tmp = baseline_values;
-                const double med = median_inplace(tmp);
+                const double med = median_inplace(&tmp);
                 const double scale = robust_scale(baseline_values, med);
                 if (std::isfinite(scale) && scale > 0.0) {
                   feedback_span_used = scale;

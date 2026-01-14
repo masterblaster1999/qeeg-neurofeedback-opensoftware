@@ -60,7 +60,6 @@ std::vector<std::string> split_commandline_args(const std::string& s) {
 
   bool in_single = false;
   bool in_double = false;
-  bool escaping = false;
 
   auto flush = [&]() {
     if (!cur.empty()) {
@@ -72,15 +71,45 @@ std::vector<std::string> split_commandline_args(const std::string& s) {
   for (size_t i = 0; i < s.size(); ++i) {
     const char c = s[i];
 
-    if (escaping) {
-      cur.push_back(c);
-      escaping = false;
-      continue;
-    }
+    // Quote handling (best-effort, dependency-free).
+    //
+    // Single quotes: treat everything literally until the next '.
+    // Double quotes: treat everything literally until the next ".
+    //
+    // Backslash behavior is intentionally conservative:
+    // - Outside quotes, backslash is only treated as an escape when it
+    //   precedes whitespace or a quote character. Otherwise it is preserved.
+    //   This makes Windows-style paths like C:\\temp\\file.edf work without
+    //   requiring the user to double-escape every backslash.
+    // - Inside double quotes, backslash may escape ", \\, or whitespace.
+    // - Inside single quotes, backslash is always literal (common shell rule).
+    if (c == '\\' && !in_single) {
+      if (i + 1 < s.size()) {
+        const char n = s[i + 1];
 
-    if (c == '\\') {
-      // Backslash escapes the next character.
-      escaping = true;
+        const bool n_is_space = is_space(n);
+        const bool n_is_quote = (n == '\'' || n == '"');
+        const bool n_is_backslash = (n == '\\');
+
+        bool do_escape = false;
+        if (in_double) {
+          // In double quotes, allow escaping of quotes/backslash/whitespace.
+          do_escape = n_is_space || n == '"' || n_is_backslash;
+        } else {
+          // Outside quotes, only escape whitespace or quotes.
+          do_escape = n_is_space || n_is_quote;
+        }
+
+        if (do_escape) {
+          // Consume the escaped character.
+          ++i;
+          cur.push_back(n);
+          continue;
+        }
+      }
+
+      // Default: preserve the backslash literally.
+      cur.push_back('\\');
       continue;
     }
 
@@ -99,11 +128,6 @@ std::vector<std::string> split_commandline_args(const std::string& s) {
     }
 
     cur.push_back(c);
-  }
-
-  if (escaping) {
-    // Trailing backslash: keep it literal.
-    cur.push_back('\\');
   }
 
   flush();

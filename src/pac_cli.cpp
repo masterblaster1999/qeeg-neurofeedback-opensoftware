@@ -3,6 +3,7 @@
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
+#include "qeeg/run_meta.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -257,6 +258,8 @@ int main(int argc, char** argv) {
     // Optional: average phase distribution (MI only).
     std::vector<double> dist_acc;
     size_t dist_n = 0;
+    bool wrote_dist = false;
+
 
     for (const auto& fr : frames) {
       if (!std::isfinite(fr.value)) continue;
@@ -325,10 +328,23 @@ int main(int argc, char** argv) {
     if (opt.pac.method == PacMethod::ModulationIndex && !dist_acc.empty() && dist_n > 0) {
       std::ofstream d(args.outdir + "/pac_phase_distribution.csv");
       if (d) {
+        wrote_dist = true;
         d << "bin_index,prob\n";
         for (size_t i = 0; i < dist_acc.size(); ++i) {
           d << i << "," << (dist_acc[i] / static_cast<double>(dist_n)) << "\n";
         }
+      }
+    }
+
+    {
+      const std::string meta_path = args.outdir + "/pac_run_meta.json";
+      std::vector<std::string> outs;
+      outs.push_back("pac_run_meta.json");
+      outs.push_back("pac_timeseries.csv");
+      outs.push_back("pac_summary.txt");
+      if (wrote_dist) outs.push_back("pac_phase_distribution.csv");
+      if (!write_run_meta_json(meta_path, "qeeg_pac_cli", args.outdir, args.input_path, outs)) {
+        std::cerr << "Warning: failed to write " << meta_path << "\n";
       }
     }
 

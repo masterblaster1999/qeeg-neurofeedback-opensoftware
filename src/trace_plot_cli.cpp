@@ -3,6 +3,7 @@
 #include "qeeg/nf_session.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
+#include "qeeg/run_meta.hpp"
 #include "qeeg/robust_stats.hpp"
 #include "qeeg/svg_utils.hpp"
 #include "qeeg/utils.hpp"
@@ -599,6 +600,21 @@ int main(int argc, char** argv) {
         m << "zero_phase=" << (args.zero_phase ? 1 : 0) << "\n";
       }
       std::cout << "Wrote: " << meta << "\n";
+    }
+
+    // Run manifest for qeeg_ui_cli / qeeg_ui_server_cli discovery.
+    {
+      const std::string meta_path = args.outdir + "/trace_plot_run_meta.json";
+      std::vector<std::string> outs;
+      outs.push_back(args.output_name);
+      outs.push_back("trace_plot_meta.txt");
+      outs.push_back("trace_plot_run_meta.json");
+
+      if (!write_run_meta_json(meta_path, "qeeg_trace_plot_cli", args.outdir, args.input_path, outs)) {
+        std::cerr << "Warning: failed to write trace_plot_run_meta.json to: " << meta_path << "\n";
+      } else {
+        std::cout << "Wrote: " << meta_path << "\n";
+      }
     }
 
     return 0;

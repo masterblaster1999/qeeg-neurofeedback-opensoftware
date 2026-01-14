@@ -1,4 +1,6 @@
 #include "qeeg/channel_map.hpp"
+#include "qeeg/bdf_writer.hpp"
+#include "qeeg/brainvision_writer.hpp"
 #include "qeeg/csv_io.hpp"
 #include "qeeg/edf_writer.hpp"
 #include "qeeg/line_noise.hpp"
@@ -52,8 +54,16 @@ struct Args {
   std::string patient_id{"X"};
   std::string recording_id{"qeeg-preprocess"};
   std::string phys_dim{"uV"};
+  // If true, disable writing EDF+/BDF+ annotations even if events exist.
+  // (EDF: omit "EDF Annotations" signal; BDF: omit "BDF Annotations" signal.)
   bool plain_edf{false};
   int annotation_spr{0};
+
+  // Output options (BrainVision)
+  BrainVisionBinaryFormat bv_binary_format{BrainVisionBinaryFormat::Float32};
+  std::string bv_unit{"uV"};
+  double bv_int16_resolution{0.0};
+  int bv_int16_target_max_digital{30000};
 
   // Output options (CSV)
   bool write_time{true};
@@ -62,10 +72,10 @@ struct Args {
 static void print_help() {
   std::cout
       << "qeeg_preprocess_cli\n\n"
-      << "Apply basic preprocessing (CAR, notch, bandpass) and export to EDF/EDF+ or CSV.\n"
+      << "Apply basic preprocessing (CAR, notch, bandpass) and export to EDF/EDF+, BDF/BDF+, BrainVision, or CSV.\n"
       << "Designed for interoperability with BioTrace+/NeXus exports and quick dataset hygiene.\n\n"
       << "Usage:\n"
-      << "  qeeg_preprocess_cli --input <in.edf|in.bdf|in.csv|in.txt> --output <out.edf|out.csv> [options]\n\n"
+      << "  qeeg_preprocess_cli --input <in.edf|in.bdf|in.csv|in.txt> --output <out.edf|out.bdf|out.vhdr|out.csv> [options]\n\n"
       << "Input formats:\n"
       << "  .edf/.edf+/.bdf/.bdf+   (recommended)\n"
       << "  .csv/.txt/.tsv/.asc     (ASCII exports; pass --fs if there is no time column)\n\n"
@@ -84,13 +94,20 @@ static void print_help() {
       << "  --zero-phase                 Offline forward-backward filtering (less phase distortion).\n\n"
       << "Input/CSV options:\n"
       << "  --fs <Hz>                    Sampling rate hint for CSV/ASCII (0 = infer from time column).\n\n"
-      << "Output (EDF) options:\n"
-      << "  --record-duration <sec>      EDF datarecord duration (default 1.0; <=0 writes a single record).\n"
-      << "  --patient-id <text>          EDF header patient id (default 'X').\n"
-      << "  --recording-id <text>        EDF header recording id (default 'qeeg-preprocess').\n"
+      << "Output (EDF/BDF) options:\n"
+      << "  --record-duration <sec>      EDF/BDF datarecord duration (default 1.0; <=0 writes a single record).\n"
+      << "  --patient-id <text>          EDF/BDF header patient id (default 'X').\n"
+      << "  --recording-id <text>        EDF/BDF header recording id (default 'qeeg-preprocess').\n"
       << "  --phys-dim <text>            Physical dimension string (default 'uV').\n"
-      << "  --plain-edf                  Force classic EDF (no EDF+ annotations channel).\n"
+      << "  --plain-edf                  Force classic EDF/BDF (no EDF+/BDF+ annotations channel).\n"
+      << "  --plain-bdf                  Alias for --plain-edf when writing .bdf outputs.\n"
       << "  --annotation-spr <N>         Override annotation samples/record (0 = auto).\n\n"
+      << "Output (BrainVision) options (only used when --output ends with .vhdr):\n"
+      << "  --float32                    Write IEEE_FLOAT_32 samples (default).\n"
+      << "  --int16                      Write INT_16 samples with per-channel resolution.\n"
+      << "  --int16-resolution <uV>      Fixed resolution in physical units (uV) for all channels (0 = auto).\n"
+      << "  --int16-target-max <N>       Auto-resolution target max digital value (default 30000).\n"
+      << "  --unit <text>                Channel unit string (default 'uV').\n\n"
       << "Output (CSV) options:\n"
       << "  --no-time                    Do not write a leading time column.\n\n"
       << "Events:\n"
@@ -178,10 +195,20 @@ int main(int argc, char** argv) {
         args.recording_id = require_value(i, argc, argv, a);
       } else if (a == "--phys-dim") {
         args.phys_dim = require_value(i, argc, argv, a);
-      } else if (a == "--plain-edf") {
+      } else if (a == "--plain-edf" || a == "--plain-bdf") {
         args.plain_edf = true;
       } else if (a == "--annotation-spr") {
         args.annotation_spr = std::stoi(require_value(i, argc, argv, a));
+      } else if (a == "--float32") {
+        args.bv_binary_format = BrainVisionBinaryFormat::Float32;
+      } else if (a == "--int16") {
+        args.bv_binary_format = BrainVisionBinaryFormat::Int16;
+      } else if (a == "--int16-resolution") {
+        args.bv_int16_resolution = std::stod(require_value(i, argc, argv, a));
+      } else if (a == "--int16-target-max") {
+        args.bv_int16_target_max_digital = std::stoi(require_value(i, argc, argv, a));
+      } else if (a == "--unit") {
+        args.bv_unit = require_value(i, argc, argv, a);
       } else if (a == "--no-time") {
         args.write_time = false;
       } else {
@@ -257,12 +284,42 @@ int main(int argc, char** argv) {
       std::cout << "Wrote "
                 << ((wopts.write_edfplus_annotations && !rec.events.empty()) ? "EDF+ (with annotations)" : "EDF")
                 << ": " << args.output_path << "\n";
+    } else if (ends_with(out_low, ".bdf") || ends_with(out_low, ".bdf+")) {
+      ensure_parent_dir(args.output_path);
+
+      BDFWriterOptions wopts;
+      wopts.record_duration_seconds = args.record_duration_seconds;
+      wopts.patient_id = args.patient_id;
+      wopts.recording_id = args.recording_id;
+      wopts.physical_dimension = args.phys_dim;
+      wopts.write_bdfplus_annotations = !args.plain_edf;
+      wopts.annotation_samples_per_record = args.annotation_spr;
+
+      BDFWriter w;
+      w.write(rec, args.output_path, wopts);
+
+      std::cout << "Wrote "
+                << ((wopts.write_bdfplus_annotations && !rec.events.empty()) ? "BDF+ (with annotations)" : "BDF")
+                << ": " << args.output_path << "\n";
+    } else if (ends_with(out_low, ".vhdr")) {
+      ensure_parent_dir(args.output_path);
+
+      BrainVisionWriterOptions wopts;
+      wopts.binary_format = args.bv_binary_format;
+      wopts.unit = args.bv_unit;
+      wopts.int16_resolution = args.bv_int16_resolution;
+      wopts.int16_target_max_digital = args.bv_int16_target_max_digital;
+
+      BrainVisionWriter w;
+      w.write(rec, args.output_path, wopts);
+
+      std::cout << "Wrote BrainVision set: " << args.output_path << "\n";
     } else if (ends_with(out_low, ".csv")) {
       ensure_parent_dir(args.output_path);
       write_recording_csv(args.output_path, rec, args.write_time);
       std::cout << "Wrote CSV: " << args.output_path << "\n";
     } else {
-      throw std::runtime_error("Unsupported output extension (use .edf or .csv): " + args.output_path);
+      throw std::runtime_error("Unsupported output extension (use .edf/.bdf/.vhdr or .csv): " + args.output_path);
     }
 
     if (!args.events_out_csv.empty()) {

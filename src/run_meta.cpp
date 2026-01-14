@@ -1,4 +1,5 @@
 #include "qeeg/run_meta.hpp"
+#include "qeeg/utils.hpp"
 
 #include <cctype>
 #include <fstream>
@@ -158,6 +159,63 @@ static std::string parse_string_value_after(size_t pos,
   return v;
 }
 
+static size_t find_matching_brace(const std::string& s, size_t open_pos) {
+  if (open_pos >= s.size() || s[open_pos] != '{') return std::string::npos;
+  int depth = 0;
+  bool in_str = false;
+  bool esc = false;
+
+  for (size_t i = open_pos; i < s.size(); ++i) {
+    const char c = s[i];
+    if (in_str) {
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (c == '\\') {
+        esc = true;
+        continue;
+      }
+      if (c == '"') {
+        in_str = false;
+      }
+      continue;
+    }
+
+    if (c == '"') {
+      in_str = true;
+      continue;
+    }
+
+    if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+      if (depth == 0) return i + 1;
+    }
+  }
+  return std::string::npos;
+}
+
+static std::string parse_input_path_from_input_object(const std::string& s) {
+  const size_t pos = find_key(s, "Input");
+  if (pos == std::string::npos) return std::string();
+
+  size_t i = s.find(':', pos);
+  if (i == std::string::npos) return std::string();
+  ++i;
+  skip_ws(s, &i);
+  if (i >= s.size() || s[i] != '{') return std::string();
+
+  const size_t end = find_matching_brace(s, i);
+  if (end == std::string::npos || end <= i) return std::string();
+  const std::string sub = s.substr(i, end - i);
+
+  const size_t p2 = find_key(sub, "Path");
+  if (p2 == std::string::npos) return std::string();
+  return parse_string_value_after(p2, sub);
+}
+
 } // namespace
 
 std::vector<std::string> read_run_meta_outputs(const std::string& json_path) {
@@ -172,6 +230,65 @@ std::string read_run_meta_tool(const std::string& json_path) {
   if (s.empty()) return std::string();
   const size_t pos = find_key(s, "Tool");
   return parse_string_value_after(pos, s);
+}
+
+std::string read_run_meta_input_path(const std::string& json_path) {
+  const std::string s = read_all(json_path);
+  if (s.empty()) return std::string();
+
+  // Primary: run_meta.cpp writer schema.
+  {
+    const size_t pos = find_key(s, "InputPath");
+    const std::string v = parse_string_value_after(pos, s);
+    if (!v.empty()) return v;
+  }
+
+  // Legacy: nf_run_meta.json uses "input_path".
+  {
+    const size_t pos = find_key(s, "input_path");
+    const std::string v = parse_string_value_after(pos, s);
+    if (!v.empty()) return v;
+  }
+
+  // Common: Input: { Path: ... }.
+  return parse_input_path_from_input_object(s);
+}
+
+
+
+bool write_run_meta_json(const std::string& json_path,
+                         const std::string& tool,
+                         const std::string& outdir,
+                         const std::string& input_path,
+                         const std::vector<std::string>& outputs) {
+  std::ofstream out(json_path, std::ios::binary);
+  if (!out) return false;
+
+  auto write_string_or_null = [&](const std::string& s) {
+    if (s.empty()) {
+      out << "null";
+    } else {
+      out << "\"" << json_escape(s) << "\"";
+    }
+  };
+
+  out << "{\n";
+  out << "  \"Tool\": \"" << json_escape(tool) << "\",\n";
+  out << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+  out << "  \"OutputDir\": \"" << json_escape(outdir) << "\",\n";
+  out << "  \"InputPath\": ";
+  write_string_or_null(input_path);
+  out << ",\n";
+
+  out << "  \"Outputs\": [\n";
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    out << "    \"" << json_escape(outputs[i]) << "\"";
+    if (i + 1 < outputs.size()) out << ",";
+    out << "\n";
+  }
+  out << "  ]\n";
+  out << "}\n";
+  return true;
 }
 
 } // namespace qeeg

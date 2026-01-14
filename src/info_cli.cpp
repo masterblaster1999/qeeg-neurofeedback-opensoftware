@@ -93,29 +93,6 @@ static Args parse_args(int argc, char** argv) {
   return a;
 }
 
-static std::string json_escape(const std::string& s) {
-  std::ostringstream oss;
-  for (char c : s) {
-    switch (c) {
-      case '\\': oss << "\\\\"; break;
-      case '"': oss << "\\\""; break;
-      case '\n': oss << "\\n"; break;
-      case '\r': oss << "\\r"; break;
-      case '\t': oss << "\\t"; break;
-      default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          oss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-              << static_cast<int>(static_cast<unsigned char>(c))
-              << std::dec << std::setw(0) << std::setfill(' ');
-        } else {
-          oss << c;
-        }
-        break;
-    }
-  }
-  return oss.str();
-}
-
 static std::string json_number(double x) {
   if (!std::isfinite(x)) return "null";
   std::ostringstream oss;

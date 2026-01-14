@@ -29,6 +29,10 @@ inline double median_inplace(std::vector<double>* v) {
   return med;
 }
 
+// Convenience overload: accepts a non-null vector by reference.
+inline double median_inplace(std::vector<double>& v) { return median_inplace(&v); }
+
+
 // Linearly-interpolated empirical quantile.
 //
 // - q is clamped to [0,1].
@@ -62,6 +66,10 @@ inline double quantile_inplace(std::vector<double>* v, double q) {
   const double t = idx - static_cast<double>(lo);
   return a + (b - a) * t;
 }
+
+// Convenience overload: accepts a non-null vector by reference.
+inline double quantile_inplace(std::vector<double>& v, double q) { return quantile_inplace(&v, q); }
+
 
 inline double quantile(const std::vector<double>& values, double q) {
   std::vector<double> tmp = values;

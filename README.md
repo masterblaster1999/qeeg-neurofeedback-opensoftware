@@ -58,6 +58,26 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
+### CMake presets (optional)
+
+If you have **CMake >= 3.19**, you can use the included `CMakePresets.json`:
+
+```bash
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+```
+
+### Useful build options
+
+```bash
+# Build only the qeeg library (skip all CLI tools)
+cmake -S . -B build -DQEEG_BUILD_CLI=OFF
+
+# Enable AddressSanitizer + UndefinedBehaviorSanitizer (best-effort; non-MSVC)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DQEEG_ENABLE_SANITIZERS=ON
+```
+
 ## Install (optional)
 
 You can optionally install the **qeeg** library and the CLI tools:
@@ -108,6 +128,8 @@ dashboard are enabled only when you serve the UI with the local server:
 
 This serves the dashboard at `http://127.0.0.1:8765/` and exposes a tiny local-only API that lets the
 UI launch `qeeg_*_cli` executables and write per-run logs under `.../ui_runs/`.
+
+Windows note: the server launches tools via the Win32 process APIs and redirects stdout/stderr into the per-run `run.log`. The UI 'Kill' button force-terminates the process (best-effort).
 
 The server prints a random API token on startup. The dashboard fetches it automatically, but if you
 call the API yourself (e.g. with `curl`), you must include it in the `X-QEEG-Token` header.
@@ -163,19 +185,55 @@ stacked time-series trace plot to a single SVG file:
 The SVG includes optional vertical markers for EDF+/BDF+ annotations/events (disable with
 `--no-events`).
 
+Outputs (under `--outdir`):
+- `traces.svg` (or the filename passed via `--output`)
+- `trace_plot_meta.txt` — parameters used (for reproducibility)
+- `trace_plot_run_meta.json` — manifest used by `qeeg_ui_cli` to auto-link run artifacts
+
 ### 0b) Check 50/60 Hz line-noise (choose a notch frequency)
 
 If you don't know whether your recording is contaminated by **50 Hz** or **60 Hz** power-line
 interference (common when receiving exports from other labs/regions), you can run:
 
 ```bash
+# Human-readable summary to stdout
 ./build/qeeg_quality_cli --input path/to/recording.edf
 
-# JSON (script-friendly)
+# Write a small report bundle under --outdir (useful for qeeg_ui_cli auto-linking)
+./build/qeeg_quality_cli --input path/to/recording.edf --outdir out_quality
+
+# JSON to stdout (script-friendly)
 ./build/qeeg_quality_cli --input path/to/recording.edf --json
+
+# JSON to stdout + also write the report bundle
+./build/qeeg_quality_cli --input path/to/recording.edf --json --outdir out_quality
 ```
 
+Outputs (when `--outdir` is set):
+- `quality_report.json` — machine-readable report (includes per-channel 50/60 ratios)
+- `quality_summary.txt` — human summary
+- `line_noise_per_channel.csv` — per-channel candidate ratios + PSD density means
+- `quality_run_meta.json` — manifest used by `qeeg_ui_cli` to auto-link run artifacts
+
 Then pass `--notch 50` or `--notch 60` to the analysis CLIs as needed.
+
+### 0d) Spectral summary features (entropy, SEF95, peak frequency)
+
+If you want quick per-channel **spectral summary** features derived from a Welch PSD
+(useful for simple QC, vigilance proxies, or lightweight feature extraction), run:
+
+```bash
+./build/qeeg_spectral_features_cli --input path/to/recording.edf --outdir out_spec
+
+# Restrict the analysis range and choose a different spectral edge fraction
+./build/qeeg_spectral_features_cli --input path/to/recording.edf --outdir out_spec \
+  --range 1 40 --edge 0.95
+```
+
+Outputs (under `--outdir`):
+- `spectral_features.csv`
+- `spectral_features.json` (column descriptions)
+- `spectral_features_run_meta.json` (manifest used by `qeeg_ui_cli`)
 
 ### 1) Run a demo (synthetic data)
 
@@ -188,6 +246,45 @@ Then pass `--notch 50` or `--notch 60` to the analysis CLIs as needed.
 ```bash
 ./build/qeeg_map_cli --input path/to/recording.edf --outdir out_edf
 ```
+
+### 2a) Bandpower table only (no topomaps)
+
+If you only want a **tabular bandpower export** (and optional z-scores) without
+rendering any images, you can run:
+
+```bash
+./build/qeeg_bandpower_cli --input path/to/recording.edf --outdir out_bp
+
+# Relative + log10 (common for simple normalization)
+./build/qeeg_bandpower_cli --input path/to/recording.edf --outdir out_bp_rel --relative --log10
+
+# Append per-band z-score columns from a reference CSV built by qeeg_reference_cli
+./build/qeeg_bandpower_cli --input path/to/recording.edf --outdir out_bp_z --reference out_ref/reference.csv
+```
+
+This writes:
+- `bandpowers.csv` (wide format: one row per channel, one column per band)
+- `bandpowers.json` (column descriptions)
+- `bandpower_run_meta.json` (a small manifest consumed by `qeeg_ui_cli`)
+
+### 2a1) Derive neurofeedback band ratios from `bandpowers.csv`
+
+If you want common **band ratio** features (e.g., **theta/beta**), you can derive them
+directly from an existing `bandpowers.csv` (from either `qeeg_map_cli` or `qeeg_bandpower_cli`):
+
+```bash
+./build/qeeg_bandratios_cli --bandpowers out_bp/bandpowers.csv --outdir out_ratios --ratio theta/beta
+
+# Name the output column explicitly and also export a BIDS-friendly TSV copy
+./build/qeeg_bandratios_cli --bandpowers out_bp/bandpowers.csv --outdir out_ratios \
+  --ratio tbr=theta/beta --log10 --tsv
+```
+
+Outputs (under `--outdir`):
+- `bandratios.csv` (one row per channel)
+- `bandratios.json` (column descriptions)
+- `bandratios.tsv` (optional; written when `--tsv` is used)
+- `bandratios_run_meta.json` (manifest used by `qeeg_ui_cli` to auto-link run artifacts)
 
 
 ### 2b) BioTrace+ / NeXus 10 MKII
@@ -297,10 +394,44 @@ If your recording has trigger/annotation codes, you can optionally add extra col
 
 (When you add extra columns, they should be described in the accompanying `*_events.json`; this tool writes that description automatically.)
 
-### 2c) Preprocess (CAR / notch / bandpass) and export a cleaned EDF or CSV
+**Optional: scan / sanity-check a BIDS EEG dataset**
+
+If you're handed a BIDS dataset (or you've just exported one) and want a quick, dependency-light
+"what's in here?" summary, you can run:
+
+```bash
+./build/qeeg_bids_scan_cli --dataset my_bids --outdir out_bids_scan
+```
+
+This writes:
+- `bids_index.json` — machine-readable list of discovered recordings + sidecar presence
+- `bids_index.csv` — quick spreadsheet-friendly version
+- `bids_scan_report.txt` — human-readable warnings/errors
+
+It is **not** a full validator, but it does a few practical checks:
+- finds the dataset root by locating `dataset_description.json`
+- indexes EEG recordings in EDF/BDF/BrainVision format
+- checks for the presence of `*_eeg.json` (required) and `*_channels.tsv` (recommended)
+- best-effort checks that `*_eeg.json` contains required EEG keys (string search)
+- warns if a BrainVision `.vhdr` file is missing its companion `.vmrk`/`.eeg`
+- flags the common "electrodes.tsv present but coordsystem.json missing" issue
+
+For CI or scripting, you can treat warnings as failures:
+
+```bash
+./build/qeeg_bids_scan_cli --dataset my_bids --strict
+```
+
+### 2c) Preprocess (CAR / notch / bandpass) and export cleaned EDF/BDF/BrainVision or CSV
 
 If you want to apply quick, dependency-light preprocessing before running qEEG features (or before
 sharing data with other tools), use `qeeg_preprocess_cli`.
+
+It supports writing:
+- **EDF/EDF+** (`.edf`)
+- **BDF/BDF+** (`.bdf`) — 24-bit samples (often a better "lossless" export target than EDF)
+- **BrainVision** (`.vhdr/.vmrk/.eeg`) — widely supported by EEG toolchains
+- **CSV** (`.csv`)
 
 It can also **auto-detect 50/60 Hz line-noise** and choose a notch frequency when you don’t know
 the export settings.
@@ -313,6 +444,12 @@ the export settings.
 
 # Or write a cleaned CSV instead
 ./build/qeeg_preprocess_cli --input session.edf --output session_clean.csv --auto-notch --bandpass 1 40
+
+# Or write a cleaned BDF+ (24-bit)
+./build/qeeg_preprocess_cli --input session.edf --output session_clean.bdf --auto-notch --bandpass 1 40
+
+# Or write a cleaned BrainVision set (.vhdr/.vmrk/.eeg)
+./build/qeeg_preprocess_cli --input session.edf --output session_clean.vhdr --auto-notch --bandpass 1 40
 ```
 
 ### 2d) Channel QC: find bad channels and optionally drop/interpolate
@@ -710,8 +847,9 @@ Common tweaks:
 Outputs:
 - `spectrogram_<channel>.bmp` — heatmap (time on x, low freq at bottom)
 - Tip: add `--colorbar` to embed a vertical vmin/vmax colorbar into the BMP
-- `spectrogram_<channel>.csv` — dB matrix (wide by default; use `--csv-long` for long format)
+- `spectrogram_<channel>.csv` — dB matrix (wide by default; use `--csv-long` for long format; omitted with `--no-csv`)
 - `spectrogram_<channel>_meta.txt` — parameters used (for reproducibility)
+- `spectrogram_run_meta.json` — manifest used by `qeeg_ui_cli` to auto-link run artifacts
 
 ### 9) Cross-frequency coupling: phase-amplitude coupling (PAC)
 
@@ -764,11 +902,14 @@ bandpower features per event/epoch:
 ```
 
 Outputs:
-- `events.csv` — exported event list
+- `events.csv` — exported event list (includes a stable `event_id` column)
+- `events_table.csv` — qeeg event table (onset_sec,duration_sec,text)
+- `events_table.tsv` — BIDS-style events table (onset,duration,trial_type)
 - `epoch_bandpowers.csv` — long-format table of (event × channel × band)
 - `epoch_bandpowers_summary.csv` — mean power per channel/band across processed epochs
 - (optional) `epoch_bandpowers_norm.csv` — baseline-normalized values (when `--baseline` is used)
 - (optional) `epoch_bandpowers_norm_summary.csv` — mean baseline-normalized values (when `--baseline` is used)
+- `epoch_run_meta.json` — manifest used by `qeeg_ui_cli` to auto-link run artifacts
 
 ### 11) Artifact window detection (first pass)
 
@@ -778,13 +919,21 @@ Flag likely artifact-contaminated windows using simple **robust** time-domain fe
 This produces:
 - `artifact_windows.csv` — one row per time window (including list of bad channels)
 - `artifact_channels.csv` — long-format per-window × per-channel feature table
+- `artifact_channel_summary.csv` — per-channel fraction of windows flagged
+- `artifact_segments.csv` — merged contiguous bad-window segments
 - `artifact_summary.txt` — parameters + summary stats
+- (optional) `artifact_events.tsv` / `artifact_events.json` — BIDS-style events export for artifact segments (when `--export-bids-events`)
+- `artifact_run_meta.json` — manifest used by `qeeg_ui_cli` to auto-link run artifacts
 
 Example:
 
 ```bash
 ./build/qeeg_artifacts_cli --input path/to/recording.edf --outdir out_artifacts \
   --window 1.0 --step 0.5 --baseline 10 --ptp-z 6 --rms-z 6 --kurtosis-z 6
+
+# Also write BIDS-style events.tsv + events.json describing merged artifact segments
+./build/qeeg_artifacts_cli --input path/to/recording.edf --outdir out_artifacts \
+  --window 1.0 --step 0.5 --baseline 10 --export-bids-events
 
 # Optional light preprocessing before scoring
 ./build/qeeg_artifacts_cli --input path/to/recording.edf --outdir out_artifacts_filtered \

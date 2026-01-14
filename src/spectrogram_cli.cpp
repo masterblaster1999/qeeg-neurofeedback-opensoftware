@@ -2,6 +2,7 @@
 #include "qeeg/fft.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
+#include "qeeg/run_meta.hpp"
 #include "qeeg/spectrogram.hpp"
 #include "qeeg/utils.hpp"
 
@@ -345,6 +346,24 @@ int main(int argc, char** argv) {
         m << "zero_phase=" << (args.zero_phase ? 1 : 0) << "\n";
       }
       std::cout << "Wrote: " << meta_path << "\n";
+    }
+
+    // Run manifest for qeeg_ui_cli / qeeg_ui_server_cli discovery.
+    {
+      const std::string meta_path = args.outdir + "/spectrogram_run_meta.json";
+      std::vector<std::string> outs;
+      outs.push_back("spectrogram_" + safe_ch + ".bmp");
+      if (args.export_csv) {
+        outs.push_back("spectrogram_" + safe_ch + ".csv");
+      }
+      outs.push_back("spectrogram_" + safe_ch + "_meta.txt");
+      outs.push_back("spectrogram_run_meta.json");
+
+      if (!write_run_meta_json(meta_path, "qeeg_spectrogram_cli", args.outdir, args.input_path, outs)) {
+        std::cerr << "Warning: failed to write spectrogram_run_meta.json to: " << meta_path << "\n";
+      } else {
+        std::cout << "Wrote: " << meta_path << "\n";
+      }
     }
 
     return 0;

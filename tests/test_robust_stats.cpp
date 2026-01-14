@@ -19,6 +19,14 @@ int main() {
     assert(approx(med, 2.5));
   }
 
+  // Convenience overload: median_inplace(vector<>&)
+  {
+    std::vector<double> v = {1.0, 2.0, 3.0};
+    const double med = median_inplace(v);
+    assert(approx(med, 2.0));
+  }
+
+
   // Outlier should not move the median much; MAD scale should be small.
   {
     const std::vector<double> v = {1.0, 2.0, 3.0, 4.0, 100.0};
@@ -34,6 +42,11 @@ int main() {
   {
     std::vector<double> v = {1.0, 2.0, 3.0, 4.0};
     assert(approx(quantile_inplace(&v, 0.0), 1.0));
+  }
+  {
+    std::vector<double> v = {1.0, 2.0, 3.0, 4.0};
+    // Reference overload
+    assert(approx(quantile_inplace(v, 0.5), 2.5));
   }
   {
     std::vector<double> v = {1.0, 2.0, 3.0, 4.0};

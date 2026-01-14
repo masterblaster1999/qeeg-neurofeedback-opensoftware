@@ -22,8 +22,12 @@
   #ifndef NOMINMAX
     #define NOMINMAX
   #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <windows.h>
 #else
   #include <arpa/inet.h>
   #include <netinet/in.h>
@@ -243,6 +247,48 @@ static std::string content_type_for_path(const std::filesystem::path& p) {
   return "application/octet-stream";
 }
 
+static std::filesystem::path canonicalize_best_effort(const std::filesystem::path& p) {
+  std::error_code ec;
+  std::filesystem::path c = std::filesystem::canonical(p, ec);
+  if (!ec) return c;
+  ec.clear();
+  c = std::filesystem::weakly_canonical(p, ec);
+  if (!ec) return c;
+  ec.clear();
+  c = std::filesystem::absolute(p, ec);
+  if (!ec) return c;
+  return p;
+}
+
+static bool path_is_within_root(const std::filesystem::path& root_canon,
+                                const std::filesystem::path& candidate) {
+  const std::filesystem::path c = canonicalize_best_effort(candidate);
+  auto rit = root_canon.begin();
+  auto cit = c.begin();
+  for (; rit != root_canon.end() && cit != c.end(); ++rit, ++cit) {
+    std::string r = rit->u8string();
+    std::string v = cit->u8string();
+#ifdef _WIN32
+    r = to_lower(r);
+    v = to_lower(v);
+#endif
+    if (r != v) return false;
+  }
+  return rit == root_canon.end();
+}
+
+#ifdef _WIN32
+static std::wstring utf8_to_wide(const std::string& s) {
+  if (s.empty()) return {};
+  const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+  if (n <= 0) return {};
+  std::wstring w;
+  w.resize(static_cast<size_t>(n));
+  MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &w[0], n);
+  return w;
+}
+#endif
+
 static std::string json_find_string_value(const std::string& s, const std::string& key) {
   // Tiny JSON string extractor (only for {"key":"value"}-style fields).
   const std::string needle = "\"" + key + "\"";
@@ -284,7 +330,10 @@ struct RunJob {
   std::string started;
   std::string status{"running"};
   int exit_code{0};
-#ifndef _WIN32
+#ifdef _WIN32
+  DWORD pid{0};
+  HANDLE process_handle{nullptr};
+#else
   pid_t pid{-1};
 #endif
 };
@@ -317,7 +366,9 @@ static void socket_close(int s) {
 class UiServer {
  public:
   UiServer(std::filesystem::path root, std::filesystem::path bin_dir)
-    : root_(std::move(root)), bin_dir_(std::move(bin_dir)) {}
+    : root_(std::move(root)), bin_dir_(std::move(bin_dir)) {
+    root_canon_ = canonicalize_best_effort(root_);
+  }
 
   void set_index_html(std::filesystem::path p) { index_html_ = std::move(p); }
   void set_host(std::string h) { host_ = std::move(h); }
@@ -538,6 +589,10 @@ class UiServer {
     if (!req.path.empty() && req.path[0] == '/') {
       std::filesystem::path rel = std::filesystem::u8path(req.path.substr(1));
       // Prevent ".." traversal.
+      if (rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) {
+        send_text(c, 403, "forbidden\n");
+        return;
+      }
       for (const auto& part : rel) {
         if (part == "..") {
           send_text(c, 403, "forbidden\n");
@@ -545,6 +600,13 @@ class UiServer {
         }
       }
       std::filesystem::path p = root_ / rel;
+
+      // Prevent escaping the served root through symlinks: resolve canonical paths and ensure
+      // the final target remains under the canonical root directory.
+      if (!path_is_within_root(root_canon_, p)) {
+        send_text(c, 403, "forbidden\n");
+        return;
+      }
       if (std::filesystem::is_directory(p)) {
         // Try index.html inside.
         std::filesystem::path idx = p / "index.html";
@@ -619,7 +681,23 @@ class UiServer {
   }
 
   void update_jobs() {
-#ifndef _WIN32
+#ifdef _WIN32
+    for (auto& j : jobs_) {
+      if (j.status != "running" && j.status != "stopping") continue;
+      if (!j.process_handle) continue;
+      DWORD code = STILL_ACTIVE;
+      if (GetExitCodeProcess(j.process_handle, &code) == 0) continue;
+      if (code == STILL_ACTIVE) continue;
+      j.exit_code = static_cast<int>(code);
+      if (j.status == "stopping") {
+        j.status = "killed";
+      } else {
+        j.status = (j.exit_code == 0) ? "finished" : "error";
+      }
+      CloseHandle(j.process_handle);
+      j.process_handle = nullptr;
+    }
+#else
     for (auto& j : jobs_) {
       if (j.status != "running" && j.status != "stopping") continue;
       int st = 0;
@@ -705,7 +783,7 @@ class UiServer {
     std::filesystem::path rel = dir_norm.empty() ? std::filesystem::path() : std::filesystem::u8path(dir_norm);
 
     // Prevent absolute paths and traversal outside the served root.
-    if (rel.is_absolute()) {
+    if (rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) {
       send_json(c, 403, "{\"error\":\"absolute paths not allowed\"}");
       return;
     }
@@ -720,6 +798,12 @@ class UiServer {
     std::error_code ec;
     if (!std::filesystem::exists(abs, ec) || !std::filesystem::is_directory(abs, ec)) {
       send_json(c, 404, "{\"error\":\"dir not found\"}");
+      return;
+    }
+
+    // Prevent escaping the served root through symlinks.
+    if (!path_is_within_root(root_canon_, abs)) {
+      send_json(c, 403, "{\"error\":\"path not allowed\"}");
       return;
     }
 
@@ -844,6 +928,10 @@ class UiServer {
       return;
     }
     const std::filesystem::path p = root_ / std::filesystem::u8path(j->log_rel);
+    if (!path_is_within_root(root_canon_, p)) {
+      send_text(c, 403, "forbidden\n");
+      return;
+    }
     const std::string tail = read_file_tail_bytes(p, 64 * 1024);
     send_text(c, 200, tail, "text/plain; charset=utf-8");
   }
@@ -856,9 +944,28 @@ class UiServer {
 #endif
       int id) {
 #ifdef _WIN32
-    (void)id;
-    send_json(c, 501, "{\"error\":\"kill API not implemented on Windows in this build\"}");
-    return;
+    update_jobs();
+    RunJob* j = find_job(id);
+    if (!j) {
+      send_json(c, 404, "{\"error\":\"job not found\"}");
+      return;
+    }
+    if (j->status != "running" && j->status != "stopping") {
+      std::ostringstream oss;
+      oss << "{\"ok\":true,\"status\":\"" << qeeg::json_escape(j->status) << "\"}";
+      send_json(c, 200, oss.str());
+      return;
+    }
+    if (!j->process_handle) {
+      send_json(c, 500, "{\"error\":\"no process handle\"}");
+      return;
+    }
+    if (TerminateProcess(j->process_handle, 1) == 0) {
+      send_json(c, 500, "{\"error\":\"terminate failed\"}");
+      return;
+    }
+    j->status = "stopping";
+    send_json(c, 200, "{\"ok\":true,\"status\":\"stopping\"}");
 #else
     update_jobs();
     RunJob* j = find_job(id);
@@ -885,6 +992,7 @@ class UiServer {
 #endif
   }
 
+
   void handle_run(
 #ifdef _WIN32
       SOCKET c,
@@ -909,11 +1017,6 @@ class UiServer {
       return;
     }
 
-#ifdef _WIN32
-    (void)args;
-    send_json(c, 501, "{\"error\":\"run API not implemented on Windows in this build\"}");
-    return;
-#else
     const int job_id = ++next_job_id_;
 
     auto sanitize_component = [](std::string s) {
@@ -936,7 +1039,8 @@ class UiServer {
     // Create run directory under root.
     const std::string stamp = now_compact_local();
     const std::string safe_tool = sanitize_component(qeeg::to_lower(tool));
-    const std::string run_dir_rel = std::string("ui_runs/") + (stamp + "_" + safe_tool + "_id" + std::to_string(job_id));
+    const std::string run_dir_rel =
+        std::string("ui_runs/") + (stamp + "_" + safe_tool + "_id" + std::to_string(job_id));
     const std::filesystem::path run_dir = root_ / std::filesystem::u8path(run_dir_rel);
     qeeg::ensure_directory(run_dir.u8string());
     const std::filesystem::path log_path = run_dir / "run.log";
@@ -950,6 +1054,89 @@ class UiServer {
     replace_all_inplace(&expanded_args, "{{RUN_DIR}}", run_dir_rel);
     replace_all_inplace(&expanded_args, "{{RUN_DIR_ABS}}", run_dir.u8string());
 
+#ifdef _WIN32
+    // Build a single command line string: "exe" + raw args. Windows will split it into argv
+    // for the child program.
+    std::string cmd = "\"" + exe.u8string() + "\"";
+    if (!expanded_args.empty()) {
+      cmd += " ";
+      cmd += expanded_args;
+    }
+
+    const std::wstring cmd_w = utf8_to_wide(cmd);
+    std::vector<wchar_t> cmd_buf(cmd_w.begin(), cmd_w.end());
+    cmd_buf.push_back(L'\0');
+
+    const std::wstring cwd_w = utf8_to_wide(root_.u8string());
+    const std::wstring log_w = utf8_to_wide(log_path.u8string());
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    HANDLE hLog = CreateFileW(log_w.c_str(), GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hLog == INVALID_HANDLE_VALUE) {
+      const DWORD err = GetLastError();
+      std::ostringstream oss;
+      oss << "{\"error\":\"failed to open log file\",\"win32_error\":" << err << "}";
+      send_json(c, 500, oss.str());
+      return;
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = hLog;
+    si.hStdError = hLog;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(
+        NULL,
+        cmd_buf.data(),
+        NULL,
+        NULL,
+        TRUE,
+        CREATE_NO_WINDOW,
+        NULL,
+        cwd_w.empty() ? NULL : cwd_w.c_str(),
+        &si,
+        &pi);
+
+    // Parent does not need the thread handle.
+    if (pi.hThread) CloseHandle(pi.hThread);
+    // Close our copy of the log handle; the child inherits its own handle.
+    CloseHandle(hLog);
+
+    if (!ok) {
+      const DWORD err = GetLastError();
+      std::ostringstream oss;
+      oss << "{\"error\":\"CreateProcess failed\",\"win32_error\":" << err << "}";
+      send_json(c, 500, oss.str());
+      return;
+    }
+
+    // Record job and respond.
+    RunJob job;
+    job.id = job_id;
+    job.tool = tool;
+    job.args = expanded_args;
+    job.started = qeeg::now_string_local();
+    job.run_dir_rel = run_dir_rel;
+    job.log_rel = run_dir_rel + "/run.log";
+    job.pid = pi.dwProcessId;
+    job.process_handle = pi.hProcess;
+    jobs_.push_back(job);
+
+    std::ostringstream oss;
+    oss << "{\"ok\":true,\"id\":" << job.id
+        << ",\"run_dir\":\"" << qeeg::json_escape(job.run_dir_rel) << "\""
+        << ",\"log\":\"" << qeeg::json_escape(job.log_rel) << "\"}";
+    send_json(c, 200, oss.str());
+#else
     std::vector<std::string> argv_s;
     argv_s.push_back(exe.u8string());
     for (const auto& t : qeeg::split_commandline_args(expanded_args)) {
@@ -999,10 +1186,11 @@ class UiServer {
     std::ostringstream oss;
     oss << "{\"ok\":true,\"id\":" << job.id
         << ",\"run_dir\":\"" << qeeg::json_escape(job.run_dir_rel) << "\""
-        << ",\"log\":\"" << qeeg::json_escape(job.log_rel) << "\"" << "}";
+        << ",\"log\":\"" << qeeg::json_escape(job.log_rel) << "\"}";
     send_json(c, 200, oss.str());
 #endif
   }
+
 
   void send_text(
 #ifdef _WIN32
@@ -1016,6 +1204,7 @@ class UiServer {
     oss << "Content-Type: " << content_type << "\r\n";
     oss << "Content-Length: " << body.size() << "\r\n";
     oss << "Connection: close\r\n";
+    oss << "X-Content-Type-Options: nosniff\r\n";
     oss << "\r\n";
     const std::string hdr = oss.str();
     send_all(c, hdr.data(), hdr.size());
@@ -1093,6 +1282,7 @@ class UiServer {
 
  private:
   std::filesystem::path root_;
+  std::filesystem::path root_canon_;
   std::filesystem::path bin_dir_;
   std::filesystem::path index_html_;
   std::string host_{"127.0.0.1"};

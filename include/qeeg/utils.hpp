@@ -23,7 +23,10 @@ std::vector<std::string> split(const std::string& s, char delim);
 // Supported behaviors (best-effort):
 // - Whitespace separates tokens.
 // - Double and single quotes may be used to include whitespace.
-// - Backslash escapes the next character.
+// - Backslash escaping is supported for convenience when the user needs to
+//   include whitespace or quotes in a token (e.g. "my\\ file.edf" or \"quoted\").
+//   Backslashes that precede ordinary non-whitespace characters are preserved
+//   (important for Windows-style paths like C:\\temp\\file.edf).
 //
 // This is NOT a full shell parser (no globbing, no env expansion, no nested
 // quoting rules). It is intentionally conservative.
