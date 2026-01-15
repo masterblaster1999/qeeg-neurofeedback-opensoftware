@@ -123,11 +123,59 @@ Browsers can't directly execute local binaries for security reasons, so the "Run
 dashboard are enabled only when you serve the UI with the local server:
 
 ```bash
-./build/qeeg_ui_server_cli --root /path/to/runs --bin-dir ./build --port 8765 --open
+./build/qeeg_ui_server_cli --root /path/to/runs --bin-dir ./build --port 8765 --max-parallel 2 --open
 ```
+
+Tip: add `--max-parallel N` to limit how many tools run at once; additional runs are kept in a **queued** state until a slot is free.
+
 
 This serves the dashboard at `http://127.0.0.1:8765/` and exposes a tiny local-only API that lets the
 UI launch `qeeg_*_cli` executables and write per-run logs under `.../ui_runs/`.
+
+The hero **Recent UI runs** card has two views:
+- **Session**: jobs launched since the current server started (from the live `/api/runs` list)
+- **History**: scans `ui_runs/` so you can find runs from previous sessions and quickly **Load args** back into a tool card (handy after restarting the server)
+
+Browsing outputs: the server also renders a simple directory index for folders under `--root` when no
+`index.html` is present. This makes the UI's **Run dir** links (e.g., `ui_runs/<timestamp>_<tool>_idX/`)
+clickable so you can quickly browse outputs (CSV/JSON/SVG/HTML reports) in your browser.
+
+Security headers: when serving the built-in dashboard (\`/\` or \`/index.html\`) and the auto-generated directory index pages, the server also sets a Content-Security-Policy (CSP) and a few common hardening headers (\`X-Content-Type-Options\`, \`X-Frame-Options\`, \`Referrer-Policy\`, \`Cross-Origin-Resource-Policy\`). This helps reduce the risk of accidental script execution when browsing or previewing arbitrary outputs under the same origin.
+
+
+The per-tool **Run** panel also has an **Outputs** toggle that reads the job's `ui_server_run_meta.json`
+and lists artifacts with quick inline previews (text + images). For CSV/TSV outputs, the preview opens a
+small **table viewer** (with row filtering) and will show a **matrix heatmap** when the file looks like a
+numeric matrix (handy for PLV/coherence matrices).
+
+New: for CSV/TSV outputs that look like per-channel QEEG tables (e.g., `bandpowers.csv` with `channel,delta,theta,alpha,beta,gamma` and optional `*_z` columns, or `bandratios.csv` / other channel-metric tables), the preview adds a **QEEG** tab with:
+- quick bar charts (band profile or metric-by-channel)
+- a per-band **scalp topomap** view (approximate 10–20 / 10–10 layout)
+- a few common ratios (theta/beta, alpha/theta, etc.)
+- in Z-score view, an optional **|z| threshold** list of outlier channels
+
+Tip: in the topomap, you can click an electrode to jump the channel picker (bandpowers) or filter the table/plots to that channel (metrics).
+
+Channels that aren’t recognized in the built-in layout are simply skipped for the topomap (they’ll still appear in the table).
+
+Chaining tools: in the Outputs table, use **Use run dir** (for the run folder) or **Use** (for an output file) to set the dashboard’s
+global Workspace selection, then click **Inject path** on another tool card.
+
+New: the hero **Selected path** bar includes quick actions (**Browse**, **Preview**, **Copy**, **Clear**) and a small **Suggested / Quick run** row.
+- **Suggested** buttons jump to a common next-step tool for the selected input and inject the path into that tool’s args.
+- **Quick run** buttons do the same, and also launch the tool when the local server is connected.
+
+
+The **Outputs** panel also includes a **Download zip** button, which bundles the job’s run folder into a `.../run.zip` download for easy sharing.
+
+New: the Outputs panel also includes a **Notes** button. It opens an in-browser editor for a per-run `note.md` file saved inside the run folder (under `ui_runs/<run>/note.md`). You can use it to annotate runs (QC decisions, parameter tweaks, observations) and flip to a lightweight Markdown **Preview**. Notes are capped at **128KB** and writing is restricted to `ui_runs/` for safety.
+
+Cleanup: the Outputs panel also has a **Delete run** button and the **History** table includes a **Delete** action. These remove a single run folder under `ui_runs/` (helpful when runs accumulate on disk). For safety, deletion is restricted to directories under `ui_runs/` and is blocked while a job is still **running/queued**.
+
+For safety, the server enforces size limits (currently: **25 MiB per file** and **80 MiB total**); if anything is skipped, the zip includes a `_ZIP_NOTICE.txt` file listing what was omitted.
+
+The per-tool **Tail log** panel will **live-tail while open** (incremental polling) so you can watch
+stdout/stderr update during long-running runs. The **Refresh** button hard-resets the tail view.
 
 Windows note: the server launches tools via the Win32 process APIs and redirects stdout/stderr into the per-run `run.log`. The UI 'Kill' button force-terminates the process (best-effort).
 
@@ -139,12 +187,108 @@ Convenience: any arguments you type into the UI can use `{{RUN_DIR}}` (relative)
 easy to route `--outdir` under the run folder.
 
 The dashboard also includes a small **Workspace browser** (when served via `qeeg_ui_server_cli`) so you can
-browse files under `--root` and quickly select an input path for tool runs. Use the "Use selected file" button
-on any tool card to inject it as `--input`.
+browse files *and folders* under `--root` and quickly select a path for tool runs. The browser supports
+breadcrumb navigation, optional **hidden files** (dotfiles) visibility, server-side sorting (name / modified / size),
+and quick inline **Preview** for common text/image file types.
 
-For convenience, the "Run" panel defaults rewrite common output flags (like `--outdir`, `--output`, and `--events-out`)
-to land under `{{RUN_DIR}}` so each UI-launched run stays self-contained. You can also save/load/delete per-tool
-argument presets in your browser (stored in `localStorage`).
+New: the Workspace browser also includes a few basic **file actions** (when served via `qeeg_ui_server_cli`):
+- **New folder**: creates a directory in the current folder.
+- **Rename**: renames a file/folder within its parent directory.
+- **Trash**: moves a file/folder into `--root/.qeeg_trash/` with a timestamp prefix (a safer alternative to permanent delete).
+
+New: the Workspace browser also supports **Upload** (and drag-and-drop):
+- Click **Upload** to select one or more files to upload into the current directory.
+- Or drag files from your file explorer onto the Workspace panel and drop to upload.
+
+If a destination file already exists, the UI will prompt to **Overwrite** (otherwise it skips that file).
+
+Uploads are streamed to disk by the local server via `POST /api/fs_upload` (no multipart parsing) and are
+currently limited to **1 GiB per file** by default (see `kMaxUploadBytes` in `src/ui_server_cli.cpp`).
+
+All operations are restricted to paths under `--root` (absolute paths and `..` traversal are rejected).
+
+New: the Workspace browser includes **Find** (recursive search):
+- Enter a substring or glob pattern (e.g., `*.edf`, `run_meta.json`).
+- Choose **type** (files / dirs / any) and a max **depth** to keep searches bounded.
+- Results show quick actions (**Select**, **Preview**, **Open**, and **Reveal** to jump to the containing folder).
+
+This is powered by `POST /api/find` on the local server (still restricted to `--root`).
+
+New: Workspace **Back / Forward** navigation.
+- Use the **← / →** buttons next to **Up** to jump between recently visited folders.
+- The command palette also shows **Workspace: Back/Forward** entries when available.
+
+New: **Reveal highlight**.
+- Actions like **Selection → Browse** and **Find → Reveal** open the containing folder and momentarily highlight the target row so you can spot it immediately.
+
+New: **Drag a path into tool args** (better integration between Workspace ↔ Tools).
+- Drag any row from the Workspace (or Find results) and drop it onto a tool’s **args** field.
+- The UI will set that path as your current **Selection** and inject it into the args using the tool’s chosen **Inject flag**.
+
+Quality-of-life: the UI now shows small **toast** confirmations for common copy/inject actions (e.g., Copy path / Copy full command).
+
+New: **Command palette**. Press **Ctrl+K** (or click **Palette (Ctrl+K)** in the hero card) to open a quick-search palette. It helps you jump to tools and trigger common UI actions (Selection copy/preview/browse/clear, Workspace root/ui_runs/trash, upload/new folder/refresh, Runs Session/History, toggle animations, toggle dotfiles) without scrolling.
+
+New: **Mobile navigation drawer**. On narrow screens, the left tool list collapses into an off-canvas sidebar. Use **Menu** in the hero card to open it; tap outside (or press **Esc**) to close. Selecting a tool auto-closes the drawer.
+
+New: **Live run badges**. When served via `qeeg_ui_server_cli`, tools with active jobs (running / queued / stopping) show a small live status badge in:
+- the tool card header
+- the left navigation (including the mobile drawer)
+- the command palette (as compact `R#/Q#/S#` hints)
+
+New: **Browse run folders in Workspace**. In the Runs (Session/History) tables and in the per-run Outputs panel, use **Browse** to open the run directory inside the Workspace browser, so you can preview/copy outputs without leaving the page.
+
+
+On each tool card, use the **Inject flag** dropdown next to **Inject path** to choose *which* argument flag should
+receive the currently-selected file/folder (defaults try to pick a sensible input flag like `--input` or a dataset/root
+flag like `--dataset`/`--bids-root`). This makes it easier to drive tools with multiple path-style arguments (for example,
+`qeeg_export_derivatives_cli --map-outdir ... --qc-outdir ...`).
+
+New: the Run panel includes a **Flags** button (when help embedding is enabled). It parses the tool’s embedded `--help` output into a searchable table so you can click **Insert** to add a flag to the args field, or **Use selection** (for path-style flags) to immediately set the flag value to the Workspace-selected file/folder.
+
+
+
+New: **Presets** (args templates). Each tool card has a Presets dropdown with **Save / Delete / Reset**, plus **Export / Import** buttons:
+- When the UI is served via `qeeg_ui_server_cli`, presets are persisted under `--root` in a `qeeg_ui_presets.json` file, so they survive refreshes and work across browsers/machines.
+- If the server isn't running, presets fall back to browser `localStorage` (and will auto-migrate into the shared store once the server is available).
+
+New: **Batch runner** (multi-input queue helper). When the dashboard is served via `qeeg_ui_server_cli`, each tool card includes a **Batch** button that lets you queue up many runs at once.
+
+- The batch modal lists **files in the directory** derived from the current Workspace selection (if you selected a file, it uses that file’s parent directory; if you selected a folder, it uses that folder).
+- Your tool’s args field is used as the **args template**. You can use placeholders:
+  - `{input}` → the selected file path (auto-quoted if needed)
+  - `{name}` → file name
+  - `{stem}` → file name without extension
+  - `{index}` → 1-based index in the batch
+- If you *don’t* include `{input}` in the template, the runner will inject the file using the chosen **Inject flag** (e.g., `--input`).
+- Jobs are submitted one-by-one and respect the server’s `--max-parallel` setting (extra jobs will sit in the **queued** state).
+
+This is handy for processing a folder of EDF/BDF/CSV files with consistent parameters without copy/pasting commands.
+
+
+#### Procedural animations (optional)
+
+The dashboard includes lightweight procedural canvas visuals:
+- a subtle particle "neural field" background
+- a selectable synthetic preview panel in the hero card:
+  - EEG (multi-band waves)
+  - Topomap (synthetic scalp field)
+  - Spectrogram (synthetic waterfall)
+  - Flow field (synthetic curl / vector field)
+
+These are **decorative only** (they do not use recording data). Use the **Animations** toggle in the hero panel to stop motion; the canvases will still render a static frame.
+
+You can export the synthetic panel for quick sharing/debugging:
+- **Snapshot PNG** downloads the currently selected synthetic canvas as a PNG
+- **Record 5s** records a short WebM clip (via the browser's MediaRecorder / canvas capture APIs)
+
+
+Accessibility: the UI respects your OS/browser `prefers-reduced-motion` preference and defaults animations **off** when that setting is enabled.
+
+For convenience, the "Run" panel defaults rewrite common output flags (like `--outdir`, `--out-dir`, `--out`, `--output`,
+and `--events-out`) to land under `{{RUN_DIR}}` so each UI-launched run stays self-contained. You can also save/load/delete
+per-tool argument presets; when served via `qeeg_ui_server_cli` they persist under `--root` in `qeeg_ui_presets.json`, otherwise
+they are stored in the browser's `localStorage`.
 
 ### 0) Inspect a recording (quick summary)
 
