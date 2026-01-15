@@ -10,6 +10,7 @@ namespace qeeg {
 //
 // Notes:
 // - These helpers use comma (",") as the delimiter.
+// - Numeric output uses the classic "C" locale (decimal point '.') to keep comma-delimited CSV parseable regardless of process locale.
 // - They are intentionally dependency-light and only support what we need
 //   for simple exports (events CSV + time-series CSV).
 
@@ -35,18 +36,21 @@ void write_events_tsv(const std::string& path, const std::vector<AnnotationEvent
 // Convenience overload.
 void write_events_tsv(const std::string& path, const EEGRecording& rec);
 
-// Read an events table from a delimited text file (CSV or TSV).
+// Read an events table from a delimited text file (CSV/TSV).
 //
 // Supported formats:
 // - qeeg events CSV written by write_events_csv:
 //     onset_sec,duration_sec,text
 // - BIDS-style events TSV:
 //     onset\tduration\ttrial_type
+// - Some locale-specific CSV exports may use ';' (or tab) as the delimiter,
+//   often paired with a decimal comma in numeric columns (e.g. "0,5").
 //
 // The parser is intentionally forgiving:
 // - Lines beginning with '#' are ignored.
 // - Extra/short rows are padded/trimmed.
 // - Column names are matched case-insensitively.
+// - A UTF-8 BOM on the header line is tolerated.
 //
 // Returns a vector of AnnotationEvent (onset_sec, duration_sec, text).
 // Invalid rows (missing/invalid onset) are skipped.

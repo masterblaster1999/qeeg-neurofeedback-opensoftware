@@ -2,6 +2,7 @@
 #include "qeeg/utils.hpp"
 
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -11,7 +12,7 @@ namespace qeeg {
 namespace {
 
 static std::string read_all(const std::string& path) {
-  std::ifstream f(path, std::ios::binary);
+  std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) return std::string();
   std::ostringstream oss;
   oss << f.rdbuf();
@@ -41,6 +42,13 @@ static bool parse_hex4(const std::string& s, size_t pos, unsigned* out) {
 
 static void append_utf8(unsigned codepoint, std::string* out) {
   if (!out) return;
+
+  // JSON \u escapes are UTF-16 code units. Surrogate codepoints are not valid
+  // scalar values in UTF-8; treat them as replacement characters.
+  if (codepoint > 0x10FFFF || (codepoint >= 0xD800 && codepoint <= 0xDFFF)) {
+    codepoint = 0xFFFD; // U+FFFD replacement
+  }
+
   if (codepoint <= 0x7F) {
     out->push_back(static_cast<char>(codepoint));
   } else if (codepoint <= 0x7FF) {
@@ -83,9 +91,37 @@ static bool parse_json_string(const std::string& s, size_t* i, std::string* out)
         case 'r': r.push_back('\r'); break;
         case 't': r.push_back('\t'); break;
         case 'u': {
+          // \uXXXX (UTF-16 code unit). Combine surrogate pairs when present.
           unsigned cp = 0;
           if (!parse_hex4(s, *i, &cp)) return false;
           *i += 4;
+
+          // High surrogate?
+          if (cp >= 0xD800 && cp <= 0xDBFF) {
+            // Look for a following low surrogate escape sequence: \uYYYY
+            if ((*i + 6) <= s.size() && s[*i] == '\\' && s[*i + 1] == 'u') {
+              unsigned low = 0;
+              if (parse_hex4(s, *i + 2, &low) && low >= 0xDC00 && low <= 0xDFFF) {
+                // Consume the second escape.
+                *i += 6;
+                const unsigned hi = cp;
+                const unsigned codepoint =
+                    0x10000u + ((hi - 0xD800u) << 10) + (low - 0xDC00u);
+                append_utf8(codepoint, &r);
+                break;
+              }
+            }
+            // Invalid or missing low surrogate: append replacement char.
+            append_utf8(0xFFFDu, &r);
+            break;
+          }
+
+          // Orphan low surrogate?
+          if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            append_utf8(0xFFFDu, &r);
+            break;
+          }
+
           append_utf8(cp, &r);
           break;
         }
@@ -261,7 +297,7 @@ bool write_run_meta_json(const std::string& json_path,
                          const std::string& outdir,
                          const std::string& input_path,
                          const std::vector<std::string>& outputs) {
-  std::ofstream out(json_path, std::ios::binary);
+  std::ofstream out(std::filesystem::u8path(json_path), std::ios::binary);
   if (!out) return false;
 
   auto write_string_or_null = [&](const std::string& s) {

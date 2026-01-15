@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <locale>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -272,7 +273,7 @@ void write_bids_dataset_description(const std::string& dataset_root,
 static std::string units_for_type(const std::string& type_uc) {
   // Use common EEG conventions.
   if (type_uc == "EEG" || type_uc == "EOG" || type_uc == "HEOG" || type_uc == "VEOG" ||
-      type_uc == "ECG" || type_uc == "EMG") {
+      type_uc == "ECG" || type_uc == "EMG" || type_uc == "REF") {
     return "uV";
   }
   if (type_uc == "TRIG") {
@@ -288,6 +289,20 @@ std::string guess_bids_channel_type(const std::string& channel_name) {
   const std::string key = normalize_channel_name(channel_name);
 
   if (key.empty()) return "MISC";
+
+  // Reference channel (recorded reference).
+  // Keep this conservative: match "REF"/"Reference" or "REF" followed by digits.
+  if (key == "ref" || key == "reference") return "REF";
+  if (starts_with(key, "ref") && key.size() > 3) {
+    bool digits = true;
+    for (size_t i = 3; i < key.size(); ++i) {
+      if (std::isdigit(static_cast<unsigned char>(key[i])) == 0) {
+        digits = false;
+        break;
+      }
+    }
+    if (digits) return "REF";
+  }
 
   // EOG variants.
   if (starts_with(key, "heog")) return "HEOG";
@@ -351,8 +366,36 @@ static std::optional<double> parse_optional_double_strict(const std::string& s,
 static std::string format_double_or_na(const std::optional<double>& v, int precision = 6) {
   if (!v.has_value()) return "n/a";
   std::ostringstream oss;
+  oss.imbue(std::locale::classic());
   oss << std::fixed << std::setprecision(precision) << v.value();
   return oss.str();
+}
+
+static std::string trim_trailing_zeros(std::string s) {
+  const auto dot = s.find('.');
+  if (dot == std::string::npos) {
+    if (s == "-0") return "0";
+    return s;
+  }
+
+  while (!s.empty() && s.back() == '0') s.pop_back();
+  if (!s.empty() && s.back() == '.') s.pop_back();
+  if (s == "-0") return "0";
+  return s;
+}
+
+static std::string format_double_compact(double v, int precision = 12) {
+  if (!std::isfinite(v)) {
+    throw std::runtime_error("BIDS: non-finite numeric value");
+  }
+
+  // Normalize negative zero for nicer output.
+  if (v == 0.0) v = 0.0;
+
+  std::ostringstream oss;
+  oss.imbue(std::locale::classic());
+  oss << std::fixed << std::setprecision(precision) << v;
+  return trim_trailing_zeros(oss.str());
 }
 
 static char detect_delim(const std::string& header_line) {
@@ -469,6 +512,8 @@ void write_bids_electrodes_tsv(const std::string& path,
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
 
+  f.imbue(std::locale::classic());
+
   // Required columns first in mandated order, plus recommended columns.
   f << "name\tx\ty\tz\ttype\tmaterial\timpedance\n";
 
@@ -504,6 +549,8 @@ void write_bids_coordsystem_json(const std::string& path,
 
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  f.imbue(std::locale::classic());
 
   f << "{\n";
   f << "  \"EEGCoordinateSystem\": \"" << json_escape(meta.eeg_coordinate_system) << "\",\n";
@@ -545,6 +592,8 @@ void write_bids_channels_tsv(const std::string& path,
 
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  f.imbue(std::locale::classic());
 
   // Required columns: name, type, units (in this order).
   // We also include status/status_description for compatibility with QC tooling.
@@ -604,6 +653,8 @@ void write_bids_channels_tsv(const std::string& path,
 
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  f.imbue(std::locale::classic());
 
   // Required columns: name, type, units (in this order).
   // We also include status/status_description for compatibility with QC tooling.
@@ -731,6 +782,8 @@ void write_bids_events_tsv(const std::string& path,
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
 
+  f.imbue(std::locale::classic());
+
   // Required columns: onset, duration (in this order).
   // We optionally include trial_type/sample/value after that.
   f << "onset\tduration";
@@ -738,8 +791,6 @@ void write_bids_events_tsv(const std::string& path,
   if (opts.include_sample) f << "\tsample";
   if (opts.include_value) f << "\tvalue";
   f << "\n";
-
-  f << std::setprecision(12);
 
   // BIDS recommends sorting by onset.
   std::vector<AnnotationEvent> sorted = events;
@@ -752,7 +803,7 @@ void write_bids_events_tsv(const std::string& path,
     const double dur = (ev.duration_sec < 0.0) ? 0.0 : ev.duration_sec;
     const std::string label = ev.text.empty() ? "n/a" : ev.text;
 
-    f << onset << "\t" << dur;
+    f << format_double_compact(onset) << "\t" << format_double_compact(dur);
 
     if (opts.include_trial_type) {
       f << "\t" << tsv_sanitize(label);
@@ -789,6 +840,8 @@ void write_bids_events_json(const std::string& path, const BidsEventsTsvOptions&
 
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  f.imbue(std::locale::classic());
 
   auto write_entry = [&](const std::string& key,
                          const std::string& long_name,
@@ -896,6 +949,8 @@ void write_bids_events_json(const std::string& path,
 
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
+
+  f.imbue(std::locale::classic());
 
   auto write_entry = [&](const std::string& key,
                          const std::string& long_name,
@@ -1006,7 +1061,7 @@ void write_bids_eeg_json(const std::string& path,
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to write: " + path);
 
-  f << std::setprecision(12);
+  f.imbue(std::locale::classic());
 
   // REQUIRED fields for EEG (_eeg.json):
   // - EEGReference (string)
@@ -1016,10 +1071,10 @@ void write_bids_eeg_json(const std::string& path,
   f << "{\n";
   f << "  \"EEGReference\": \"" << json_escape(meta.eeg_reference.empty() ? "n/a" : meta.eeg_reference)
     << "\",\n";
-  f << "  \"SamplingFrequency\": " << fs << ",\n";
+  f << "  \"SamplingFrequency\": " << format_double_compact(fs) << ",\n";
 
   if (meta.power_line_frequency_hz.has_value()) {
-    f << "  \"PowerLineFrequency\": " << meta.power_line_frequency_hz.value() << ",\n";
+    f << "  \"PowerLineFrequency\": " << format_double_compact(meta.power_line_frequency_hz.value()) << ",\n";
   } else {
     f << "  \"PowerLineFrequency\": \"n/a\",\n";
   }
@@ -1037,7 +1092,7 @@ void write_bids_eeg_json(const std::string& path,
   }
 
   f << "  \"RecordingType\": \"continuous\",\n";
-  f << "  \"RecordingDuration\": " << duration << ",\n";
+  f << "  \"RecordingDuration\": " << format_double_compact(duration) << ",\n";
 
   if (!meta.eeg_ground.empty()) {
     f << "  \"EEGGround\": \"" << json_escape(meta.eeg_ground) << "\",\n";

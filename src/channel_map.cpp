@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -32,7 +33,10 @@ static std::string strip_quotes(const std::string& s) {
 
 static bool is_drop_value(std::string v) {
   v = to_lower(trim(v));
-  return v.empty() || v == "drop" || v == "none" || v == "null";
+  // Intentionally do NOT treat empty as "drop".
+  // Channel-map templates are written with an empty "new" column so that
+  // users can fill only the channels they want to rename.
+  return v == "drop" || v == "none" || v == "null";
 }
 
 static size_t count_delim_outside_quotes(const std::string& line, char delim) {
@@ -107,7 +111,7 @@ static bool looks_like_header_row(const std::string& a, const std::string& b) {
 } // namespace
 
 ChannelMap load_channel_map_file(const std::string& path) {
-  std::ifstream f(path);
+  std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to open channel map: " + path);
 
   ChannelMap m;
@@ -117,6 +121,9 @@ ChannelMap load_channel_map_file(const std::string& path) {
   bool delim_known = false;
 
   while (std::getline(f, line)) {
+    // Some Windows CSV tools write UTF-8 with BOM; strip it so header detection
+    // and key matching work as expected.
+    line = strip_utf8_bom(std::move(line));
     if (is_comment_or_empty_line(line)) continue;
 
     // Determine delimiter from the first meaningful line unless it's an "old=new" mapping.
@@ -182,10 +189,13 @@ void apply_channel_map(EEGRecording* rec, const ChannelMap& map) {
     const auto it = map.normalized_to_name.find(orig_key);
     if (it != map.normalized_to_name.end()) {
       const std::string mapped = trim(it->second);
-      if (is_drop_value(mapped)) {
-        continue; // drop channel
+      if (!mapped.empty()) {
+        if (is_drop_value(mapped)) {
+          continue; // drop channel
+        }
+        out_name = mapped;
       }
-      out_name = mapped;
+      // Empty mapping is a no-op (keep the original channel name).
     }
 
     out_name = trim(out_name);
@@ -209,7 +219,7 @@ void apply_channel_map(EEGRecording* rec, const ChannelMap& map) {
 }
 
 void write_channel_map_template(const std::string& path, const EEGRecording& rec) {
-  std::ofstream o(path);
+  std::ofstream o(std::filesystem::u8path(path), std::ios::binary);
   if (!o) throw std::runtime_error("Failed to write channel map template: " + path);
 
   o << "old,new\n";

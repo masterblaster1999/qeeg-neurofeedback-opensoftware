@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <locale>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -87,25 +89,38 @@ double median_inplace(std::vector<double>* v) {
 }
 
 double parse_double_strict(const std::string& s) {
-  // std::stod is permissive: it stops at the first non-numeric character.
-  // For EEG CSV numeric data, we want a strict parse so that values like
-  // "1,23" don't silently become 1.
+  // NOTE: Avoid std::stod here: it relies on the current C locale (LC_NUMERIC),
+  // which can cause "0.004" to mis-parse in decimal-comma locales. Always parse
+  // numeric cells using the classic "C" locale for consistent behavior.
   const std::string t = trim(s);
   if (t.empty()) throw std::runtime_error("CSV: empty numeric cell");
 
-  size_t idx = 0;
-  double v = 0.0;
-  try {
-    v = std::stod(t, &idx);
-  } catch (const std::exception& e) {
-    throw std::runtime_error(std::string("CSV: failed to parse double '") + t + "': " + e.what());
+  // Be explicit about special tokens for portability across libstdc++/libc++.
+  const std::string low = to_lower(t);
+  if (low == "nan") return std::numeric_limits<double>::quiet_NaN();
+  if (low == "inf" || low == "+inf" || low == "infinity" || low == "+infinity") {
+    return std::numeric_limits<double>::infinity();
+  }
+  if (low == "-inf" || low == "-infinity") {
+    return -std::numeric_limits<double>::infinity();
   }
 
-  if (idx != t.size()) {
-    // Reject trailing junk, but show a helpful error.
+  std::istringstream iss(t);
+  iss.imbue(std::locale::classic());
+  double v = 0.0;
+  iss >> v;
+  if (!iss) {
+    throw std::runtime_error(std::string("CSV: failed to parse double '") + t + "'");
+  }
+
+  // Allow trailing whitespace, but reject any other trailing characters.
+  iss >> std::ws;
+  if (!iss.eof()) {
+    std::string rest;
+    std::getline(iss, rest);
+    if (rest.size() > 64) rest = rest.substr(0, 64) + "...";
     std::ostringstream oss;
-    oss << "CSV: failed to strictly parse double '" << t << "' (trailing '" << t.substr(idx)
-        << "')";
+    oss << "CSV: failed to strictly parse double '" << t << "' (trailing '" << rest << "')";
     throw std::runtime_error(oss.str());
   }
   return v;
@@ -569,7 +584,7 @@ struct PendingEvent {
 } // namespace
 
 EEGRecording CSVReader::read(const std::string& path) {
-  std::ifstream f(path);
+  std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
   if (!f) throw std::runtime_error("Failed to open CSV: " + path);
 
   // Header detection:

@@ -5,6 +5,7 @@
 
 int main() {
   using qeeg::split_commandline_args;
+  using qeeg::join_commandline_args_win32;
 
   {
     const auto v = split_commandline_args("--input a.edf --outdir out");
@@ -41,6 +42,65 @@ int main() {
     assert(v[1] == "my file.edf");
     assert(v[2] == "--outdir");
     assert(v[3] == "out");
+  }
+
+  {
+    // Explicitly empty quoted arguments should be preserved.
+    const auto v = split_commandline_args("--flag \"\" --x '' end");
+    assert(v.size() == 5);
+    assert(v[0] == "--flag");
+    assert(v[1].empty());
+    assert(v[2] == "--x");
+    assert(v[3].empty());
+    assert(v[4] == "end");
+  }
+
+  {
+    const auto v = split_commandline_args("\"\"");
+    assert(v.size() == 1);
+    assert(v[0].empty());
+  }
+
+  // Windows CreateProcess quoting helper (pure string logic, testable on any platform).
+  {
+    const std::vector<std::string> argv = {
+        "C:\\Program Files\\QEEG\\tool.exe",
+        "--input",
+        "my file.edf",
+    };
+    const std::string cmd = join_commandline_args_win32(argv);
+    assert(cmd == "\"C:\\Program Files\\QEEG\\tool.exe\" --input \"my file.edf\"");
+  }
+
+  {
+    const std::vector<std::string> argv = {
+        "tool.exe",
+        "--name",
+        "Alpha \"Peak\"",
+    };
+    const std::string cmd = join_commandline_args_win32(argv);
+    assert(cmd == "tool.exe --name \"Alpha \\\"Peak\\\"\"");
+  }
+
+  {
+    const std::vector<std::string> argv = {
+        "tool.exe",
+        "--empty",
+        "",
+    };
+    const std::string cmd = join_commandline_args_win32(argv);
+    assert(cmd == "tool.exe --empty \"\"");
+  }
+
+  {
+    // Trailing backslashes need special handling when the arg is quoted.
+    const std::vector<std::string> argv = {
+        "tool.exe",
+        "--dir",
+        "C:\\path with space\\",
+    };
+    const std::string cmd = join_commandline_args_win32(argv);
+    assert(cmd == "tool.exe --dir \"C:\\path with space\\\\\"");
   }
 
   std::cout << "ok\n";

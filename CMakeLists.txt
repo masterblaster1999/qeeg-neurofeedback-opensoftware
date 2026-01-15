@@ -303,6 +303,14 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_cmdline_split PRIVATE qeeg)
   add_test(NAME qeeg_test_cmdline_split COMMAND qeeg_test_cmdline_split)
 
+  add_executable(qeeg_test_number_parse tests/test_number_parse.cpp)
+  target_link_libraries(qeeg_test_number_parse PRIVATE qeeg)
+  add_test(NAME qeeg_test_number_parse COMMAND qeeg_test_number_parse)
+
+  add_executable(qeeg_test_http_range tests/test_http_range.cpp)
+  target_link_libraries(qeeg_test_http_range PRIVATE qeeg)
+  add_test(NAME qeeg_test_http_range COMMAND qeeg_test_http_range)
+
   add_executable(qeeg_test_random_token tests/test_random_token.cpp)
   target_link_libraries(qeeg_test_random_token PRIVATE qeeg)
   add_test(NAME qeeg_test_random_token COMMAND qeeg_test_random_token)

@@ -163,12 +163,14 @@ int main() {
   {
     EEGRecording rec;
     rec.fs_hz = 250.0;
-    rec.channel_names = {"Cz", "VEOG", "TRIG"};
-    rec.data.resize(3);
+    rec.channel_names = {"Cz", "VEOG", "TRIG", "REF"};
+    rec.data.resize(4);
     rec.data[0] = {0.0f, 1.0f, 2.0f};
     rec.data[1] = {0.0f, 0.0f, 0.0f};
     rec.data[2] = {0.0f, 5.0f, 0.0f};
+    rec.data[3] = {0.0f, 0.0f, 0.0f};
     rec.events.push_back({1.0, 0.0, "stim"});
+    rec.events.push_back({1e-9, 0.0, "tiny"});
     rec.events.push_back({0.5, 0.1, "5"});
     rec.events.push_back({2.0, 0.5, "NF:Reward"});
     rec.events.push_back({3.0, 0.5, "NF:Artifact"});
@@ -218,14 +220,16 @@ int main() {
     assert(ch.find("Cz\tEEG\tuV") != std::string::npos);
     assert(ch.find("VEOG\tVEOG\tuV") != std::string::npos);
     assert(ch.find("TRIG\tTRIG\tV") != std::string::npos);
+    assert(ch.find("REF\tREF\tuV") != std::string::npos);
 
     // Load channels.tsv name list (used by derivatives exporters to preserve ordering).
     {
       const auto names = load_bids_channels_tsv_names(channels_tsv.u8string());
-      assert(names.size() == 3);
+      assert(names.size() == 4);
       assert(names[0] == "Cz");
       assert(names[1] == "VEOG");
       assert(names[2] == "TRIG");
+      assert(names[3] == "REF");
     }
 
     // Also test the overload that writes channels.tsv from a channel name list.
@@ -243,6 +247,12 @@ int main() {
     }
 
     const std::string ev = slurp(events_tsv);
+    assert(ev.find("0.000000001\t0\ttiny") != std::string::npos);
+    // Ensure compact decimal formatting (avoid scientific notation in TSV).
+    assert(ev.find("e-") == std::string::npos);
+    assert(ev.find("E-") == std::string::npos);
+    assert(ev.find("e+") == std::string::npos);
+    assert(ev.find("E+") == std::string::npos);
     assert(ev.find("onset\tduration\ttrial_type") != std::string::npos);
     assert(ev.find("1") != std::string::npos);
     assert(ev.find("stim") != std::string::npos);

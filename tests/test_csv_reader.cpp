@@ -3,9 +3,12 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <clocale>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 static bool approx(double a, double b, double eps = 1e-6) {
   return std::fabs(a - b) <= eps;
@@ -13,6 +16,70 @@ static bool approx(double a, double b, double eps = 1e-6) {
 
 int main() {
   using namespace qeeg;
+
+  // CSVReader numeric parsing should be locale-independent.
+  // Best-effort: switch LC_NUMERIC to a locale that uses a decimal comma if available,
+  // then run the full test suite under that locale.
+  const char* prev_num_locale_c = std::setlocale(LC_NUMERIC, nullptr);
+  const std::string prev_num_locale = prev_num_locale_c ? prev_num_locale_c : "";
+
+  struct LocaleRestore {
+    std::string prev;
+    ~LocaleRestore() {
+      if (!prev.empty()) std::setlocale(LC_NUMERIC, prev.c_str());
+    }
+  } restore{prev_num_locale};
+
+  const std::vector<const char*> candidates = {
+      "de_DE.UTF-8", "de_DE.utf8", "de_DE",
+      "fr_FR.UTF-8", "fr_FR.utf8", "fr_FR",
+      "es_ES.UTF-8", "es_ES.utf8", "es_ES",
+      "it_IT.UTF-8", "it_IT.utf8", "it_IT",
+  };
+
+  const char* chosen = nullptr;
+  for (const char* loc : candidates) {
+    if (std::setlocale(LC_NUMERIC, loc) != nullptr) {
+      chosen = loc;
+      break;
+    }
+  }
+
+  if (chosen) {
+    std::cout << "test_csv_reader: LC_NUMERIC set to " << chosen << " (was "
+              << (prev_num_locale.empty() ? "(null)" : prev_num_locale) << "\n";
+  } else {
+    std::cout << "test_csv_reader: LC_NUMERIC comma-decimal locale not available; "
+              << "continuing with default locale\n";
+  }
+
+  // 0) UTF-8 filenames should work (important on Windows).
+  {
+    const std::filesystem::path dir = std::filesystem::u8path(u8"tmp_\xC2\xB5_csv_reader");
+    const std::filesystem::path file = dir / std::filesystem::u8path(u8"time_\xC2\xB5.csv");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    assert(!ec);
+
+    {
+      std::ofstream out(file);
+      out << "time,C1\n";
+      out << "0.000,1\n";
+      out << "0.004,2\n";
+      out << "0.008,3\n";
+    }
+
+    CSVReader r(/*fs_hz=*/0.0); // infer
+    EEGRecording rec = r.read(file.u8string());
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 1);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.data.size() == 1);
+    assert(rec.data[0].size() == 3);
+    assert(std::fabs(rec.data[0][2] - 3.0f) < 1e-6f);
+
+    std::filesystem::remove_all(dir, ec);
+  }
 
   // 1) Infer fs from a seconds-based time column.
   const std::string path1 = "tmp_time_seconds.csv";

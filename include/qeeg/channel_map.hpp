@@ -21,8 +21,9 @@ struct ChannelMap {
 //
 // Lines starting with '#' are treated as comments.
 //
-// The 'new' value may be empty or one of: "DROP", "NONE" (case-insensitive) to drop
-// that channel.
+// The 'new' value may be:
+//   - empty (meaning "keep the original channel name")
+//   - one of: "DROP", "NONE", "NULL" (case-insensitive) to drop that channel.
 ChannelMap load_channel_map_file(const std::string& path);
 
 // Apply a ChannelMap to an EEGRecording in-place.

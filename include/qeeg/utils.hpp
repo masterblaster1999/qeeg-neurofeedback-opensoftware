@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,18 @@ std::vector<std::string> split(const std::string& s, char delim);
 // This is NOT a full shell parser (no globbing, no env expansion, no nested
 // quoting rules). It is intentionally conservative.
 std::vector<std::string> split_commandline_args(const std::string& s);
+
+// Join argv into a single Windows command line string suitable for CreateProcess.
+//
+// On Windows, processes receive a *single* command line string. Most C/C++
+// runtimes then split it into argv with rules that treat backslashes specially
+// when they precede a double quote. This helper implements a widely-used
+// quoting strategy (compatible with the MSVC CRT rules) so that paths with
+// spaces, quotes, and trailing backslashes are forwarded correctly.
+//
+// The returned string is UTF-8 and is intended to be passed to CreateProcessW
+// after UTF-8->UTF-16 conversion.
+std::string join_commandline_args_win32(const std::vector<std::string>& argv);
 
 // Split a single CSV row into fields.
 //
@@ -80,6 +93,17 @@ std::string normalize_channel_name(std::string s);
 bool starts_with(const std::string& s, const std::string& prefix);
 bool ends_with(const std::string& s, const std::string& suffix);
 
+// Strict numeric parsing helpers.
+//
+// These functions trim leading/trailing whitespace and then require that the
+// entire remaining string is a valid number (no trailing "abc" fragments).
+//
+// Notes:
+// - to_double() primarily parses numbers using the classic "C" locale so that
+//   '.' is treated as the decimal separator regardless of the user's global
+//   locale.
+// - As a convenience for some locales, to_double() also supports a single
+//   decimal comma (e.g., "0,5") when no '.' is present.
 int to_int(const std::string& s);
 double to_double(const std::string& s);
 
@@ -87,10 +111,17 @@ bool file_exists(const std::string& path);
 void ensure_directory(const std::string& path);
 
 // Return a human-readable local timestamp string (best-effort).
+//
+// Format: ISO-8601 local time with numeric UTC offset, e.g.
+//   2026-01-15T13:37:42-05:00
+//
 // Used for lightweight run metadata JSON and HTML reports.
 std::string now_string_local();
 
 // Return a human-readable UTC timestamp string (best-effort).
+//
+// Format: ISO-8601 UTC time, e.g.
+//   2026-01-15T18:37:42Z
 std::string now_string_utc();
 
 
@@ -110,5 +141,42 @@ std::string json_escape(const std::string& s);
 // - Uses std::random_device for entropy (best-effort).
 // - Not intended as a general-purpose crypto library replacement.
 std::string random_hex_token(size_t n_bytes = 16);
+
+
+// HTTP helpers
+//
+// The built-in UI server supports lightweight HTTP features (e.g., Range) for
+// downloading large files (EDF/BDF/zips) without pulling in a full HTTP stack.
+//
+// parse_http_byte_range() parses the value of a "Range" request header
+// (RFC 9110) for a single "bytes" range, clamping it to the given resource
+// size.
+//
+// Examples:
+//   bytes=0-99    -> start=0, end=99
+//   bytes=500-    -> start=500, end=size-1
+//   bytes=-500    -> start=size-500, end=size-1 (suffix range)
+//
+// Notes:
+// - Only a *single* range is supported. Multi-range headers (comma-separated)
+//   return HttpRangeResult::kInvalid.
+// - Range is only meaningful for size > 0.
+//
+// Return value semantics:
+// - kNone: header missing/empty
+// - kInvalid: syntactically invalid/unsupported
+// - kUnsatisfiable: syntactically valid but outside the resource size
+// - kSatisfiable: range parsed and clamped, with start/end outputs set
+enum class HttpRangeResult {
+  kNone = 0,
+  kInvalid,
+  kUnsatisfiable,
+  kSatisfiable,
+};
+
+HttpRangeResult parse_http_byte_range(const std::string& range_header,
+                                      uintmax_t resource_size,
+                                      uintmax_t* out_start,
+                                      uintmax_t* out_end);
 
 } // namespace qeeg

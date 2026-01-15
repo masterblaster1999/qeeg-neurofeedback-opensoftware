@@ -435,7 +435,7 @@ Outputs (under `--outdir`):
 
 If you record with Mind Media BioTrace+ (e.g., a NeXus-10 MKII), export sessions to **EDF/EDF+** (recommended) or **BDF/BDF+** and use the exported file as input here.
 
-This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral channels at lower sampling rates (skin conductance, respiration, temperature, etc.), the reader will keep all non-annotation channels and resample them to the highest EEG/ExG-like sampling rate (best effort). Voltage-like channels exported in mV or V are converted to microvolts. If you only want EEG/ExG channels, drop peripherals with a channel-map (new=DROP).
+This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral channels at lower sampling rates (skin conductance, respiration, temperature, etc.), the reader will keep all non-annotation channels and resample them to the highest EEG/ExG-like sampling rate (best effort). Voltage-like channels exported in mV or V are converted to microvolts. If you only want EEG/ExG channels, drop peripherals with a channel-map (set `new=DROP`; leaving `new` blank keeps the channel unchanged).
 
 **Notes on BioTrace+ export formats**
 - The `.bcd` / `.mbd` formats are BioTrace+/NeXus session containers/backups and are **not supported** here.
@@ -459,7 +459,7 @@ That means tools like `qeeg_convert_cli --events-out ...` and `qeeg_export_bids_
 # Convert an ASCII export (e.g. .txt) to a clean CSV and generate a channel-map template
 ./build/qeeg_convert_cli --input path/to/session.txt --output session.csv --channel-map-template channel_map.csv
 
-# Edit channel_map.csv (e.g., map ExG1->C3, ExG2->C4, set new=DROP to remove channels),
+# Edit channel_map.csv (e.g., map ExG1->C3, ExG2->C4; leave `new` blank to keep a channel; set `new=DROP` to remove channels),
 # then apply it during conversion (works for EDF/BDF too)
 ./build/qeeg_convert_cli --input path/to/session.edf --output session_mapped.csv --channel-map channel_map.csv --events-out events.csv
 ```

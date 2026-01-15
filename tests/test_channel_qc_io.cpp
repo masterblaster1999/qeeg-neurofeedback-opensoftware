@@ -47,6 +47,57 @@ int main() {
 
   std::remove(csv_path.c_str());
 
+  // 1b) Parse a semicolon-delimited QC table (common spreadsheet export in some locales).
+  // Also include a decimal-comma numeric cell to ensure we don't accidentally split on ','.
+  const std::string sc_path = "tmp_channel_qc_semicolon.csv";
+  {
+    std::ofstream out(sc_path);
+    out << "channel;ptp;bad;reasons\n";
+    out << "EEG Fp1-REF;0,1;1;flatline\n";
+    out << "Cz;0,2;0;\n";
+  }
+  {
+    ChannelQcMap m = load_channel_qc_csv(sc_path);
+    assert(m.size() == 2);
+    assert(m.at(normalize_channel_name("Fp1")).bad == true);
+    assert(m.at(normalize_channel_name("Fp1")).reasons == "flatline");
+    assert(m.at(normalize_channel_name("Fp1")).name == "EEG Fp1-REF");
+    assert(m.at(normalize_channel_name("Cz")).bad == false);
+    assert(m.at(normalize_channel_name("Cz")).name == "Cz");
+  }
+  {
+    const auto names = load_channel_qc_csv_channel_names(sc_path);
+    assert(names.size() == 2);
+    assert(names[0] == "EEG Fp1-REF");
+    assert(names[1] == "Cz");
+  }
+  std::remove(sc_path.c_str());
+
+  // 1c) Parse a tab-delimited QC table.
+  const std::string tsv_path = "tmp_channel_qc.tsv";
+  {
+    std::ofstream out(tsv_path);
+    out << "channel\tbad\treasons\n";
+    out << "Fz\t1\tnoisy\n";
+    out << "Pz\t0\t\n";
+  }
+  {
+    ChannelQcMap m = load_channel_qc_csv(tsv_path);
+    assert(m.size() == 2);
+    assert(m.at(normalize_channel_name("Fz")).bad == true);
+    assert(m.at(normalize_channel_name("Fz")).reasons == "noisy");
+    assert(m.at(normalize_channel_name("Fz")).name == "Fz");
+    assert(m.at(normalize_channel_name("Pz")).bad == false);
+    assert(m.at(normalize_channel_name("Pz")).name == "Pz");
+  }
+  {
+    const auto names = load_channel_qc_csv_channel_names(tsv_path);
+    assert(names.size() == 2);
+    assert(names[0] == "Fz");
+    assert(names[1] == "Pz");
+  }
+  std::remove(tsv_path.c_str());
+
   // 2) Parse bad_channels.txt (one channel per line).
   const std::string bad_path = "tmp_bad_channels.txt";
   {

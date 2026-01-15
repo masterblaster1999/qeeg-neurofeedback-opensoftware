@@ -13,6 +13,49 @@
 namespace qeeg {
 namespace {
 
+// Count delimiter occurrences outside of quoted fields.
+//
+// This is used to detect whether a file is comma-, semicolon-, or tab-delimited.
+// Some spreadsheet exports use ';' depending on locale (notably when ',' is used
+// as a decimal separator), and some tools emit TSV.
+static size_t count_delim_outside_quotes(const std::string& s, char delim) {
+  bool in_quotes = false;
+  size_t n = 0;
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '"') {
+      if (in_quotes && (i + 1) < s.size() && s[i + 1] == '"') {
+        // Escaped quote
+        ++i;
+        continue;
+      }
+      in_quotes = !in_quotes;
+      continue;
+    }
+    if (!in_quotes && c == delim) ++n;
+  }
+  return n;
+}
+
+static char detect_delim_from_header(const std::string& header_line) {
+  const size_t n_tab = count_delim_outside_quotes(header_line, '\t');
+  const size_t n_comma = count_delim_outside_quotes(header_line, ',');
+  const size_t n_semi = count_delim_outside_quotes(header_line, ';');
+
+  char best = ',';
+  size_t best_n = n_comma;
+  if (n_semi > best_n) {
+    best = ';';
+    best_n = n_semi;
+  }
+  if (n_tab > best_n) {
+    best = '\t';
+    best_n = n_tab;
+  }
+  return best;
+}
+
+
 static bool is_comment_or_empty(const std::string& line) {
   const std::string t = trim(line);
   return t.empty() || (!t.empty() && t[0] == '#');
@@ -81,6 +124,7 @@ ChannelQcMap load_channel_qc_csv(const std::string& path) {
 
   std::string line;
   bool have_header = false;
+  char delim = ',';
   std::vector<std::string> header;
   int col_channel = -1;
   int col_bad = -1;
@@ -97,7 +141,8 @@ ChannelQcMap load_channel_qc_csv(const std::string& path) {
     if (is_comment_or_empty(line)) continue;
 
     if (!have_header) {
-      header = split_csv_row(line, ',');
+      delim = detect_delim_from_header(line);
+      header = split_csv_row(line, delim);
       col_channel = find_col(header, {"channel", "name"});
       col_bad = find_col(header, {"bad"});
       col_reasons = find_col(header, {"reasons", "reason"});
@@ -107,7 +152,7 @@ ChannelQcMap load_channel_qc_csv(const std::string& path) {
       continue;
     }
 
-    const auto row = split_csv_row(line, ',');
+    const auto row = split_csv_row(line, delim);
     if (static_cast<size_t>(col_channel) >= row.size() || static_cast<size_t>(col_bad) >= row.size()) {
       continue;
     }
@@ -166,16 +211,15 @@ std::vector<std::string> load_channel_qc_csv_channel_names(const std::string& pa
     if (is_comment_or_empty(line)) continue;
 
     if (!have_header) {
-      const std::string t = trim(line);
-      delim = (t.find('\t') != std::string::npos) ? '\t' : ',';
-      header = (delim == '\t') ? split(t, delim) : split_csv_row(t, delim);
+      delim = detect_delim_from_header(line);
+      header = split_csv_row(line, delim);
       col_channel = find_col(header, {"channel", "name"});
       if (col_channel < 0) throw std::runtime_error("channel_qc.csv missing required column: channel");
       have_header = true;
       continue;
     }
 
-    const auto row = (delim == '\t') ? split(line, delim) : split_csv_row(line, delim);
+    const auto row = split_csv_row(line, delim);
     if (static_cast<size_t>(col_channel) >= row.size()) continue;
     const std::string ch_raw = trim(row[static_cast<size_t>(col_channel)]);
     if (ch_raw.empty()) continue;

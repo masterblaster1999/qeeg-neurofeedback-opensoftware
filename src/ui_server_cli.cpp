@@ -46,8 +46,10 @@ namespace {
 using qeeg::ends_with;
 using qeeg::ensure_directory;
 using qeeg::file_exists;
+using qeeg::HttpRangeResult;
 using qeeg::json_escape;
 using qeeg::now_string_local;
+using qeeg::parse_http_byte_range;
 using qeeg::random_hex_token;
 using qeeg::split_commandline_args;
 using qeeg::starts_with;
@@ -216,6 +218,29 @@ static std::string url_decode(const std::string& s) {
   return out;
 }
 
+static std::string url_decode_path(const std::string& s) {
+  // Percent-decode a URL *path* component.
+  //
+  // Important: unlike application/x-www-form-urlencoded query strings, the
+  // path portion of a URL does NOT treat '+' as a space.
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '%' && i + 2 < s.size()) {
+      const int h1 = hexval(s[i + 1]);
+      const int h2 = hexval(s[i + 2]);
+      if (h1 >= 0 && h2 >= 0) {
+        out.push_back(static_cast<char>((h1 << 4) | h2));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+
 static std::map<std::string, std::string> parse_query_params(const std::string& qs) {
   std::map<std::string, std::string> out;
   size_t i = 0;
@@ -290,6 +315,7 @@ static bool parse_http_request(const std::string& raw, HttpRequest* out) {
 static std::string http_status_text(int code) {
   switch (code) {
     case 200: return "OK";
+    case 206: return "Partial Content";
     case 204: return "No Content";
     case 409: return "Conflict";
     case 411: return "Length Required";
@@ -298,6 +324,7 @@ static std::string http_status_text(int code) {
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 413: return "Payload Too Large";
+    case 416: return "Range Not Satisfiable";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
     default: return "";
@@ -1157,6 +1184,19 @@ class UiServer {
       }
     }
 
+    // URL-decode the request path (best-effort). This matters for browsing the
+    // directory listing: links percent-encode spaces and other characters.
+    req.path = url_decode_path(req.path);
+    if (req.path.empty() || req.path[0] != '/') {
+      send_json(c, 400, "{\"error\":\"bad path\"}");
+      return;
+    }
+    // Reject embedded NUL bytes to avoid surprising filesystem behavior.
+    if (req.path.find('\0') != std::string::npos) {
+      send_json(c, 400, "{\"error\":\"bad path\"}");
+      return;
+    }
+
     // Determine Content-Length (if any). We parse as u64 to support large uploads.
     uintmax_t want = 0;
     auto it = req.headers.find("content-length");
@@ -1381,13 +1421,23 @@ class UiServer {
     }
 
     if (req.path == "/" || req.path == "/index.html") {
-      serve_file(c, index_html_, true);
+      if (req.method != "GET" && req.method != "HEAD") {
+        send_text(c, 405, "method not allowed\n");
+        return;
+      }
+      serve_file(c, index_html_, req, true);
       return;
     }
 
     // Static file: map URL path to <root>/<path>
     if (!req.path.empty() && req.path[0] == '/') {
-      std::filesystem::path rel = std::filesystem::u8path(req.path.substr(1));
+      std::filesystem::path rel;
+      try {
+        rel = std::filesystem::u8path(req.path.substr(1));
+      } catch (...) {
+        send_text(c, 400, "bad path\n");
+        return;
+      }
       // Prevent ".." traversal.
       if (rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) {
         send_text(c, 403, "forbidden\n");
@@ -1408,20 +1458,28 @@ class UiServer {
         return;
       }
       if (std::filesystem::is_directory(p)) {
+        if (req.method != "GET" && req.method != "HEAD") {
+          send_text(c, 405, "method not allowed\n");
+          return;
+        }
         // Try index.html inside.
         std::filesystem::path idx = p / "index.html";
         if (std::filesystem::exists(idx)) {
-          serve_file(c, idx);
+          serve_file(c, idx, req);
           return;
         }
 
         // No index file: render a simple directory listing so users can
         // browse run outputs (e.g., ui_runs/<timestamp>_<tool>_idX/).
-        serve_directory_listing(c, p, req.path);
+        serve_directory_listing(c, p, req.path, req.method == "HEAD");
         return;
       }
       if (std::filesystem::exists(p)) {
-        serve_file(c, p);
+        if (req.method != "GET" && req.method != "HEAD") {
+          send_text(c, 405, "method not allowed\n");
+          return;
+        }
+        serve_file(c, p, req);
         return;
       }
     }
@@ -1524,13 +1582,23 @@ class UiServer {
     qeeg::ensure_directory(run_dir.u8string());
 
 #ifdef _WIN32
-    // Build a single command line string: "exe" + raw args. Windows will split it into argv
-    // for the child program.
-    std::string cmd = "\"" + exe.u8string() + "\"";
-    if (!job->args.empty()) {
-      cmd += " ";
-      cmd += job->args;
+    // Build a single command line string for CreateProcess.
+    //
+    // IMPORTANT: Windows processes receive a *single* command line string and most C/C++
+    // runtimes (including MSVC's) apply special parsing rules for backslashes immediately
+    // preceding double quotes. If we naively concatenate raw strings, paths like:
+    //   C:\path with space\
+    // can be mis-parsed (trailing backslash escapes the closing quote).
+    //
+    // To make behavior consistent with the POSIX fork/exec path, we:
+    //  1) split the UI-provided args string into tokens using split_commandline_args()
+    //  2) re-quote each token using join_commandline_args_win32()
+    std::vector<std::string> argv_s;
+    argv_s.push_back(exe.u8string());
+    for (const auto& t : qeeg::split_commandline_args(job->args)) {
+      argv_s.push_back(t);
     }
+    const std::string cmd = qeeg::join_commandline_args_win32(argv_s);
 
     const std::wstring cmd_w = utf8_to_wide(cmd);
     std::vector<wchar_t> cmd_buf(cmd_w.begin(), cmd_w.end());
@@ -3998,20 +4066,21 @@ class UiServer {
 
 
 
-  void send_text(
+  void send_headers(
 #ifdef _WIN32
       SOCKET c,
 #else
       int c,
 #endif
-      int code, const std::string& body,
-      const std::string& content_type = "text/plain; charset=utf-8",
+      int code,
+      const std::string& content_type,
+      uintmax_t content_length,
       const std::vector<std::pair<std::string, std::string>>& extra_headers = {},
       bool no_store = false) {
     std::ostringstream oss;
     oss << "HTTP/1.1 " << code << ' ' << http_status_text(code) << "\r\n";
     oss << "Content-Type: " << content_type << "\r\n";
-    oss << "Content-Length: " << body.size() << "\r\n";
+    oss << "Content-Length: " << content_length << "\r\n";
     oss << "Connection: close\r\n";
     if (no_store) oss << "Cache-Control: no-store\r\n";
     oss << "X-Content-Type-Options: nosniff\r\n";
@@ -4023,8 +4092,21 @@ class UiServer {
     }
     oss << "\r\n";
     const std::string hdr = oss.str();
-    send_all(c, hdr.data(), hdr.size());
-    send_all(c, body.data(), body.size());
+    (void)send_all(c, hdr.data(), hdr.size());
+  }
+
+  void send_text(
+#ifdef _WIN32
+      SOCKET c,
+#else
+      int c,
+#endif
+      int code, const std::string& body,
+      const std::string& content_type = "text/plain; charset=utf-8",
+      const std::vector<std::pair<std::string, std::string>>& extra_headers = {},
+      bool no_store = false) {
+    send_headers(c, code, content_type, static_cast<uintmax_t>(body.size()), extra_headers, no_store);
+    (void)send_all(c, body.data(), body.size());
   }
 
   void send_json(
@@ -4037,14 +4119,15 @@ class UiServer {
     send_text(c, code, json, "application/json; charset=utf-8", {}, true);
   }
 
-  void send_all(
+
+  bool send_all(
 #ifdef _WIN32
       SOCKET c,
 #else
       int c,
 #endif
       const char* data, size_t n) {
-    if (!data || n == 0) return;
+    if (!data || n == 0) return true;
     size_t off = 0;
     while (off < n) {
 #ifdef _WIN32
@@ -4052,10 +4135,12 @@ class UiServer {
 #else
       ssize_t rc = send(c, data + off, n - off, 0);
 #endif
-      if (rc <= 0) break;
+      if (rc <= 0) return false;
       off += static_cast<size_t>(rc);
     }
+    return true;
   }
+
 
   void serve_directory_listing(
 #ifdef _WIN32
@@ -4064,7 +4149,8 @@ class UiServer {
       int c,
 #endif
       const std::filesystem::path& dir_abs,
-      const std::string& url_path) {
+      const std::string& url_path,
+      bool head_only = false) {
     std::error_code ec;
     if (!std::filesystem::exists(dir_abs, ec) || !std::filesystem::is_directory(dir_abs, ec)) {
       send_text(c, 404, "not found\n");
@@ -4201,10 +4287,17 @@ class UiServer {
     }
     html << "</body></html>";
 
+    const std::string body = html.str();
+
     std::vector<std::pair<std::string, std::string>> extra;
     extra.emplace_back("Content-Security-Policy", kDashboardCsp);
-    send_text(c, 200, html.str(), "text/html; charset=utf-8", extra, true);
+    if (head_only) {
+      send_headers(c, 200, "text/html; charset=utf-8", static_cast<uintmax_t>(body.size()), extra, true);
+      return;
+    }
+    send_text(c, 200, body, "text/html; charset=utf-8", extra, true);
   }
+
 
   void serve_file(
 #ifdef _WIN32
@@ -4212,17 +4305,20 @@ class UiServer {
 #else
       int c,
 #endif
-      const std::filesystem::path& p, bool is_dashboard = false) {
+      const std::filesystem::path& p,
+      const HttpRequest& req,
+      bool is_dashboard = false) {
     std::error_code ec;
     if (!std::filesystem::exists(p, ec) || std::filesystem::is_directory(p, ec)) {
       send_text(c, 404, "not found\n");
       return;
     }
 
-    // Read file into memory (best-effort; keep reasonably bounded).
+    // Stream the file instead of reading it all into memory. This avoids
+    // rejecting large EEG outputs (e.g., EDF/BDF) and keeps RAM usage bounded.
     const uintmax_t sz = std::filesystem::file_size(p, ec);
-    if (ec || sz > (50ull * 1024ull * 1024ull)) {
-      send_text(c, 413, "file too large\n");
+    if (ec) {
+      send_text(c, 404, "not found\n");
       return;
     }
 
@@ -4232,25 +4328,68 @@ class UiServer {
       return;
     }
 
-    std::string body;
-    body.resize(static_cast<size_t>(sz));
-    if (sz > 0) {
-      f.read(&body[0], static_cast<std::streamsize>(sz));
-      if (!f) {
-        send_text(c, 500, "failed to read file\n");
-        return;
-      }
-    }
-
+    const bool head_only = (req.method == "HEAD");
     const std::string ct = content_type_for_path(p);
 
     std::vector<std::pair<std::string, std::string>> extra;
+    extra.emplace_back("Accept-Ranges", "bytes");
     bool no_store = false;
     if (is_dashboard && starts_with(ct, "text/html")) {
       extra.emplace_back("Content-Security-Policy", kDashboardCsp);
       no_store = true;
     }
-    send_text(c, 200, body, ct, extra, no_store);
+
+    // Optional: handle a single Range request.
+    uintmax_t rstart = 0;
+    uintmax_t rend = 0;
+    auto it = req.headers.find("range");
+    if (it != req.headers.end()) {
+      const HttpRangeResult rr = parse_http_byte_range(it->second, sz, &rstart, &rend);
+      if (rr == HttpRangeResult::kUnsatisfiable) {
+        std::vector<std::pair<std::string, std::string>> h = extra;
+        h.emplace_back("Content-Range", std::string("bytes */") + std::to_string(sz));
+        const std::string body = "range not satisfiable\n";
+        send_headers(c, 416, "text/plain; charset=utf-8", static_cast<uintmax_t>(body.size()), h, true);
+        if (!head_only) (void)send_all(c, body.data(), body.size());
+        return;
+      }
+      if (rr == HttpRangeResult::kSatisfiable) {
+        const uintmax_t clen = (rend - rstart) + 1;
+        std::vector<std::pair<std::string, std::string>> h = extra;
+        h.emplace_back("Content-Range",
+                       std::string("bytes ") + std::to_string(rstart) + "-" + std::to_string(rend) + "/" + std::to_string(sz));
+        send_headers(c, 206, ct, clen, h, no_store);
+        if (head_only) return;
+
+        // Seek to start and stream the requested range.
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(rstart));
+        char buf[64 * 1024];
+        uintmax_t remaining = clen;
+        while (f && remaining > 0) {
+          const size_t want = static_cast<size_t>(std::min<uintmax_t>(remaining, sizeof(buf)));
+          f.read(buf, static_cast<std::streamsize>(want));
+          const std::streamsize got = f.gcount();
+          if (got <= 0) break;
+          if (!send_all(c, buf, static_cast<size_t>(got))) break;
+          remaining -= static_cast<uintmax_t>(got);
+        }
+        return;
+      }
+      // kInvalid: ignore and fall through to full response.
+    }
+
+    send_headers(c, 200, ct, sz, extra, no_store);
+    if (head_only) return;
+
+    // Send the body in chunks.
+    char buf[64 * 1024];
+    while (f) {
+      f.read(buf, static_cast<std::streamsize>(sizeof(buf)));
+      const std::streamsize got = f.gcount();
+      if (got <= 0) break;
+      if (!send_all(c, buf, static_cast<size_t>(got))) break;
+    }
   }
 
  private:

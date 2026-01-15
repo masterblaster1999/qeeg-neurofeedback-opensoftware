@@ -1,5 +1,6 @@
 #include "qeeg/csv_io.hpp"
 #include "qeeg/event_ops.hpp"
+#include "qeeg/utils.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -7,6 +8,8 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 
 namespace qeeg {
@@ -76,13 +79,57 @@ static std::vector<std::string> split_delimited_row(const std::string& line_in, 
   return out;
 }
 
+static size_t count_delim_outside_quotes(const std::string& line_in, char delim) {
+  // Count delimiter occurrences that appear *outside* quoted fields.
+  // This helps avoid being fooled by delimiter characters inside quotes.
+  std::string line = line_in;
+  if (!line.empty() && line.back() == '\r') line.pop_back();
+
+  bool in_quotes = false;
+  size_t n = 0;
+  for (size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+    if (c == '"') {
+      // Escaped quote: "" inside quotes.
+      if (in_quotes && i + 1 < line.size() && line[i + 1] == '"') {
+        ++i;
+        continue;
+      }
+      in_quotes = !in_quotes;
+      continue;
+    }
+    if (!in_quotes && c == delim) ++n;
+  }
+  return n;
+}
+
 static char detect_delim(const std::string& header, const std::string& path) {
-  const bool has_tab = header.find('\t') != std::string::npos;
-  const bool has_comma = header.find(',') != std::string::npos;
-  if (has_tab && !has_comma) return '\t';
-  if (has_comma && !has_tab) return ',';
+  // Respect extension hint first.
   if (ends_with_ci(path, ".tsv")) return '\t';
-  return ',';
+
+  // Auto-detect common delimiters: tab, comma, semicolon.
+  const size_t n_tab = count_delim_outside_quotes(header, '\t');
+  const size_t n_comma = count_delim_outside_quotes(header, ',');
+  const size_t n_semi = count_delim_outside_quotes(header, ';');
+
+  // Pick the delimiter with the highest count.
+  // Tie-breaker is conservative: prefer comma, then semicolon, then tab.
+  char best = ',';
+  size_t best_n = n_comma;
+  if (n_semi > best_n) {
+    best = ';';
+    best_n = n_semi;
+  }
+  if (n_tab > best_n) {
+    best = '\t';
+    best_n = n_tab;
+  }
+
+  if (best_n == 0) {
+    // Fall back to comma (most common) if we can't detect.
+    return ',';
+  }
+  return best;
 }
 
 static int find_col(const std::vector<std::string>& header, const std::vector<std::string>& names) {
@@ -95,20 +142,69 @@ static int find_col(const std::vector<std::string>& header, const std::vector<st
   return -1;
 }
 
-static bool parse_double_maybe(const std::string& s, double* out) {
+static bool parse_double_classic_strict(const std::string& s, double* out) {
   if (!out) return false;
-  const std::string t = to_lower_ascii(trim_ws(s));
-  if (t.empty() || t == "n/a" || t == "na") return false;
-  try {
-    size_t pos = 0;
-    const double v = std::stod(t, &pos);
-    if (pos != t.size()) return false;
-    if (!std::isfinite(v)) return false;
-    *out = v;
-    return true;
-  } catch (...) {
-    return false;
+
+  std::istringstream iss(s);
+  iss.imbue(std::locale::classic());
+
+  double v = 0.0;
+  iss >> v;
+  if (!iss) return false;
+
+  // Allow trailing whitespace, but reject any other trailing characters.
+  iss >> std::ws;
+  if (!iss.eof()) return false;
+
+  if (!std::isfinite(v)) return false;
+  *out = v;
+  return true;
+}
+
+static bool parse_double_maybe(const std::string& s, char delim, double* out) {
+  if (!out) return false;
+  const std::string raw = trim_ws(s);
+  const std::string low = to_lower_ascii(raw);
+  if (low.empty() || low == "n/a" || low == "na") return false;
+
+  // Primary parse: classic C locale (decimal point '.') regardless of process locale.
+  if (parse_double_classic_strict(raw, out)) return true;
+
+  // Locale-specific exports:
+  // When the delimiter is not ',', numeric cells often use decimal commas
+  // ("0,5") and sometimes thousands dots ("1.234,56").
+  //
+  // We only attempt comma-based parsing when the delimiter is NOT a comma, to
+  // avoid ambiguity in comma-delimited CSVs.
+  if (delim != ',') {
+    // 1) Single decimal comma with no dot: "0,5" => "0.5"
+    if (raw.find('.') == std::string::npos) {
+      const size_t cpos = raw.find(',');
+      if (cpos != std::string::npos && raw.find(',', cpos + 1) == std::string::npos) {
+        std::string t = raw;
+        t[cpos] = '.';
+        if (parse_double_classic_strict(t, out)) return true;
+      }
+    }
+
+    // 2) Thousands dots + decimal comma: "1.234,56" => "1234.56"
+    const size_t comma = raw.find(',');
+    if (comma != std::string::npos &&
+        raw.find(',', comma + 1) == std::string::npos &&
+        raw.find('.') != std::string::npos &&
+        raw.rfind(',') > raw.find('.')) {
+      std::string t;
+      t.reserve(raw.size());
+      for (char c : raw) {
+        if (c == '.') continue; // drop thousands separators
+        t.push_back(c);
+      }
+      std::replace(t.begin(), t.end(), ',', '.');
+      if (parse_double_classic_strict(t, out)) return true;
+    }
   }
+
+  return false;
 }
 
 } // namespace
@@ -136,6 +232,7 @@ std::string csv_escape(const std::string& s) {
 
 void write_events_csv(const std::string& path, const std::vector<AnnotationEvent>& events) {
   std::ofstream o(path);
+  o.imbue(std::locale::classic());
   if (!o) throw std::runtime_error("Failed to write events CSV: " + path);
 
   o << "onset_sec,duration_sec,text\n";
@@ -161,6 +258,7 @@ static std::string tsv_sanitize_cell(const std::string& s) {
 
 void write_events_tsv(const std::string& path, const std::vector<AnnotationEvent>& events) {
   std::ofstream o(path);
+  o.imbue(std::locale::classic());
   if (!o) throw std::runtime_error("Failed to write events TSV: " + path);
 
   o << "onset\tduration\ttrial_type\n";
@@ -183,9 +281,11 @@ std::vector<AnnotationEvent> read_events_table(const std::string& path) {
   // Skip leading blank/comment lines.
   while (std::getline(f, header_line)) {
     if (!header_line.empty() && header_line.back() == '\r') header_line.pop_back();
-    const std::string t = trim_ws(header_line);
+    std::string t = trim_ws(header_line);
     if (t.empty()) continue;
     if (!t.empty() && t[0] == '#') continue;
+    // Some Windows CSV exports prefix the first header cell with a UTF-8 BOM.
+    t = strip_utf8_bom(std::move(t));
     header_line = t;
     break;
   }
@@ -224,14 +324,14 @@ std::vector<AnnotationEvent> read_events_table(const std::string& path) {
     if (row.size() < header.size()) row.resize(header.size());
 
     double onset = std::numeric_limits<double>::quiet_NaN();
-    if (!parse_double_maybe(row[static_cast<size_t>(col_onset)], &onset)) {
+    if (!parse_double_maybe(row[static_cast<size_t>(col_onset)], delim, &onset)) {
       continue; // invalid onset
     }
 
     double dur = 0.0;
     if (col_dur >= 0) {
       double tmp = 0.0;
-      if (parse_double_maybe(row[static_cast<size_t>(col_dur)], &tmp)) dur = tmp;
+      if (parse_double_maybe(row[static_cast<size_t>(col_dur)], delim, &tmp)) dur = tmp;
     }
     if (!(dur >= 0.0) || !std::isfinite(dur)) dur = 0.0;
 
@@ -273,6 +373,7 @@ void write_recording_csv(const std::string& path, const EEGRecording& rec, bool 
   }
 
   std::ofstream o(path);
+  o.imbue(std::locale::classic());
   if (!o) throw std::runtime_error("Failed to write CSV: " + path);
 
   // Header

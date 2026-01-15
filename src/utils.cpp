@@ -4,6 +4,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <locale>
 #include <random>
 #include <ctime>
 #include <iomanip>
@@ -61,10 +62,16 @@ std::vector<std::string> split_commandline_args(const std::string& s) {
   bool in_single = false;
   bool in_double = false;
 
+  // Track whether we've started a token. This lets us preserve explicitly
+  // empty quoted arguments like "" or '' (important for UIs that pass
+  // optional flags where the value may be intentionally empty).
+  bool token_started = false;
+
   auto flush = [&]() {
-    if (!cur.empty()) {
+    if (token_started) {
       out.push_back(cur);
       cur.clear();
+      token_started = false;
     }
   };
 
@@ -104,20 +111,24 @@ std::vector<std::string> split_commandline_args(const std::string& s) {
           // Consume the escaped character.
           ++i;
           cur.push_back(n);
+          token_started = true;
           continue;
         }
       }
 
       // Default: preserve the backslash literally.
       cur.push_back('\\');
+      token_started = true;
       continue;
     }
 
     if (!in_double && c == '\'') {
+      token_started = true;
       in_single = !in_single;
       continue;
     }
     if (!in_single && c == '"') {
+      token_started = true;
       in_double = !in_double;
       continue;
     }
@@ -128,9 +139,88 @@ std::vector<std::string> split_commandline_args(const std::string& s) {
     }
 
     cur.push_back(c);
+    token_started = true;
   }
 
   flush();
+  return out;
+}
+
+namespace {
+
+static inline bool win32_needs_quotes(const std::string& s) {
+  if (s.empty()) return true;
+  for (unsigned char c : s) {
+    if (std::isspace(c) != 0) return true;
+    if (c == '"') return true;
+  }
+  return false;
+}
+
+static std::string win32_quote_arg(const std::string& arg) {
+  // Quote an argument using rules compatible with the MSVC CRT's command line
+  // parsing.
+  //
+  // Key behaviors:
+  // - Surround with "" if the argument is empty or contains whitespace/quotes.
+  // - Backslashes are literal except when immediately preceding a quote.
+  // - When quoting, trailing backslashes before the closing quote must be
+  //   doubled.
+  //
+  // This algorithm matches the widely-used approach implemented by Python's
+  // subprocess.list2cmdline.
+
+  if (!win32_needs_quotes(arg)) return arg;
+
+  std::string out;
+  out.reserve(arg.size() + 2);
+  out.push_back('"');
+
+  size_t bs = 0;
+  for (char c : arg) {
+    if (c == '\\') {
+      ++bs;
+      continue;
+    }
+
+    if (c == '"') {
+      // Escape all backslashes, then escape the quote.
+      out.append(bs * 2 + 1, '\\');
+      out.push_back('"');
+      bs = 0;
+      continue;
+    }
+
+    // Normal character: emit any pending backslashes literally.
+    if (bs) {
+      out.append(bs, '\\');
+      bs = 0;
+    }
+    out.push_back(c);
+  }
+
+  // End of arg: if we're quoting, escape trailing backslashes so the closing
+  // quote is not consumed.
+  if (bs) out.append(bs * 2, '\\');
+  out.push_back('"');
+  return out;
+}
+
+} // namespace
+
+std::string join_commandline_args_win32(const std::vector<std::string>& argv) {
+  std::string out;
+  // Rough sizing: args + spaces.
+  size_t total = 0;
+  for (const auto& a : argv) total += a.size() + 1;
+  out.reserve(total);
+
+  bool first = true;
+  for (const auto& a : argv) {
+    if (!first) out.push_back(' ');
+    first = false;
+    out += win32_quote_arg(a);
+  }
   return out;
 }
 
@@ -355,9 +445,13 @@ bool ends_with(const std::string& s, const std::string& suffix) {
 
 int to_int(const std::string& s) {
   try {
+    const std::string t = trim(s);
     size_t idx = 0;
-    int v = std::stoi(trim(s), &idx, 10);
+    int v = std::stoi(t, &idx, 10);
     if (idx == 0) throw std::invalid_argument("no digits");
+    // Be strict: reject trailing garbage like "12abc".
+    // (Trailing whitespace is already removed by trim().)
+    if (idx != t.size()) throw std::invalid_argument("trailing characters");
     return v;
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to parse int from '" + s + "': " + e.what());
@@ -366,10 +460,42 @@ int to_int(const std::string& s) {
 
 double to_double(const std::string& s) {
   try {
-    size_t idx = 0;
-    double v = std::stod(trim(s), &idx);
-    if (idx == 0) throw std::invalid_argument("no digits");
-    return v;
+    const std::string t = trim(s);
+    if (t.empty()) throw std::invalid_argument("empty");
+
+    auto parse_classic = [](const std::string& x, double* out) -> bool {
+      if (!out) return false;
+      std::istringstream iss(x);
+      iss.imbue(std::locale::classic());
+      double v = 0.0;
+      iss >> v;
+      if (!iss) return false;
+      // Allow trailing whitespace, but reject any other trailing characters.
+      iss >> std::ws;
+      if (!iss.eof()) return false;
+      *out = v;
+      return true;
+    };
+
+    double v = 0.0;
+    if (parse_classic(t, &v)) return v;
+
+    // Common locale pitfall: users may provide a decimal comma (e.g. "0,5").
+    // In the default C locale, stod("0,5") silently parses "0" and ignores
+    // the remainder. We instead either parse correctly or throw.
+    if (t.find('.') == std::string::npos) {
+      const size_t cpos = t.find(',');
+      if (cpos != std::string::npos) {
+        // Only apply this fallback when there's exactly one comma.
+        if (t.find(',', cpos + 1) == std::string::npos) {
+          std::string tc = t;
+          tc[cpos] = '.';
+          if (parse_classic(tc, &v)) return v;
+        }
+      }
+    }
+
+    throw std::invalid_argument("invalid");
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to parse double from '" + s + "': " + e.what());
   }
@@ -383,19 +509,92 @@ void ensure_directory(const std::string& path) {
   std::filesystem::create_directories(std::filesystem::u8path(path));
 }
 
+namespace {
+
+static bool localtime_safe(std::time_t t, std::tm* out) {
+#if defined(_WIN32)
+  return out && localtime_s(out, &t) == 0;
+#else
+  return out && localtime_r(&t, out) != nullptr;
+#endif
+}
+
+static bool gmtime_safe(std::time_t t, std::tm* out) {
+#if defined(_WIN32)
+  return out && gmtime_s(out, &t) == 0;
+#else
+  return out && gmtime_r(&t, out) != nullptr;
+#endif
+}
+
+static long utc_offset_seconds(std::time_t t) {
+  std::tm local_tm{};
+  std::tm gm_tm{};
+  if (!localtime_safe(t, &local_tm) || !gmtime_safe(t, &gm_tm)) return 0;
+
+  // mktime() interprets its input tm as *local time*. By converting both the
+  // local and UTC broken-down times with mktime(), we can compute the local UTC
+  // offset (including DST) for this instant.
+  std::tm gm_as_local = gm_tm;
+  gm_as_local.tm_isdst = -1;
+
+  const std::time_t local_tt = std::mktime(&local_tm);
+  const std::time_t gm_local_tt = std::mktime(&gm_as_local);
+  if (local_tt == (std::time_t)-1 || gm_local_tt == (std::time_t)-1) return 0;
+
+  const double diff = std::difftime(local_tt, gm_local_tt);
+  return static_cast<long>(diff);
+}
+
+static std::string format_utc_offset(long offset_seconds) {
+  char sign = '+';
+  if (offset_seconds < 0) {
+    sign = '-';
+    offset_seconds = -offset_seconds;
+  }
+
+  const long total_minutes = offset_seconds / 60;
+  const long hh = total_minutes / 60;
+  const long mm = total_minutes % 60;
+
+  std::ostringstream oss;
+  oss << sign
+      << std::setw(2) << std::setfill('0') << hh
+      << ":"
+      << std::setw(2) << std::setfill('0') << mm;
+  return oss.str();
+}
+
+} // namespace
+
 std::string now_string_local() {
-  std::time_t t = std::time(nullptr);
-  std::string s = std::ctime(&t);
-  if (!s.empty() && s.back() == '\n') s.pop_back();
-  return s;
+  const std::time_t t = std::time(nullptr);
+
+  std::tm tm{};
+  if (!localtime_safe(t, &tm)) {
+    // Fallback: ctime() is not thread-safe, but returning *something* is more
+    // helpful than an empty string for logs/UI.
+    std::string s = std::ctime(&t);
+    if (!s.empty() && s.back() == '\n') s.pop_back();
+    return s;
+  }
+
+  // ISO-8601 local time with numeric UTC offset, e.g.
+  //   2026-01-15T13:37:42-05:00
+  std::ostringstream oss;
+  oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S")
+      << format_utc_offset(utc_offset_seconds(t));
+  return oss.str();
 }
 
 std::string now_string_utc() {
-  std::time_t t = std::time(nullptr);
-  std::tm* tm = std::gmtime(&t);
-  if (!tm) return std::string();
+  const std::time_t t = std::time(nullptr);
+
+  std::tm tm{};
+  if (!gmtime_safe(t, &tm)) return std::string();
+
   std::ostringstream oss;
-  oss << std::put_time(tm, "%Y-%m-%dT%H:%M:%SZ");
+  oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
   return oss.str();
 }
 
@@ -430,6 +629,99 @@ std::string json_escape(const std::string& s) {
     }
   }
   return oss.str();
+}
+
+
+namespace {
+
+static bool parse_uintmax_strict(const std::string& s, uintmax_t* out) {
+  if (!out) return false;
+  const std::string t = qeeg::trim(s);
+  if (t.empty()) return false;
+  uintmax_t v = 0;
+  for (char c : t) {
+    if (std::isdigit(static_cast<unsigned char>(c)) == 0) return false;
+    v = v * 10 + static_cast<uintmax_t>(c - '0');
+  }
+  *out = v;
+  return true;
+}
+
+static bool starts_with_ci(const std::string& s, const std::string& prefix_lower_ascii) {
+  // prefix_lower_ascii must already be lowercase ASCII.
+  if (s.size() < prefix_lower_ascii.size()) return false;
+  for (size_t i = 0; i < prefix_lower_ascii.size(); ++i) {
+    const unsigned char sc = static_cast<unsigned char>(s[i]);
+    const unsigned char pc = static_cast<unsigned char>(prefix_lower_ascii[i]);
+    if (static_cast<unsigned char>(std::tolower(sc)) != pc) return false;
+  }
+  return true;
+}
+
+} // namespace
+
+
+HttpRangeResult parse_http_byte_range(const std::string& range_header,
+                                      uintmax_t resource_size,
+                                      uintmax_t* out_start,
+                                      uintmax_t* out_end) {
+  if (out_start) *out_start = 0;
+  if (out_end) *out_end = 0;
+
+  const std::string raw = trim(range_header);
+  if (raw.empty()) return HttpRangeResult::kNone;
+  if (resource_size == 0) return HttpRangeResult::kUnsatisfiable;
+
+  // Only support the standard bytes range-unit.
+  if (!starts_with_ci(raw, "bytes=")) return HttpRangeResult::kInvalid;
+
+  std::string spec = trim(raw.substr(6));
+  if (spec.empty()) return HttpRangeResult::kInvalid;
+
+  // We intentionally do NOT support multiple ranges (comma-separated), since
+  // that would require multipart/byteranges responses.
+  if (spec.find(',') != std::string::npos) return HttpRangeResult::kInvalid;
+
+  const size_t dash = spec.find('-');
+  if (dash == std::string::npos) return HttpRangeResult::kInvalid;
+
+  const std::string a = trim(spec.substr(0, dash));
+  const std::string b = trim(spec.substr(dash + 1));
+  if (a.empty() && b.empty()) return HttpRangeResult::kInvalid;
+
+  uintmax_t start = 0;
+  uintmax_t end = 0;
+
+  if (a.empty()) {
+    // Suffix range: bytes=-N (last N bytes)
+    uintmax_t suffix = 0;
+    if (!parse_uintmax_strict(b, &suffix)) return HttpRangeResult::kInvalid;
+    if (suffix == 0) return HttpRangeResult::kUnsatisfiable;
+    if (suffix >= resource_size) {
+      start = 0;
+    } else {
+      start = resource_size - suffix;
+    }
+    end = resource_size - 1;
+  } else {
+    // Start or start-end.
+    if (!parse_uintmax_strict(a, &start)) return HttpRangeResult::kInvalid;
+    if (start >= resource_size) return HttpRangeResult::kUnsatisfiable;
+
+    if (b.empty()) {
+      end = resource_size - 1;
+    } else {
+      if (!parse_uintmax_strict(b, &end)) return HttpRangeResult::kInvalid;
+      if (end < start) return HttpRangeResult::kInvalid;
+      if (end >= resource_size) end = resource_size - 1;
+    }
+  }
+
+  if (end < start) return HttpRangeResult::kInvalid;
+  if (!out_start || !out_end) return HttpRangeResult::kInvalid;
+  *out_start = start;
+  *out_end = end;
+  return HttpRangeResult::kSatisfiable;
 }
 
 } // namespace qeeg
