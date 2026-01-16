@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <iostream>
 
 int main() {
@@ -85,6 +86,23 @@ int main() {
     assert(r == HttpRangeResult::kSatisfiable);
     assert(start == 1);
     assert(end == 2);
+  }
+
+
+
+  {
+    // Overflow should be treated as invalid (do not wrap).
+    const std::string maxs = std::to_string(std::numeric_limits<uintmax_t>::max());
+    const std::string too_big = maxs + "0"; // definitely larger than uintmax_t max
+
+    const auto r1 = parse_http_byte_range("bytes=" + too_big + "-", 100, &start, &end);
+    assert(r1 == HttpRangeResult::kInvalid);
+
+    const auto r2 = parse_http_byte_range("bytes=0-" + too_big, 100, &start, &end);
+    assert(r2 == HttpRangeResult::kInvalid);
+
+    const auto r3 = parse_http_byte_range("bytes=-" + too_big, 100, &start, &end);
+    assert(r3 == HttpRangeResult::kInvalid);
   }
 
   std::cout << "ok\n";

@@ -50,6 +50,7 @@ add_library(qeeg STATIC
   src/plv.cpp
   src/online_plv.cpp
   src/nf_metric.cpp
+  src/nf_protocols.cpp
   src/artifacts.cpp
   src/online_artifacts.cpp
   src/online_bandpower.cpp
@@ -314,6 +315,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_random_token tests/test_random_token.cpp)
   target_link_libraries(qeeg_test_random_token PRIVATE qeeg)
   add_test(NAME qeeg_test_random_token COMMAND qeeg_test_random_token)
+
+  add_executable(qeeg_test_nf_protocols tests/test_nf_protocols.cpp)
+  target_link_libraries(qeeg_test_nf_protocols PRIVATE qeeg)
+  add_test(NAME qeeg_test_nf_protocols COMMAND qeeg_test_nf_protocols)
 
   add_executable(qeeg_test_smoother tests/test_smoother.cpp)
   target_link_libraries(qeeg_test_smoother PRIVATE qeeg)

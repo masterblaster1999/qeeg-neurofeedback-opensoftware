@@ -8,6 +8,7 @@
 #include "qeeg/nf_metric.hpp"
 #include "qeeg/nf_metric_eval.hpp"
 #include "qeeg/nf_threshold.hpp"
+#include "qeeg/nf_protocols.hpp"
 #include "qeeg/hysteresis_gate.hpp"
 #include "qeeg/adaptive_threshold.hpp"
 #include "qeeg/debounce.hpp"
@@ -49,6 +50,26 @@ struct Args {
   std::string band_spec; // empty => default
   std::string metric_spec{"alpha:Pz"};
 
+  // Optional: use a built-in neurofeedback protocol preset (see --list-protocols).
+  // When set, the preset provides defaults for --metric/--bands and a few NF loop params
+  // unless you explicitly override them on the command line.
+  std::string protocol;
+  std::string protocol_ch;
+  std::string protocol_a;
+  std::string protocol_b;
+
+  struct ExplicitFlags {
+    bool bands{false};
+    bool metric{false};
+    bool reward_direction{false};
+    bool target_rate{false};
+    bool baseline{false};
+    bool window{false};
+    bool update{false};
+    bool metric_smooth{false};
+  } explicit_set;
+
+
   // Optional: channel quality control (qeeg_channel_qc_cli output).
   // When provided:
   //  - bad channels are ignored by the artifact gate (to avoid "always bad" sessions due to a known dead channel)
@@ -75,7 +96,7 @@ struct Args {
   size_t nperseg{512};
   double overlap{0.5};
 
-  // Bandpower scaling options (bandpower/ratio metrics only)
+  // Bandpower scaling options (bandpower/ratio/asymmetry metrics only)
   // - --relative: band_power / total_power within a frequency range
   // - --log10: apply log10(max(eps, value)) after any optional relative normalization
   bool log10_power{false};
@@ -203,6 +224,105 @@ struct Args {
   bool pac_zero_phase{false};
 };
 
+
+
+static void print_protocol_list() {
+  const auto presets = qeeg::built_in_nf_protocols();
+  std::cout << "Built-in NF protocol presets (use with --protocol NAME):\n";
+  for (const auto& p : presets) {
+    std::cout << "  " << p.name;
+    if (!p.title.empty()) std::cout << " — " << p.title;
+    std::cout << "\n";
+    if (!p.description.empty()) {
+      std::cout << "      " << p.description << "\n";
+    }
+  }
+  if (presets.empty()) {
+    std::cout << "  (none)\n";
+  }
+}
+
+static void print_protocol_help(const std::string& name) {
+  const auto p = qeeg::find_nf_protocol_preset(name);
+  if (!p.has_value()) {
+    throw std::runtime_error("Unknown protocol preset: " + name);
+  }
+
+  std::cout << p->name;
+  if (!p->title.empty()) std::cout << " — " << p->title;
+  std::cout << "\n";
+  if (!p->description.empty()) std::cout << "  " << p->description << "\n";
+
+  std::cout << "\nDefaults:\n";
+  std::cout << "  metric_template: " << p->metric_template << "\n";
+  try {
+    const std::string metric_rendered = qeeg::nf_render_protocol_metric(*p);
+    std::cout << "  metric:          " << metric_rendered << "\n";
+  } catch (const std::exception& e) {
+    std::cout << "  metric:          (error: " << e.what() << ")\n";
+  }
+  if (!p->band_spec.empty()) {
+    std::cout << "  bands:           " << p->band_spec << "\n";
+  } else {
+    std::cout << "  bands:           (default_eeg_bands)\n";
+  }
+  if (!p->default_channel.empty()) std::cout << "  default_channel: " << p->default_channel << "\n";
+  if (!p->default_channel_a.empty()) std::cout << "  default_channel_a: " << p->default_channel_a << "\n";
+  if (!p->default_channel_b.empty()) std::cout << "  default_channel_b: " << p->default_channel_b << "\n";
+
+  std::cout << "  reward_direction: " << qeeg::reward_direction_name(p->reward_direction) << "\n";
+  std::cout << "  target_reward_rate: " << p->target_reward_rate << "\n";
+  std::cout << "  baseline_seconds: " << p->baseline_seconds << "\n";
+  std::cout << "  window_seconds: " << p->window_seconds << "\n";
+  std::cout << "  update_seconds: " << p->update_seconds << "\n";
+  std::cout << "  metric_smooth_seconds: " << p->metric_smooth_seconds << "\n";
+
+  std::cout << "\nOverride examples:\n";
+  std::cout << "  qeeg_nf_cli --protocol " << p->name << " --protocol-ch Cz ...\n";
+  std::cout << "  qeeg_nf_cli --protocol " << p->name << " --metric alpha:Pz ...  (explicit flags override preset defaults)\n";
+}
+
+static void apply_protocol_preset(Args* a) {
+  if (!a) return;
+  const std::string proto_name = qeeg::trim(a->protocol);
+  if (proto_name.empty()) return;
+
+  const auto p = qeeg::find_nf_protocol_preset(proto_name);
+  if (!p.has_value()) {
+    throw std::runtime_error("Unknown protocol preset: " + proto_name + ". Use --list-protocols to see available presets.");
+  }
+
+  // Canonicalize the stored name.
+  a->protocol = p->name;
+
+  // Apply defaults only when the user did NOT explicitly set the corresponding flag.
+  // This makes presets a convenient starting point without preventing expert overrides.
+  if (!a->explicit_set.metric) {
+    a->metric_spec = qeeg::nf_render_protocol_metric(*p, a->protocol_ch, a->protocol_a, a->protocol_b);
+  }
+  if (!a->explicit_set.bands && !p->band_spec.empty()) {
+    a->band_spec = qeeg::nf_render_protocol_bands(*p, a->protocol_ch, a->protocol_a, a->protocol_b);
+  }
+  if (!a->explicit_set.reward_direction) {
+    a->reward_direction = p->reward_direction;
+  }
+  if (!a->explicit_set.target_rate) {
+    a->target_reward_rate = p->target_reward_rate;
+  }
+  if (!a->explicit_set.baseline) {
+    a->baseline_seconds = p->baseline_seconds;
+  }
+  if (!a->explicit_set.window) {
+    a->window_seconds = p->window_seconds;
+  }
+  if (!a->explicit_set.update) {
+    a->update_seconds = p->update_seconds;
+  }
+  if (!a->explicit_set.metric_smooth) {
+    a->metric_smooth_seconds = p->metric_smooth_seconds;
+  }
+}
+
 static void print_help() {
   std::cout
     << "qeeg_nf_cli (first pass neurofeedback engine)\n\n"
@@ -218,11 +338,19 @@ static void print_help() {
     << "  --input PATH              Input EDF/BDF/CSV (CSV requires --fs)\n"
     << "  --fs HZ                   Sampling rate for CSV (optional if first column is time); also used for --demo\n"
     << "  --outdir DIR              Output directory (default: out_nf)\n"
+    << "\nProtocol presets (optional):\n"
+    << "  --list-protocols          List built-in NF protocol presets and exit\n"
+    << "  --protocol NAME           Apply a built-in protocol preset (defaults for --metric/--bands/etc unless overridden)\n"
+    << "  --protocol-help NAME      Show details for one preset and exit\n"
+    << "  --protocol-ch CH          Override {ch} for single-channel presets\n"
+    << "  --protocol-a CH_A         Override {a} for pair presets (coherence/asymmetry)\n"
+    << "  --protocol-b CH_B         Override {b} for pair presets (coherence/asymmetry)\n\n"
     << "  --bands SPEC              Band spec, e.g. 'delta:0.5-4,theta:4-7,alpha:8-12'\n"
     << "                             IAF-relative convenience forms:\n"
     << "                               --bands iaf=10.2\n"
     << "                               --bands iaf:out_iaf   (reads out_iaf/iaf_band_spec.txt or out_iaf/iaf_summary.txt)\n"
     << "  --metric SPEC             Metric: 'alpha:Pz' (bandpower), 'alpha/beta:Pz' (ratio),\n"
+    << "                           'asym:alpha:F4:F3' (asymmetry),\n"
     << "                           'coh:alpha:F3:F4' or 'msc:alpha:F3:F4' (magnitude-squared coherence),\n"
     << "                           'imcoh:alpha:F3:F4' (imaginary coherency),\n"
     << "                           'pac:PHASE:AMP:CH' (Tort MI), or 'mvl:PHASE:AMP:CH'\n"
@@ -231,8 +359,8 @@ static void print_help() {
     << "  --metric-smooth S         Optional: EMA smooth the metric before thresholding (time constant seconds; default: 0/off)\n"
     << "  --nperseg N               Welch segment length (default: 512)\n"
     << "  --overlap FRAC            Welch overlap fraction in [0,1) (default: 0.5)\n"
-    << "  --log10                   Use log10(power) instead of raw bandpower (bandpower/ratio metrics only)\n"
-    << "  --relative                Use relative power: band_power / total_power (bandpower/ratio metrics only)\n"
+    << "  --log10                   Use log10(power) instead of raw bandpower (bandpower/ratio/asymmetry metrics only)\n"
+    << "  --relative                Use relative power: band_power / total_power (bandpower/ratio/asymmetry metrics only)\n"
     << "  --relative-range LO HI    Total-power integration range used for --relative.\n"
     << "                           Default: [min_band_fmin, max_band_fmax] from --bands.\n"
     << "  --baseline S              Baseline duration seconds for initial threshold (default: 10)\n"
@@ -312,10 +440,26 @@ static Args parse_args(int argc, char** argv) {
       a.input_path = argv[++i];
     } else if (arg == "--outdir" && i + 1 < argc) {
       a.outdir = argv[++i];
+    } else if (arg == "--list-protocols") {
+      print_protocol_list();
+      std::exit(0);
+    } else if (arg == "--protocol-help" && i + 1 < argc) {
+      print_protocol_help(argv[++i]);
+      std::exit(0);
+    } else if (arg == "--protocol" && i + 1 < argc) {
+      a.protocol = argv[++i];
+    } else if (arg == "--protocol-ch" && i + 1 < argc) {
+      a.protocol_ch = argv[++i];
+    } else if (arg == "--protocol-a" && i + 1 < argc) {
+      a.protocol_a = argv[++i];
+    } else if (arg == "--protocol-b" && i + 1 < argc) {
+      a.protocol_b = argv[++i];
     } else if (arg == "--bands" && i + 1 < argc) {
       a.band_spec = argv[++i];
+      a.explicit_set.bands = true;
     } else if (arg == "--metric" && i + 1 < argc) {
       a.metric_spec = argv[++i];
+      a.explicit_set.metric = true;
     } else if (arg == "--channel-qc" && i + 1 < argc) {
       a.channel_qc = argv[++i];
     } else if (arg == "--allow-bad-metric-channels") {
@@ -324,10 +468,13 @@ static Args parse_args(int argc, char** argv) {
       a.fs_csv = to_double(argv[++i]);
     } else if (arg == "--window" && i + 1 < argc) {
       a.window_seconds = to_double(argv[++i]);
+      a.explicit_set.window = true;
     } else if (arg == "--update" && i + 1 < argc) {
       a.update_seconds = to_double(argv[++i]);
+      a.explicit_set.update = true;
     } else if (arg == "--metric-smooth" && i + 1 < argc) {
       a.metric_smooth_seconds = to_double(argv[++i]);
+      a.explicit_set.metric_smooth = true;
     } else if (arg == "--nperseg" && i + 1 < argc) {
       a.nperseg = static_cast<size_t>(to_int(argv[++i]));
     } else if (arg == "--overlap" && i + 1 < argc) {
@@ -342,18 +489,23 @@ static Args parse_args(int argc, char** argv) {
       a.relative_fmax_hz = to_double(argv[++i]);
     } else if (arg == "--baseline" && i + 1 < argc) {
       a.baseline_seconds = to_double(argv[++i]);
+      a.explicit_set.baseline = true;
     } else if (arg == "--baseline-quantile" && i + 1 < argc) {
       a.baseline_quantile = to_double(argv[++i]);
     } else if (arg == "--threshold" && i + 1 < argc) {
       a.initial_threshold = to_double(argv[++i]);
     } else if (arg == "--reward-direction" && i + 1 < argc) {
       a.reward_direction = parse_reward_direction(argv[++i]);
+      a.explicit_set.reward_direction = true;
     } else if (arg == "--reward-below") {
       a.reward_direction = RewardDirection::Below;
+      a.explicit_set.reward_direction = true;
     } else if (arg == "--reward-above") {
       a.reward_direction = RewardDirection::Above;
+      a.explicit_set.reward_direction = true;
     } else if (arg == "--target-rate" && i + 1 < argc) {
       a.target_reward_rate = to_double(argv[++i]);
+      a.explicit_set.target_rate = true;
     } else if (arg == "--eta" && i + 1 < argc) {
       a.adapt_eta = to_double(argv[++i]);
     } else if (arg == "--adapt-mode" && i + 1 < argc) {
@@ -760,6 +912,10 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
   out << std::setprecision(10);
   out << "{\n";
   out << "  \"meta\": {\n";
+  out << "    \"protocol\": ";
+  if (!args.protocol.empty()) out << "\"" << json_escape(args.protocol) << "\"";
+  else out << "null";
+  out << ",\n";
   out << "    \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
   out << "    \"band_spec\": \"" << json_escape(args.band_spec) << "\",\n";
   out << "    \"reward_direction\": \"" << (args.reward_direction == RewardDirection::Above ? "above" : "below") << "\",\n";
@@ -843,7 +999,8 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
   const pillFs = document.getElementById('pillFs');
   const pillUpdate = document.getElementById('pillUpdate');
 
-  pillMetric.textContent = `Metric: ${data.meta.metric_spec}`;
+  const proto = (data.meta && data.meta.protocol) ? `Protocol: ${data.meta.protocol} | ` : "";
+  pillMetric.textContent = `${proto}Metric: ${data.meta.metric_spec}`;
   pillFs.textContent = `Fs: ${Number(data.meta.recording_fs_hz).toFixed(3)} Hz`;
   pillUpdate.textContent = `Update: ${Number(data.meta.update_seconds).toFixed(3)} s`;
 
@@ -1531,6 +1688,10 @@ static void write_nf_summary_json(const Args& args,
   out << "  \"Tool\": \"qeeg_nf_cli\",\n";
   out << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
   out << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
+  out << "  \"protocol\": ";
+  if (!args.protocol.empty()) out << "\"" << json_escape(args.protocol) << "\"";
+  else out << "null";
+  out << ",\n";
   out << "  \"input_path\": \"" << json_escape(args.input_path) << "\",\n";
   out << "  \"fs_hz\": " << rec.fs_hz << ",\n";
   out << "  \"file_duration_sec\": ";
@@ -1639,6 +1800,12 @@ static void osc_send_info(OscUdpClient* osc, const std::string& prefix, const Ar
     OscMessage m1(prefix + "/metric_spec");
     m1.add_string(args.metric_spec);
     osc->send(m1);
+
+    if (!args.protocol.empty()) {
+      OscMessage mp(prefix + "/protocol");
+      mp.add_string(args.protocol);
+      osc->send(mp);
+    }
 
     OscMessage m2(prefix + "/fs");
     m2.add_float32(static_cast<float>(fs_hz));
@@ -1966,17 +2133,28 @@ static BandDefinition resolve_band_token(const std::vector<BandDefinition>& band
   throw std::runtime_error(label + " band not found (name) and not a range (LO-HI): " + token);
 }
 
-static double compute_metric_band_or_ratio(const OnlineBandpowerFrame& fr,
-                                          const NfMetricSpec& spec,
-                                          int ch_idx,
-                                          int b_idx,
-                                          int b_num,
-                                          int b_den) {
-  const size_t c = static_cast<size_t>(ch_idx);
+static double compute_metric_band_ratio_or_asym(const OnlineBandpowerFrame& fr,
+                                               const NfMetricSpec& spec,
+                                               int ch_idx,
+                                               int ch_a_idx,
+                                               int ch_b_idx,
+                                               int b_idx,
+                                               int b_num,
+                                               int b_den) {
   if (spec.type == NfMetricSpec::Type::Band) {
+    const size_t c = static_cast<size_t>(ch_idx);
     return nf_eval_metric_band_or_ratio(fr, spec, c, static_cast<size_t>(b_idx), 0, 0);
   }
-  return nf_eval_metric_band_or_ratio(fr, spec, c, 0, static_cast<size_t>(b_num), static_cast<size_t>(b_den));
+  if (spec.type == NfMetricSpec::Type::Ratio) {
+    const size_t c = static_cast<size_t>(ch_idx);
+    return nf_eval_metric_band_or_ratio(fr, spec, c, 0, static_cast<size_t>(b_num), static_cast<size_t>(b_den));
+  }
+  if (spec.type != NfMetricSpec::Type::Asymmetry) {
+    throw std::runtime_error("compute_metric_band_ratio_or_asym: unsupported spec type");
+  }
+  const size_t ca = static_cast<size_t>(ch_a_idx);
+  const size_t cb = static_cast<size_t>(ch_b_idx);
+  return nf_eval_metric_asymmetry(fr, spec, ca, cb, static_cast<size_t>(b_idx));
 }
 
 static double clamp01(double x) {
@@ -2024,7 +2202,10 @@ static size_t sec_to_samples(double sec, double fs_hz) {
 
 int main(int argc, char** argv) {
   try {
-    const Args args = parse_args(argc, argv);
+    Args args = parse_args(argc, argv);
+
+    // Apply protocol preset defaults (if requested).
+    apply_protocol_preset(&args);
 
     if (!args.demo && args.input_path.empty()) {
       print_help();
@@ -2246,6 +2427,10 @@ int main(int argc, char** argv) {
         meta << "],\n";
         meta << "  \"allow_bad_metric_channels\": " << (args.allow_bad_metric_channels ? "true" : "false") << ",\n";
         meta << "  \"fs_hz\": " << rec.fs_hz << ",\n";
+        meta << "  \"protocol\": ";
+        if (!args.protocol.empty()) meta << "\"" << json_escape(args.protocol) << "\"";
+        else meta << "null";
+        meta << ",\n";
         meta << "  \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
         meta << "  \"band_spec\": \"" << json_escape(args.band_spec) << "\",\n";
         meta << "  \"reward_direction\": \"" << reward_direction_name(args.reward_direction) << "\",\n";
@@ -2378,7 +2563,7 @@ int main(int argc, char** argv) {
 
     if (have_qc) {
       std::vector<std::string> bad_metric_channels;
-      if (metric.type == NfMetricSpec::Type::Coherence) {
+      if (metric.type == NfMetricSpec::Type::Coherence || metric.type == NfMetricSpec::Type::Asymmetry) {
         const int ia = find_channel_index(rec.channel_names, metric.channel_a);
         const int ib = find_channel_index(rec.channel_names, metric.channel_b);
         if (qc_is_bad(ia)) bad_metric_channels.push_back(rec.channel_names[static_cast<size_t>(ia)]);
@@ -2401,8 +2586,8 @@ int main(int argc, char** argv) {
     }
 
     if ((args.log10_power || args.relative_power) &&
-        (metric.type != NfMetricSpec::Type::Band && metric.type != NfMetricSpec::Type::Ratio)) {
-      throw std::runtime_error("--log10 / --relative are only supported for bandpower and ratio metrics");
+        (metric.type != NfMetricSpec::Type::Band && metric.type != NfMetricSpec::Type::Ratio && metric.type != NfMetricSpec::Type::Asymmetry)) {
+      throw std::runtime_error("--log10 / --relative are only supported for bandpower, ratio, and asymmetry metrics");
     }
 
     // Output
@@ -2552,6 +2737,8 @@ int main(int argc, char** argv) {
       out << ",band,channel";
     } else if (metric.type == NfMetricSpec::Type::Ratio) {
       out << ",band_num,band_den,channel";
+    } else if (metric.type == NfMetricSpec::Type::Asymmetry) {
+      out << ",band,channel_a,channel_b";
     } else if (metric.type == NfMetricSpec::Type::Coherence) {
       out << ",band,channel_a,channel_b,measure";
     } else {
@@ -3310,7 +3497,10 @@ int main(int argc, char** argv) {
     OnlineWelchBandpower eng(rec.channel_names, rec.fs_hz, bands, opt);
 
     // We'll resolve band/channel indices once the first frame is emitted.
+    bool metric_resolved = false;
     int ch_idx = -1;
+    int ch_a_idx = -1;
+    int ch_b_idx = -1;
     int b_idx = -1;
     int b_num = -1;
     int b_den = -1;
@@ -3354,18 +3544,31 @@ int main(int argc, char** argv) {
 
       const auto frames = eng.push_block(block);
       for (const auto& fr : frames) {
-        if (ch_idx < 0) {
-          ch_idx = find_channel_index(fr.channel_names, metric.channel);
-          if (ch_idx < 0) throw std::runtime_error("Metric channel not found in recording: " + metric.channel);
+        if (!metric_resolved) {
           if (metric.type == NfMetricSpec::Type::Band) {
+            ch_idx = find_channel_index(fr.channel_names, metric.channel);
+            if (ch_idx < 0) throw std::runtime_error("Metric channel not found in recording: " + metric.channel);
             b_idx = find_band_index(fr.bands, metric.band);
             if (b_idx < 0) throw std::runtime_error("Metric band not found: " + metric.band);
-          } else {
+          } else if (metric.type == NfMetricSpec::Type::Ratio) {
+            ch_idx = find_channel_index(fr.channel_names, metric.channel);
+            if (ch_idx < 0) throw std::runtime_error("Metric channel not found in recording: " + metric.channel);
             b_num = find_band_index(fr.bands, metric.band_num);
             b_den = find_band_index(fr.bands, metric.band_den);
             if (b_num < 0) throw std::runtime_error("Metric numerator band not found: " + metric.band_num);
             if (b_den < 0) throw std::runtime_error("Metric denominator band not found: " + metric.band_den);
+          } else if (metric.type == NfMetricSpec::Type::Asymmetry) {
+            ch_a_idx = find_channel_index(fr.channel_names, metric.channel_a);
+            ch_b_idx = find_channel_index(fr.channel_names, metric.channel_b);
+            if (ch_a_idx < 0) throw std::runtime_error("Metric channel_a not found in recording: " + metric.channel_a);
+            if (ch_b_idx < 0) throw std::runtime_error("Metric channel_b not found in recording: " + metric.channel_b);
+            if (ch_a_idx == ch_b_idx) throw std::runtime_error("asymmetry metric requires two different channels");
+            b_idx = find_band_index(fr.bands, metric.band);
+            if (b_idx < 0) throw std::runtime_error("Metric band not found: " + metric.band);
+          } else {
+            throw std::runtime_error("Unsupported NF metric type in bandpower engine");
           }
+          metric_resolved = true;
         }
 
         const OnlineArtifactFrame af = take_artifact_frame(art ? &art_queue : nullptr,
@@ -3374,7 +3577,7 @@ int main(int argc, char** argv) {
         const bool artifact_hit = (args.artifact_gate && af.baseline_ready && af.bad);
         const bool artifact_state = (do_artifacts && af.baseline_ready && af.bad);
 
-        const double val_raw = compute_metric_band_or_ratio(fr, metric, ch_idx, b_idx, b_num, b_den);
+        const double val_raw = compute_metric_band_ratio_or_asym(fr, metric, ch_idx, ch_a_idx, ch_b_idx, b_idx, b_num, b_den);
         const double val = smooth_metric(val_raw, fr.t_end_sec, artifact_hit);
 
         const NfPhase phase = phase_of(fr.t_end_sec);
@@ -3470,8 +3673,11 @@ int main(int argc, char** argv) {
           append_phase_and_raw(phase, /*raw_reward=*/false);
           if (metric.type == NfMetricSpec::Type::Band) {
             out << "," << metric.band << "," << metric.channel;
-          } else {
+          } else if (metric.type == NfMetricSpec::Type::Ratio) {
             out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
+          } else {
+            // Asymmetry
+            out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
           }
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
@@ -3509,8 +3715,11 @@ int main(int argc, char** argv) {
           append_phase_and_raw(phase, /*raw_reward=*/false);
           if (metric.type == NfMetricSpec::Type::Band) {
             out << "," << metric.band << "," << metric.channel;
-          } else {
+          } else if (metric.type == NfMetricSpec::Type::Ratio) {
             out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
+          } else {
+            // Asymmetry
+            out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
           }
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
@@ -3571,8 +3780,11 @@ int main(int argc, char** argv) {
         append_phase_and_raw(phase, raw_reward);
         if (metric.type == NfMetricSpec::Type::Band) {
           out << "," << metric.band << "," << metric.channel;
-        } else {
+        } else if (metric.type == NfMetricSpec::Type::Ratio) {
           out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
+        } else {
+          // Asymmetry
+          out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
         }
         append_feedback_optional_cols(val_raw);
         append_reward_value_cols(feedback_raw, reward_value);

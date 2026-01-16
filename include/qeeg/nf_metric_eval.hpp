@@ -62,4 +62,40 @@ inline double nf_eval_metric_band_or_ratio(const OnlineBandpowerFrame& fr,
   return (num + eps) / (den + eps);
 }
 
+// Evaluate an asymmetry metric of the form:
+//   asym:BAND:CH_A:CH_B
+//
+// Semantics:
+// - If the frame is *not* log10-transformed, returns log10((Pa + eps) / (Pb + eps)).
+// - If the frame *is* log10-transformed, returns Pa_log10 - Pb_log10, which equals log10(Pa/Pb).
+inline double nf_eval_metric_asymmetry(const OnlineBandpowerFrame& fr,
+                                       const NfMetricSpec& spec,
+                                       size_t channel_a_index,
+                                       size_t channel_b_index,
+                                       size_t band_index) {
+  if (spec.type != NfMetricSpec::Type::Asymmetry) {
+    throw std::runtime_error("nf_eval_metric_asymmetry: spec type must be Asymmetry");
+  }
+  if (channel_a_index >= fr.channel_names.size() || channel_b_index >= fr.channel_names.size()) {
+    throw std::runtime_error("nf_eval_metric_asymmetry: channel index out of range");
+  }
+  if (band_index >= fr.powers.size() || band_index >= fr.bands.size()) {
+    throw std::runtime_error("nf_eval_metric_asymmetry: band_index out of range");
+  }
+  if (channel_a_index >= fr.powers[band_index].size() || channel_b_index >= fr.powers[band_index].size()) {
+    throw std::runtime_error("nf_eval_metric_asymmetry: channel index out of range for band row");
+  }
+
+  const double pa = fr.powers[band_index][channel_a_index];
+  const double pb = fr.powers[band_index][channel_b_index];
+
+  if (fr.log10_power) {
+    // powers[][] are already log10-transformed.
+    return pa - pb; // log10(Pa/Pb)
+  }
+
+  const double eps = 1e-12;
+  return std::log10((pa + eps) / (pb + eps));
+}
+
 } // namespace qeeg

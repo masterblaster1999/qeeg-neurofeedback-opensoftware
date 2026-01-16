@@ -11,12 +11,13 @@ NfMetricSpec parse_nf_metric_spec(const std::string& s) {
   //  - alpha/beta:Pz
   //  - band:alpha:Pz
   //  - ratio:alpha:beta:Pz
+  //  - asym:alpha:F4:F3      (log power ratio / asymmetry)
   //  - coh:alpha:F3:F4
   //  - coh:imcoh:alpha:F3:F4
   //  - msc:alpha:F3:F4
   //  - imcoh:alpha:F3:F4
-  //  - pac:theta:gamma:Cz  (Tort MI)
-  //  - mvl:theta:gamma:Cz  (mean vector length)
+  //  - pac:theta:gamma:Cz    (Tort MI)
+  //  - mvl:theta:gamma:Cz    (mean vector length)
   const auto parts = split(trim(s), ':');
   if (parts.empty()) throw std::runtime_error("--metric: empty spec");
 
@@ -40,6 +41,16 @@ NfMetricSpec parse_nf_metric_spec(const std::string& s) {
       m.band_num = trim(parts[1]);
       m.band_den = trim(parts[2]);
       m.channel = trim(parts[3]);
+      return m;
+    }
+
+    if (head == "asym" || head == "asymmetry") {
+      if (parts.size() != 4) throw std::runtime_error("--metric asym: expects asym:BAND:CH_A:CH_B");
+      NfMetricSpec m;
+      m.type = NfMetricSpec::Type::Asymmetry;
+      m.band = trim(parts[1]);
+      m.channel_a = trim(parts[2]);
+      m.channel_b = trim(parts[3]);
       return m;
     }
 
@@ -98,7 +109,7 @@ NfMetricSpec parse_nf_metric_spec(const std::string& s) {
   // Short-form (bandpower or ratio)
   if (parts.size() != 2) {
     throw std::runtime_error(
-      "--metric: expected 'alpha:Pz', 'alpha/beta:Pz', 'coh:alpha:F3:F4', 'imcoh:alpha:F3:F4', or 'pac:theta:gamma:Cz'");
+      "--metric: expected 'alpha:Pz', 'alpha/beta:Pz', 'asym:alpha:F4:F3', 'coh:alpha:F3:F4', 'imcoh:alpha:F3:F4', or 'pac:theta:gamma:Cz'");
   }
 
   NfMetricSpec m;

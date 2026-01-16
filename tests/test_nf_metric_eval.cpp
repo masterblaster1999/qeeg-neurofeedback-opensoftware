@@ -47,6 +47,33 @@ int main() {
     expect(std::fabs(lr - 1.0) < 1e-9, "log10 ratio should be 1.0 for 100/10");
   }
 
+  // Asymmetry metric: log10(Pa/Pb) using either raw powers or log10 powers.
+  OnlineBandpowerFrame fr2;
+  fr2.channel_names = {"F4", "F3"};
+  fr2.bands = {BandDefinition{"alpha", 8.0, 12.0}};
+
+  NfMetricSpec asym;
+  asym.type = NfMetricSpec::Type::Asymmetry;
+  asym.band = "alpha";
+  asym.channel_a = "F4";
+  asym.channel_b = "F3";
+
+  // Raw powers: log10(100/25)=log10(4)
+  fr2.log10_power = false;
+  fr2.powers = {{100.0, 25.0}};
+  {
+    const double a = nf_eval_metric_asymmetry(fr2, asym, /*ch_a*/0, /*ch_b*/1, /*band*/0);
+    expect(std::fabs(a - std::log10(4.0)) < 1e-9, "raw asymmetry should be log10(4)");
+  }
+
+  // Log10 powers: log10(100)-log10(25) = log10(4)
+  fr2.log10_power = true;
+  fr2.powers = {{2.0, std::log10(25.0)}};
+  {
+    const double a = nf_eval_metric_asymmetry(fr2, asym, /*ch_a*/0, /*ch_b*/1, /*band*/0);
+    expect(std::fabs(a - std::log10(4.0)) < 1e-9, "log10 asymmetry should be log10(4)");
+  }
+
   std::cerr << "test_nf_metric_eval OK\n";
   return 0;
 }

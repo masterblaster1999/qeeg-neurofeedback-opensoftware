@@ -8,6 +8,7 @@
 #include <random>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -228,17 +229,27 @@ std::string random_hex_token(size_t n_bytes) {
   if (n_bytes == 0) n_bytes = 16;
   static const char* kHex = "0123456789abcdef";
 
+  // Best-effort entropy source.
+  //
+  // Prefer std::random_device directly rather than seeding a PRNG like mt19937.
+  // For local-only tooling this is usually sufficient, and keeps the token
+  // generation logic dependency-free.
   std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<int> dist(0, 255);
 
   std::string out;
   out.reserve(n_bytes * 2);
-  for (size_t i = 0; i < n_bytes; ++i) {
-    const int b = dist(gen);
-    out.push_back(kHex[(b >> 4) & 0x0F]);
-    out.push_back(kHex[b & 0x0F]);
+
+  size_t produced = 0;
+  while (produced < n_bytes) {
+    const std::random_device::result_type r = rd();
+    for (size_t k = 0; k < sizeof(r) && produced < n_bytes; ++k) {
+      const unsigned char b = static_cast<unsigned char>((r >> (8 * k)) & 0xFFu);
+      out.push_back(kHex[(b >> 4) & 0x0F]);
+      out.push_back(kHex[b & 0x0F]);
+      ++produced;
+    }
   }
+
   return out;
 }
 
@@ -638,11 +649,19 @@ static bool parse_uintmax_strict(const std::string& s, uintmax_t* out) {
   if (!out) return false;
   const std::string t = qeeg::trim(s);
   if (t.empty()) return false;
+
   uintmax_t v = 0;
+  const uintmax_t kMax = std::numeric_limits<uintmax_t>::max();
+
   for (char c : t) {
     if (std::isdigit(static_cast<unsigned char>(c)) == 0) return false;
-    v = v * 10 + static_cast<uintmax_t>(c - '0');
+    const uintmax_t digit = static_cast<uintmax_t>(c - '0');
+
+    // Overflow check for: v = v * 10 + digit
+    if (v > (kMax - digit) / 10) return false;
+    v = v * 10 + digit;
   }
+
   *out = v;
   return true;
 }

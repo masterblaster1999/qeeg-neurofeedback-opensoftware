@@ -13,6 +13,13 @@ int main() {
     }
   }
   {
+    const std::string t = qeeg::random_hex_token(1);
+    assert(t.size() == 2);
+    for (unsigned char c : t) {
+      assert(std::isxdigit(c) != 0);
+    }
+  }
+  {
     // 0 means "use a sensible default"
     const std::string t = qeeg::random_hex_token(0);
     assert(!t.empty());
