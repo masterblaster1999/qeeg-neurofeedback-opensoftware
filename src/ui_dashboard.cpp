@@ -5757,9 +5757,99 @@ function detectQeegCsv(rows, label){
   return {kind:'channel_metrics', channelIdx:channelIdx, metrics:metrics, prefMetric:pref};
 }
 
+function detectTimeSeriesCsv(rows, label){
+  // Heuristic detection for simple time series tables.
+  //
+  // Expected shapes:
+  //   - bandpower_timeseries.csv: t_end_sec, <band>_<channel>...
+  //   - artifact_gate_timeseries.csv: t_end_sec, gate...
+  //
+  // We look for a numeric time column + at least one mostly-numeric value column.
+  if(!Array.isArray(rows) || rows.length < 3) return null;
+  const header = rows[0] || [];
+  if(!Array.isArray(header) || header.length < 2) return null;
+
+  const map = {};
+  for(let j=0;j<header.length;++j){
+    const key = norm(String(header[j]||'').trim());
+    if(key && map[key]===undefined) map[key] = j;
+  }
+
+  const candidates = [
+    't_end_sec','t_end_s','t_mid_sec','t_mid_s','t_start_sec','t_start_s',
+    'time_sec','time_s','t_sec','t_s','time','t',
+    'seconds','sec','sample','index'
+  ];
+
+  let timeIdx = -1;
+  for(const k of candidates){
+    if(map[k]!==undefined){ timeIdx = map[k]; break; }
+  }
+  if(timeIdx < 0){
+    // Fallback: use the first column if it looks numeric.
+    timeIdx = 0;
+  }
+  const timeName = String(header[timeIdx]||'time');
+
+  const probeN = Math.min(rows.length-1, 80);
+
+  // Validate time column numeric-ness.
+  let seenT = 0, numT = 0;
+  for(let i=1;i<=probeN;++i){
+    const rr = rows[i] || [];
+    if(timeIdx >= rr.length) continue;
+    const v = String(rr[timeIdx]||'').trim();
+    if(!v) continue;
+    ++seenT;
+    if(isNumericCell(v)) ++numT;
+  }
+  if(seenT < 3 || (numT/Math.max(1,seenT)) < 0.8) return null;
+
+  // Find value columns.
+  const cols = [];
+  for(let j=0;j<header.length;++j){
+    if(j===timeIdx) continue;
+    const name = String(header[j]||'').trim();
+    if(!name) continue;
+
+    let seen=0, num=0;
+    for(let i=1;i<=probeN;++i){
+      const rr = rows[i] || [];
+      if(j>=rr.length) continue;
+      const v = String(rr[j]||'').trim();
+      if(!v) continue;
+      ++seen;
+      if(isNumericCell(v)) ++num;
+    }
+    if(seen>=3 && (num/seen) >= 0.8){
+      cols.push({name:name, idx:j});
+    }
+  }
+
+  if(cols.length < 1) return null;
+
+  // Pick a default column (best-effort).
+  const labelLow = norm(label||'');
+  let defIdx = cols[0].idx;
+  if(labelLow.includes('bandpower_timeseries') || labelLow.includes('bandpower')){
+    for(const c of cols){
+      const n = norm(c.name);
+      if(n.includes('alpha')) { defIdx = c.idx; break; }
+    }
+  }
+  if(labelLow.includes('artifact') || labelLow.includes('gate')){
+    for(const c of cols){
+      const n = norm(c.name);
+      if(n.includes('gate') || n.includes('artifact')) { defIdx = c.idx; break; }
+    }
+  }
+
+  return {kind:'timeseries', timeIdx:timeIdx, timeName:timeName, cols:cols, defaultSel:[defIdx]};
+}
+
 function csvSetView(mode){
   if(!csvPreviewCtx) return;
-  mode = (mode==='heat') ? 'heat' : (mode==='raw' ? 'raw' : (mode==='qeeg' ? 'qeeg' : 'table'));
+  mode = (mode==='heat') ? 'heat' : (mode==='raw' ? 'raw' : (mode==='qeeg' ? 'qeeg' : (mode==='series' ? 'series' : 'table')));
   csvPreviewCtx.view = mode;
   try{ localStorage.setItem('qeeg_csv_view', mode); }catch(e){}
   renderCsvPreview();
@@ -5778,58 +5868,69 @@ function renderCsvPreview(){
 
   const canHeat = !!csvPreviewCtx.matrix;
   const canQeeg = !!csvPreviewCtx.qeeg;
+  const canSeries = !!csvPreviewCtx.series;
 
   let view = csvPreviewCtx.view || 'table';
   if(view==='heat' && !canHeat) view='table';
   if(view==='qeeg' && !canQeeg) view='table';
+  if(view==='series' && !canSeries) view='table';
   csvPreviewCtx.view = view;
 
   let heatBtn = '<button class="btn" id="csvViewHeatBtn" type="button" '+(canHeat?'':'disabled')+'>Heatmap</button>';
   let qeegBtn = '<button class="btn" id="csvViewQeegBtn" type="button" '+(canQeeg?'':'disabled')+'>QEEG</button>';
+  let seriesBtn = '<button class="btn" id="csvViewSeriesBtn" type="button" '+(canSeries?'':'disabled')+'>Series</button>';
 
   let meta = 'Rows: <b>'+String(rows.length)+'</b>' + (truncated ? (' (showing first '+String(maxRows)+')') : '') + ' · Cols: <b>'+String(cols)+'</b>' + (colTrunc ? (' (showing first '+String(maxCols)+')') : '');
   body.innerHTML =
     '<div class="csv-controls">'+
       '<span class="small">'+meta+'</span>'+
       '<input class="input" id="csvFilterInput" placeholder="filter rows/channels" style="max-width:240px" value="'+esc(csvPreviewCtx.filter||'')+'">'+
-      '<button class="btn" id="csvViewTableBtn" type="button">Table</button>'+
+      '<button class=\"btn\" id=\"csvViewTableBtn\" type=\"button\">Table</button>'+
+      seriesBtn+
       qeegBtn+
       heatBtn+
-      '<button class="btn" id="csvViewRawBtn" type="button">Raw</button>'+
+      '<button class=\"btn\" id=\"csvViewRawBtn\" type=\"button\">Raw</button>'+
     '</div>'+
-    '<div id="csvViewTable" class="csv-viewwrap"></div>'+
-    '<div id="csvViewQeeg" class="csv-viewwrap hidden"></div>'+
-    '<div id="csvViewHeat" class="csv-viewwrap hidden"></div>'+
-    '<div id="csvViewRaw" class="hidden"><pre><code>'+esc(raw)+'</code></pre></div>';
+    '<div id=\"csvViewTable\" class=\"csv-viewwrap\"></div>'+
+    '<div id=\"csvViewSeries\" class=\"csv-viewwrap hidden\"></div>'+
+    '<div id=\"csvViewQeeg\" class=\"csv-viewwrap hidden\"></div>'+
+    '<div id=\"csvViewHeat\" class=\"csv-viewwrap hidden\"></div>'+
+    '<div id=\"csvViewRaw\" class=\"hidden\"><pre><code>'+esc(raw)+'</code></pre></div>';
 
   const fi=document.getElementById('csvFilterInput');
   if(fi){
     fi.oninput = ()=>{ if(!csvPreviewCtx) return; csvPreviewCtx.filter = fi.value||''; renderCsvPreviewTableOnly(); if(csvPreviewCtx.view==='qeeg') renderCsvPreviewQeegOnly(); };
   }
   const bt=document.getElementById('csvViewTableBtn');
+  const bs=document.getElementById('csvViewSeriesBtn');
   const bq=document.getElementById('csvViewQeegBtn');
   const bh=document.getElementById('csvViewHeatBtn');
   const br=document.getElementById('csvViewRawBtn');
   if(bt) bt.onclick = ()=>csvSetView('table');
+  if(bs) bs.onclick = ()=>csvSetView('series');
   if(bq) bq.onclick = ()=>csvSetView('qeeg');
   if(bh) bh.onclick = ()=>csvSetView('heat');
   if(br) br.onclick = ()=>csvSetView('raw');
 
   // Activate view.
   const vTable=document.getElementById('csvViewTable');
+  const vSeries=document.getElementById('csvViewSeries');
   const vQeeg=document.getElementById('csvViewQeeg');
   const vHeat=document.getElementById('csvViewHeat');
   const vRaw=document.getElementById('csvViewRaw');
   if(vTable) vTable.classList.toggle('hidden', view!=='table');
+  if(vSeries) vSeries.classList.toggle('hidden', view!=='series');
   if(vQeeg) vQeeg.classList.toggle('hidden', view!=='qeeg');
   if(vHeat) vHeat.classList.toggle('hidden', view!=='heat');
   if(vRaw) vRaw.classList.toggle('hidden', view!=='raw');
 
   // Render current view.
   renderCsvPreviewTableOnly();
+  if(view==='series') renderCsvPreviewSeriesOnly();
   if(view==='qeeg') renderCsvPreviewQeegOnly();
   if(view==='heat') renderCsvPreviewHeatOnly();
   if(bt) bt.classList.toggle('active', view==='table');
+  if(bs) bs.classList.toggle('active', view==='series');
   if(bq) bq.classList.toggle('active', view==='qeeg');
   if(bh) bh.classList.toggle('active', view==='heat');
   if(br) br.classList.toggle('active', view==='raw');
@@ -5945,6 +6046,368 @@ function renderCsvPreviewHeatOnly(){
 }
 
 
+
+
+
+function csvSeriesPalette(){
+  const accent = qeegCssVar('--accent') || 'rgba(106,166,255,0.9)';
+  return [
+    accent,
+    'rgba(255,120,140,0.9)',
+    'rgba(120,255,170,0.9)',
+    'rgba(255,205,120,0.9)',
+    'rgba(180,140,255,0.9)',
+    'rgba(140,240,255,0.9)',
+  ];
+}
+
+function drawTimeSeriesChart(canvas, xs, series, opts){
+  if(!canvas) return;
+  const ctx = canvas.getContext('2d');
+  if(!ctx) return;
+
+  xs = Array.isArray(xs) ? xs : [];
+  series = Array.isArray(series) ? series : [];
+  opts = opts || {};
+
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+
+  const title = String(opts.title||'');
+  const xLabel = String(opts.xLabel||'t');
+  const hoverIndex = (opts.hoverIndex===undefined || opts.hoverIndex===null) ? -1 : Number(opts.hoverIndex);
+
+  let minX = Infinity, maxX = -Infinity;
+  for(const x of xs){
+    const v = Number(x);
+    if(!isFinite(v)) continue;
+    if(v < minX) minX = v;
+    if(v > maxX) maxX = v;
+  }
+
+  let minY = Infinity, maxY = -Infinity;
+  for(const s of series){
+    const ys = Array.isArray(s.ys) ? s.ys : [];
+    for(const y of ys){
+      const v = Number(y);
+      if(!isFinite(v)) continue;
+      if(v < minY) minY = v;
+      if(v > maxY) maxY = v;
+    }
+  }
+
+  if(!isFinite(minX) || !isFinite(maxX) || !isFinite(minY) || !isFinite(maxY)){
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+    ctx.fillText('No numeric time series to plot.', 20, 30);
+    return;
+  }
+
+  // Include a baseline for common signals.
+  minY = Math.min(minY, 0);
+  maxY = Math.max(maxY, 0);
+  if(maxX - minX < 1e-12) maxX = minX + 1e-12;
+  if(maxY - minY < 1e-12) maxY = minY + 1e-12;
+
+  const padL = 64;
+  const padR = 18;
+  const padT = 26;
+  const padB = 42;
+  const iw = W - padL - padR;
+  const ih = H - padT - padB;
+  if(iw <= 10 || ih <= 10) return;
+
+  const xFor = (x)=> padL + (x - minX) * iw / (maxX - minX);
+  const yFor = (y)=> padT + (maxY - y) * ih / (maxY - minY);
+
+  // Title
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(title, 10, 16);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+  ctx.lineWidth = 1;
+  const gridN = 5;
+  for(let g=0; g<=gridN; ++g){
+    const t = g / gridN;
+    const y = padT + t * ih;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + iw, y);
+    ctx.stroke();
+  }
+
+  // Axes
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + ih);
+  ctx.lineTo(padL + iw, padT + ih);
+  ctx.stroke();
+
+  // Labels
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(String(maxY.toFixed(4)), padL - 6, padT + 10);
+  ctx.fillText(String(minY.toFixed(4)), padL - 6, padT + ih);
+  ctx.textAlign = 'left';
+  ctx.fillText(String(minX.toFixed(2)), padL, padT + ih + 18);
+  ctx.textAlign = 'right';
+  ctx.fillText(String(maxX.toFixed(2)), padL + iw, padT + ih + 18);
+  ctx.textAlign = 'center';
+  ctx.fillText(xLabel, padL + iw/2, H - 6);
+
+  // Series
+  for(let si=0; si<series.length; ++si){
+    const s = series[si] || {};
+    const ys = Array.isArray(s.ys) ? s.ys : [];
+    const color = String(s.color||'rgba(255,255,255,0.8)');
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    let started = false;
+    for(let i=0;i<xs.length && i<ys.length;++i){
+      const x = Number(xs[i]);
+      const y = Number(ys[i]);
+      if(!isFinite(x) || !isFinite(y)){
+        started = false;
+        continue;
+      }
+      const px = xFor(x);
+      const py = yFor(y);
+      if(!started){
+        ctx.moveTo(px, py);
+        started = true;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+    ctx.stroke();
+  }
+
+  // Legend
+  ctx.textAlign = 'left';
+  ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+  let lx = padL + 8;
+  let ly = padT + 12;
+  for(const s of series){
+    const name = String(s.name||'');
+    if(!name) continue;
+    ctx.fillStyle = String(s.color||'rgba(255,255,255,0.7)');
+    ctx.fillRect(lx, ly-8, 10, 10);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText(name.length>38 ? (name.slice(0,38)+'…') : name, lx + 14, ly);
+    ly += 16;
+    if(ly > padT + ih - 8) break;
+  }
+
+  // Hover marker
+  if(isFinite(hoverIndex) && hoverIndex >= 0 && hoverIndex < xs.length){
+    const x = Number(xs[Math.floor(hoverIndex)]);
+    if(isFinite(x)){
+      const px = xFor(x);
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(px, padT);
+      ctx.lineTo(px, padT + ih);
+      ctx.stroke();
+
+      for(const s of series){
+        const ys = Array.isArray(s.ys) ? s.ys : [];
+        const y = Number(ys[Math.floor(hoverIndex)]);
+        if(!isFinite(y)) continue;
+        const py = yFor(y);
+        ctx.fillStyle = String(s.color||'rgba(255,255,255,0.9)');
+        ctx.beginPath();
+        ctx.arc(px, py, 3.2, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+  }
+}
+
+function renderCsvPreviewSeriesOnly(){
+  if(!csvPreviewCtx || !csvPreviewCtx.series) return;
+  const wrap=document.getElementById('csvViewSeries');
+  if(!wrap) return;
+
+  const rows = Array.isArray(csvPreviewCtx.rows) ? csvPreviewCtx.rows : [];
+  if(rows.length < 2){
+    wrap.innerHTML = '<span class="small">(no rows)</span>';
+    return;
+  }
+
+  const s = csvPreviewCtx.series;
+  const header = rows[0] || [];
+  const timeIdx = s.timeIdx;
+  const timeName = String(s.timeName||'time');
+
+  if(!Array.isArray(s.selected) || !s.selected.length){
+    s.selected = Array.isArray(s.defaultSel) ? s.defaultSel.slice(0,1) : [];
+  }
+
+  // Build series dropdown options.
+  let optsHtml = '';
+  for(const c of (s.cols||[])){
+    const nm = String(c.name||'');
+    const idx = Number(c.idx);
+    optsHtml += '<option value="'+esc(String(idx))+'">'+esc(nm)+'</option>';
+  }
+
+  const truncNote = csvPreviewCtx.truncated ? '<span class="pill">truncated preview</span>' : '';
+
+  wrap.innerHTML =
+    '<div style="padding:10px">'+
+      '<div class="qeeg-controls">'+
+        '<span class="small">Detected: <b>time series</b> '+truncNote+' · x=<code>'+esc(timeName)+'</code></span>'+
+        '<span class="small">Tip: select 1–4 series to overlay (Ctrl/Cmd-click).</span>'+
+      '</div>'+
+      '<div class="qeeg-controls" style="align-items:flex-start">'+
+        '<div style="display:flex;flex-direction:column;gap:6px">'+
+          '<label class="small">Series</label>'+
+          '<select class="input" id="csvSeriesSelect" multiple size="7" style="min-width:340px;max-width:560px">'+optsHtml+'</select>'+
+        '</div>'+
+        '<div style="display:flex;flex-direction:column;gap:6px">'+
+          '<label class="small">Actions</label>'+
+          '<button class="btn" id="csvSeriesClearBtn" type="button">Clear</button>'+
+          '<span class="small" id="csvSeriesMeta"></span>'+
+          '<span class="small" id="csvSeriesHover"></span>'+
+        '</div>'+
+      '</div>'+
+      '<canvas id="csvSeriesCanvas" class="qeeg-chart" width="940" height="360"></canvas>'+
+    '</div>';
+
+  const sel = document.getElementById('csvSeriesSelect');
+  const clearBtn = document.getElementById('csvSeriesClearBtn');
+  const meta = document.getElementById('csvSeriesMeta');
+  const hover = document.getElementById('csvSeriesHover');
+  const canvas = document.getElementById('csvSeriesCanvas');
+  if(!sel || !canvas) return;
+
+  // Restore selections
+  const selectedSet = new Set((s.selected||[]).map(x=>String(x)));
+  for(const opt of sel.options){
+    if(selectedSet.has(String(opt.value))) opt.selected = true;
+  }
+
+  function getSelectedIdx(){
+    const out = [];
+    for(const opt of sel.selectedOptions){
+      const v = Number(opt.value);
+      if(isFinite(v)) out.push(v);
+    }
+    // Limit overlays to keep it readable.
+    return out.slice(0, 6);
+  }
+
+  function buildData(selectedIdx, hoverIndex){
+    // Extract x
+    const xs = [];
+    const N = rows.length - 1;
+    for(let i=1;i<rows.length;++i){
+      const r = rows[i] || [];
+      const tx = (timeIdx < r.length) ? Number(String(r[timeIdx]||'').trim()) : NaN;
+      xs.push(isFinite(tx) ? tx : NaN);
+    }
+
+    // Extract y series
+    const pal = csvSeriesPalette();
+    const series = [];
+    for(let si=0; si<selectedIdx.length; ++si){
+      const col = selectedIdx[si];
+      let name = String(header[col]||('col'+String(col)));
+      const ys = new Array(N).fill(NaN);
+      for(let i=1;i<rows.length;++i){
+        const r = rows[i] || [];
+        const v = (col < r.length) ? Number(String(r[col]||'').trim()) : NaN;
+        ys[i-1] = isFinite(v) ? v : NaN;
+      }
+      series.push({name:name, ys:ys, color:pal[si % pal.length]});
+    }
+
+    return {xs:xs, series:series};
+  }
+
+  function csvSeriesXRange(xs){
+  xs = Array.isArray(xs) ? xs : [];
+  let minX = Infinity;
+  let maxX = -Infinity;
+  for(const x of xs){
+    const v = Number(x);
+    if(!isFinite(v)) continue;
+    if(v < minX) minX = v;
+    if(v > maxX) maxX = v;
+  }
+  if(!isFinite(minX) || !isFinite(maxX)){
+    minX = 0.0;
+    maxX = Math.max(1.0, xs.length - 1);
+  }
+  if(Math.abs(maxX - minX) < 1e-12) maxX = minX + 1e-12;
+  return {min:minX, max:maxX};
+}
+
+  // Draw + hover
+  let lastHover = -1;
+
+  function redraw(hoverIndex){
+    const idxs = getSelectedIdx();
+    s.selected = idxs.slice();
+    if(!idxs.length){
+      if(meta) meta.textContent = 'No series selected.';
+      drawTimeSeriesChart(canvas, [0,1], [], {title:'(no series)', xLabel:timeName});
+      return;
+    }
+    const d = buildData(idxs, hoverIndex);
+    // Compute meta
+    if(meta) meta.textContent = String(idxs.length) + ' series · points: ' + String(d.xs.length);
+    drawTimeSeriesChart(canvas, d.xs, d.series, {title: String(csvPreviewCtx.label||'') , xLabel: timeName, hoverIndex: hoverIndex});
+
+    // Update hover label
+    if(hover && hoverIndex>=0 && hoverIndex<d.xs.length){
+      const t = d.xs[Math.floor(hoverIndex)];
+      let msg = 't=' + (isFinite(t) ? String(Number(t).toFixed(3)) : 'NaN');
+      for(const ss of d.series){
+        const y = ss.ys[Math.floor(hoverIndex)];
+        if(isFinite(y)) msg += ' · ' + String(ss.name) + '=' + String(Number(y).toFixed(4));
+      }
+      hover.textContent = msg;
+    }else if(hover){
+      hover.textContent = '';
+    }
+
+    return d;
+  }
+
+  let lastData = redraw(-1);
+
+  sel.onchange = ()=>{ lastData = redraw(lastHover); };
+  if(clearBtn){
+    clearBtn.onclick = ()=>{
+      for(const opt of sel.options) opt.selected = false;
+      // pick first default
+      const def = (Array.isArray(s.defaultSel) && s.defaultSel.length) ? String(s.defaultSel[0]) : (sel.options.length ? String(sel.options[0].value) : '');
+      for(const opt of sel.options){ if(String(opt.value)===def) opt.selected = true; }
+      lastData = redraw(-1);
+    };
+  }
+
+  // Hover behavior
+  canvas.onmousemove = (ev)=>{
+    if(!lastData || !Array.isArray(lastData.xs) || !lastData.xs.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) / rect.width;
+    const idx = Math.max(0, Math.min(lastData.xs.length-1, Math.round(x * (lastData.xs.length-1))));
+    lastHover = idx;
+    lastData = redraw(idx);
+  };
+  canvas.onmouseleave = ()=>{ lastHover = -1; lastData = redraw(-1); };
+}
 
 function qeegBandNote(){
   // Common EEG band naming conventions (approx).
@@ -6896,12 +7359,12 @@ async function openPreview(url, label){
     // file looks like a numeric matrix).
     if(ext==='csv' || ext==='tsv'){
       const delim = (ext==='tsv') ? '\t' : ',';
-      const parsed = parseDelimitedPreview(clip, delim, 200, 60);
+      const parsed = parseDelimitedPreview(clip, delim, 1200, 120);
 
       let view = 'table';
       try{
         const vv = localStorage.getItem('qeeg_csv_view') || '';
-        if(vv==='heat' || vv==='raw' || vv==='table' || vv==='qeeg') view = vv;
+        if(vv==='heat' || vv==='raw' || vv==='table' || vv==='qeeg' || vv==='series') view = vv;
       }catch(e){}
 
       csvPreviewCtx = {
@@ -6913,15 +7376,17 @@ async function openPreview(url, label){
         cols: parsed.cols,
         truncated: !!(parsed.truncated || byteTrunc),
         colTrunc: !!parsed.colTrunc,
-        maxRows: 200,
-        maxCols: 60,
+        maxRows: 1200,
+        maxCols: 120,
         filter: '',
         view: view,
         matrix: null,
         qeeg: null,
+        series: null,
       };
       csvPreviewCtx.matrix = detectNumericMatrix(csvPreviewCtx.rows);
       csvPreviewCtx.qeeg = detectQeegCsv(csvPreviewCtx.rows, csvPreviewCtx.label);
+      csvPreviewCtx.series = detectTimeSeriesCsv(csvPreviewCtx.rows, csvPreviewCtx.label);
       renderCsvPreview();
       return;
     }

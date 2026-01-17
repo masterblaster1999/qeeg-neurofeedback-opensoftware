@@ -1,5 +1,6 @@
 #include "qeeg/bandpower.hpp"
 #include "qeeg/coherence.hpp"
+#include "qeeg/online_coherence.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
@@ -7,9 +8,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -34,6 +39,13 @@ struct Args {
   std::string measure{"msc"};
 
   bool export_spectrum{false};
+
+  // Optional: sliding-window coherence time series.
+  // Only supported when --pair is provided.
+  bool timeseries{false};
+  double window_seconds{2.0};
+  double update_seconds{0.25};
+
   bool average_reference{false};
 
   // Optional preprocessing filters
@@ -64,6 +76,9 @@ static void print_help() {
     << "  --pair CH1:CH2          If set, compute only this pair (otherwise output a full matrix)\n"
     << "  --measure msc|imcoh      Connectivity measure (default: msc)\n"
     << "  --export-spectrum        If --pair is used, also write coherence_spectrum.csv\n"
+    << "  --timeseries             If --pair is used, also write <measure>_timeseries.csv\n"
+    << "  --window SECONDS         Window length for --timeseries (default: 2.0)\n"
+    << "  --update SECONDS         Update interval for --timeseries (default: 0.25)\n"
     << "  --average-reference      Apply common average reference across channels\n"
     << "  --notch HZ               Apply a notch filter at HZ (e.g., 50 or 60)\n"
     << "  --notch-q Q              Notch Q factor (default: 30)\n"
@@ -95,6 +110,14 @@ static Args parse_args(int argc, char** argv) {
       a.measure = argv[++i];
     } else if (arg == "--export-spectrum") {
       a.export_spectrum = true;
+    } else if (arg == "--timeseries") {
+      a.timeseries = true;
+    } else if ((arg == "--window" || arg == "--window-seconds") && i + 1 < argc) {
+      a.timeseries = true;
+      a.window_seconds = to_double(argv[++i]);
+    } else if ((arg == "--update" || arg == "--update-seconds") && i + 1 < argc) {
+      a.timeseries = true;
+      a.update_seconds = to_double(argv[++i]);
     } else if (arg == "--average-reference") {
       a.average_reference = true;
     } else if (arg == "--notch" && i + 1 < argc) {
@@ -184,12 +207,79 @@ static std::string column_for_measure(CoherenceMeasure m) {
   return "coherence";
 }
 
+static std::string fmt_double(double v, int precision = 6) {
+  if (!std::isfinite(v)) return "NaN";
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(precision) << v;
+  return oss.str();
+}
+
+static void write_coherence_timeseries_sidecar_json(const Args& args,
+                                                    const std::string& stem,
+                                                    const std::string& col,
+                                                    const BandDefinition& band,
+                                                    const std::string& ch_a,
+                                                    const std::string& ch_b,
+                                                    CoherenceMeasure measure) {
+  const std::string outpath = args.outdir + "/" + stem + "_timeseries.json";
+  std::ofstream out(std::filesystem::u8path(outpath), std::ios::binary);
+  if (!out) throw std::runtime_error("Failed to write " + outpath);
+  out << std::setprecision(12);
+
+  const std::string ts_suffix = " Sliding-window estimate over a " + fmt_double(args.window_seconds, 3) +
+                                " s window, updated every " + fmt_double(args.update_seconds, 3) + " s.";
+
+  const std::string measure_name = coherence_measure_name(measure);
+
+  auto write_entry = [&](const std::string& key,
+                         const std::string& long_name,
+                         const std::string& desc,
+                         const std::string& units) {
+    out << "  \"" << json_escape(key) << "\": {\n";
+    out << "    \"LongName\": \"" << json_escape(long_name) << "\",\n";
+    out << "    \"Description\": \"" << json_escape(desc) << "\"";
+    if (!units.empty()) {
+      out << ",\n    \"Units\": \"" << json_escape(units) << "\"";
+    }
+    out << "\n  }";
+  };
+
+  out << "{\n";
+  write_entry("t_end_sec",
+              "Window end time",
+              "Time in seconds at the end of the analysis window (relative to recording start)." + ts_suffix,
+              "s");
+  out << ",\n";
+
+  const std::string desc = "Band-mean " + measure_name + " integrated from " + fmt_double(band.fmin_hz, 4) +
+                           " to " + fmt_double(band.fmax_hz, 4) + " Hz between channels " + ch_a +
+                           " and " + ch_b + "." + ts_suffix;
+  write_entry(col,
+              measure_name + " (" + band.name + ")",
+              desc,
+              "n/a");
+
+  out << "\n}\n";
+}
+
 int main(int argc, char** argv) {
   try {
     const Args args = parse_args(argc, argv);
     if (args.input_path.empty()) {
       print_help();
       throw std::runtime_error("--input is required");
+    }
+
+    if (args.timeseries) {
+      if (args.pair_spec.empty()) {
+        throw std::runtime_error("--timeseries is only supported with --pair (matrix time series not supported yet)");
+      }
+      if (!(args.window_seconds > 0.0)) {
+        throw std::runtime_error("--window must be > 0");
+      }
+      if (!(args.update_seconds > 0.0)) {
+        throw std::runtime_error("--update must be > 0");
+      }
     }
 
     ensure_directory(args.outdir);
@@ -279,12 +369,52 @@ int main(int argc, char** argv) {
         }
       }
 
+      if (args.timeseries) {
+        const std::string ts_path = args.outdir + "/" + stem + "_timeseries.csv";
+        std::ofstream out_ts(std::filesystem::u8path(ts_path), std::ios::binary);
+        if (!out_ts) throw std::runtime_error("Failed to write " + ts_path);
+        out_ts << "t_end_sec," << col << "\n";
+        out_ts << std::setprecision(12);
+
+        OnlineCoherenceOptions opt;
+        opt.window_seconds = args.window_seconds;
+        opt.update_seconds = args.update_seconds;
+        opt.welch = wopt;
+        opt.measure = measure;
+
+        const std::string ch_a = rec.channel_names[static_cast<size_t>(ia)];
+        const std::string ch_b = rec.channel_names[static_cast<size_t>(ib)];
+
+        OnlineWelchCoherence eng({ch_a, ch_b}, rec.fs_hz, {band}, {{0, 1}}, opt);
+
+        const size_t chunk_samples = 512;
+        std::vector<std::vector<float>> block(2);
+        for (size_t pos = 0; pos < rec.n_samples(); pos += chunk_samples) {
+          const size_t end = std::min(rec.n_samples(), pos + chunk_samples);
+          block[0].assign(rec.data[static_cast<size_t>(ia)].begin() + static_cast<std::ptrdiff_t>(pos),
+                          rec.data[static_cast<size_t>(ia)].begin() + static_cast<std::ptrdiff_t>(end));
+          block[1].assign(rec.data[static_cast<size_t>(ib)].begin() + static_cast<std::ptrdiff_t>(pos),
+                          rec.data[static_cast<size_t>(ib)].begin() + static_cast<std::ptrdiff_t>(end));
+          const auto frames = eng.push_block(block);
+          for (const auto& fr : frames) {
+            if (fr.coherences.empty() || fr.coherences[0].empty()) continue;
+            out_ts << fr.t_end_sec << "," << fr.coherences[0][0] << "\n";
+          }
+        }
+
+        write_coherence_timeseries_sidecar_json(args, stem, col, band, ch_a, ch_b, measure);
+      }
+
       {
         const std::string meta_path = args.outdir + "/coherence_run_meta.json";
         std::vector<std::string> outs;
         outs.push_back("coherence_run_meta.json");
         outs.push_back(stem + "_band.csv");
         if (args.export_spectrum) outs.push_back(stem + "_spectrum.csv");
+        if (args.timeseries) {
+          outs.push_back(stem + "_timeseries.csv");
+          outs.push_back(stem + "_timeseries.json");
+        }
         if (!write_run_meta_json(meta_path, "qeeg_coherence_cli", args.outdir, args.input_path, outs)) {
           std::cerr << "Warning: failed to write " << meta_path << "\n";
         }

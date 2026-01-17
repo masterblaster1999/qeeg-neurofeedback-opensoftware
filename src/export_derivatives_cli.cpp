@@ -459,6 +459,8 @@ int main(int argc, char** argv) {
       if (!used_meta) {
         copy_if_exists(bp / "bandpowers.csv", eeg_dir / (stem + "_desc-qeegbp_bandpowers.csv"), args.overwrite);
         copy_if_exists(bp / "bandpowers.json", eeg_dir / (stem + "_desc-qeegbp_bandpowers.json"), args.overwrite);
+        copy_if_exists(bp / "bandpower_timeseries.csv", eeg_dir / (stem + "_desc-qeegbp_bandpower_timeseries.csv"), args.overwrite);
+        copy_if_exists(bp / "bandpower_timeseries.json", eeg_dir / (stem + "_desc-qeegbp_bandpower_timeseries.json"), args.overwrite);
         copy_if_exists(bp / "bandpower_run_meta.json", eeg_dir / (stem + "_desc-qeegbp_bandpower_run_meta.json"), args.overwrite);
       }
 
@@ -467,6 +469,12 @@ int main(int argc, char** argv) {
         const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegbp_bandpowers.tsv");
         ensure_writable(dst, args.overwrite);
         convert_csv_file_to_tsv((bp / "bandpowers.csv").u8string(), dst.u8string());
+      }
+
+      if (std::filesystem::exists(bp / "bandpower_timeseries.csv")) {
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegbp_bandpower_timeseries.tsv");
+        ensure_writable(dst, args.overwrite);
+        convert_csv_file_to_tsv((bp / "bandpower_timeseries.csv").u8string(), dst.u8string());
       }
     }
 

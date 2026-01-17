@@ -1,5 +1,7 @@
 # qeeg-map (first pass)
 
+![CI](https://github.com/masterblaster1999/qeeg-neurofeedback-opensoftware/actions/workflows/ci.yml/badge.svg)
+
 A small, dependency-light **C++17** project that:
 - loads EEG recordings from **EDF** (16‑bit EDF/EDF+), **BDF** (24‑bit) or **CSV**
 - computes per‑channel **PSD via Welch's method**
@@ -35,8 +37,13 @@ A small, dependency-light **C++17** project that:
   - Tip: add `--annotate` in `qeeg_map_cli` to draw a head outline, electrode markers, and an embedded vmin/vmax colorbar in the BMPs
   - Optional: `topomap_<band>_z.bmp` if `--reference` is provided
   - Coherence CLI outputs:
-    - `coherence_matrix_<band>.csv` (matrix)
-    - `coherence_pairs.csv` (edge list)
+    - Pair mode (`--pair F3:F4`):
+      - `coherence_band.csv` (or `imcoh_band.csv`)
+      - optional: `coherence_spectrum.csv` (with `--export-spectrum`)
+      - optional: `coherence_timeseries.csv` / `imcoh_timeseries.csv` (+ matching `.json` sidecar) (with `--timeseries`)
+    - Matrix mode (no `--pair`):
+      - `coherence_matrix_<band>.csv` (matrix)
+      - `coherence_pairs.csv` (edge list)
   - PLV CLI outputs:
     - `plv_matrix_<band>.csv` (matrix)
     - `plv_pairs.csv` (edge list)
@@ -97,6 +104,15 @@ target_link_libraries(my_app PRIVATE qeeg::qeeg)
 
 ## Usage
 
+### Version
+
+```bash
+# From your build directory (where the executables live):
+./build/qeeg_version_cli
+./build/qeeg_version_cli --full
+./build/qeeg_version_cli --json
+```
+
 ### QEEG Tools UI (dashboard)
 
 If you want a single "home page" that lists all of the project's executables and links to any
@@ -147,6 +163,8 @@ The per-tool **Run** panel also has an **Outputs** toggle that reads the job's `
 and lists artifacts with quick inline previews (text + images). For CSV/TSV outputs, the preview opens a
 small **table viewer** (with row filtering) and will show a **matrix heatmap** when the file looks like a
 numeric matrix (handy for PLV/coherence matrices).
+
+New: for CSV/TSV outputs that look like **time series** tables (a numeric time column like `t_end_sec` plus numeric value columns), the preview adds a **Series** tab with a lightweight line-chart overlay for selected columns (useful for `bandpower_timeseries.csv`).
 
 New: for CSV/TSV outputs that look like per-channel QEEG tables (e.g., `bandpowers.csv` with `channel,delta,theta,alpha,beta,gamma` and optional `*_z` columns, or `bandratios.csv` / other channel-metric tables), the preview adds a **QEEG** tab with:
 - quick bar charts (band profile or metric-by-channel)
@@ -404,12 +422,19 @@ rendering any images, you can run:
 
 # Append per-band z-score columns from a reference CSV built by qeeg_reference_cli
 ./build/qeeg_bandpower_cli --input path/to/recording.edf --outdir out_bp_z --reference out_ref/reference.csv
+
+# Also write a sliding-window bandpower time series (one row per update)
+./build/qeeg_bandpower_cli --input path/to/recording.edf --outdir out_bp_ts --timeseries --window 2.0 --update 0.25
 ```
 
 This writes:
 - `bandpowers.csv` (wide format: one row per channel, one column per band)
 - `bandpowers.json` (column descriptions)
 - `bandpower_run_meta.json` (a small manifest consumed by `qeeg_ui_cli`)
+
+Optional (when `--timeseries` is used):
+- `bandpower_timeseries.csv` (wide format: one row per update; columns are `<band>_<channel>`)
+- `bandpower_timeseries.json` (column descriptions)
 
 ### 2a1) Derive neurofeedback band ratios from `bandpowers.csv`
 

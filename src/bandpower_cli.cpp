@@ -1,4 +1,5 @@
 #include "qeeg/bandpower.hpp"
+#include "qeeg/online_bandpower.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/run_meta.hpp"
@@ -43,6 +44,11 @@ struct Args {
   // Optional z-score reference
   std::string reference_path;
 
+  // Optional sliding-window bandpower time series (adds bandpower_timeseries.csv)
+  bool timeseries{false};
+  double window_seconds{2.0};
+  double update_seconds{0.25};
+
   // Optional preprocessing
   bool average_reference{false};
   double notch_hz{0.0};
@@ -61,7 +67,8 @@ static void print_help() {
       << "Usage:\n"
       << "  qeeg_bandpower_cli --input file.edf --outdir out_bp\n"
       << "  qeeg_bandpower_cli --input file.csv --fs 250 --outdir out_bp\n"
-      << "  qeeg_bandpower_cli --input file.edf --outdir out_bp --relative --log10\n\n"
+      << "  qeeg_bandpower_cli --input file.edf --outdir out_bp --relative --log10\n"
+      << "  qeeg_bandpower_cli --input file.edf --outdir out_bp --timeseries --window 2.0 --update 0.25\n\n"
       << "Options:\n"
       << "  --input PATH            Input EDF/BDF/CSV/ASCII/BrainVision (.vhdr)\n"
       << "  --fs HZ                 Sampling rate hint for CSV (0 = infer from time column)\n"
@@ -75,6 +82,9 @@ static void print_help() {
       << "                         Default: [min_band_fmin, max_band_fmax] from --bands.\n"
       << "  --log10                 Apply log10 transform to (relative) bandpower values\n"
       << "  --reference PATH        Reference CSV (channel,band,mean,std) to append _z columns\n"
+      << "  --timeseries            Also write bandpower_timeseries.csv (sliding window)\n"
+      << "  --window SECONDS        Window length for --timeseries (default: 2.0)\n"
+      << "  --update SECONDS        Update interval for --timeseries (default: 0.25)\n"
       << "  --average-reference     Apply common average reference across channels\n"
       << "  --notch HZ              Apply a notch filter at HZ (e.g., 50 or 60)\n"
       << "  --notch-q Q             Notch Q factor (default: 30)\n"
@@ -111,6 +121,14 @@ static Args parse_args(int argc, char** argv) {
       a.relative_fmax_hz = to_double(argv[++i]);
     } else if (arg == "--log10") {
       a.log10_power = true;
+    } else if (arg == "--timeseries") {
+      a.timeseries = true;
+    } else if ((arg == "--window" || arg == "--window-seconds") && i + 1 < argc) {
+      a.timeseries = true;
+      a.window_seconds = to_double(argv[++i]);
+    } else if ((arg == "--update" || arg == "--update-seconds") && i + 1 < argc) {
+      a.timeseries = true;
+      a.update_seconds = to_double(argv[++i]);
     } else if (arg == "--reference" && i + 1 < argc) {
       a.reference_path = argv[++i];
     } else if (arg == "--average-reference") {
@@ -221,6 +239,100 @@ static void write_bandpowers_sidecar_json(const Args& args,
   out << "\n}\n";
 }
 
+
+static void write_bandpower_timeseries_sidecar_json(const Args& args,
+                                                   const std::vector<BandDefinition>& bands,
+                                                   const std::vector<std::string>& channels,
+                                                   bool have_ref,
+                                                   bool rel_range_used,
+                                                   double rel_lo_hz,
+                                                   double rel_hi_hz) {
+  const std::string outpath = args.outdir + "/bandpower_timeseries.json";
+  std::ofstream out(std::filesystem::u8path(outpath), std::ios::binary);
+  if (!out) throw std::runtime_error("Failed to write bandpower_timeseries.json: " + outpath);
+  out << std::setprecision(12);
+
+  // Mirrors the BIDS *_events.json convention: top-level keys match CSV columns.
+  const bool rel = args.relative_power;
+  const bool lg = args.log10_power;
+
+  auto units_for_power = [&]() -> std::string {
+    if (rel) return "n/a";
+    if (lg) return "log10(a.u.)";
+    return "a.u.";
+  };
+
+  auto desc_suffix = [&]() -> std::string {
+    std::string s;
+    if (rel) {
+      if (rel_range_used) {
+        s += " Values are relative power fractions (band / total) where total is integrated over [" +
+             fmt_double(rel_lo_hz, 4) + "," + fmt_double(rel_hi_hz, 4) + "] Hz.";
+      } else {
+        s += " Values are relative power fractions (band / total).";
+      }
+    }
+    if (lg) {
+      s += " Values are log10-transformed.";
+    }
+    return s;
+  };
+
+  const std::string ts_suffix = " Sliding-window estimate over a " + fmt_double(args.window_seconds, 3) +
+                                 " s window, updated every " + fmt_double(args.update_seconds, 3) + " s.";
+
+  out << "{\n";
+  bool first = true;
+
+  auto write_entry = [&](const std::string& key,
+                         const std::string& long_name,
+                         const std::string& desc,
+                         const std::string& units) {
+    if (!first) out << ",\n";
+    first = false;
+    out << "  \"" << json_escape(key) << "\": {\n";
+    out << "    \"LongName\": \"" << json_escape(long_name) << "\",\n";
+    out << "    \"Description\": \"" << json_escape(desc) << "\"";
+    if (!units.empty()) {
+      out << ",\n    \"Units\": \"" << json_escape(units) << "\"";
+    }
+    out << "\n  }";
+  };
+
+  write_entry("t_end_sec",
+              "Window end time",
+              "Time in seconds at the end of the analysis window (relative to recording start)." + ts_suffix,
+              "s");
+
+  for (const auto& b : bands) {
+    for (const auto& ch : channels) {
+      const std::string key = b.name + "_" + ch;
+      std::string desc = "Bandpower integrated from " + fmt_double(b.fmin_hz, 4) +
+                         " to " + fmt_double(b.fmax_hz, 4) + " Hz for channel " + ch + ".";
+      desc += ts_suffix;
+      desc += desc_suffix();
+      write_entry(key,
+                  b.name + " band power (" + ch + ")",
+                  desc,
+                  units_for_power());
+    }
+  }
+
+  if (have_ref) {
+    for (const auto& b : bands) {
+      for (const auto& ch : channels) {
+        const std::string key = b.name + "_" + ch + "_z";
+        write_entry(key,
+                    b.name + " z-score (" + ch + ")",
+                    "Z-score computed relative to the provided reference CSV (channel,band,mean,std)." + ts_suffix,
+                    "z");
+      }
+    }
+  }
+
+  out << "\n}\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -241,6 +353,14 @@ int main(int argc, char** argv) {
     if (args.relative_range_specified) {
       if (args.relative_fmin_hz < 0.0 || args.relative_fmax_hz <= args.relative_fmin_hz) {
         throw std::runtime_error("--relative-range must satisfy 0 <= LO < HI");
+      }
+    }
+    if (args.timeseries) {
+      if (!(args.window_seconds > 0.0)) {
+        throw std::runtime_error("--window must be > 0");
+      }
+      if (!(args.update_seconds > 0.0)) {
+        throw std::runtime_error("--update must be > 0");
       }
     }
 
@@ -378,12 +498,89 @@ int main(int argc, char** argv) {
     // JSON sidecar describing columns in bandpowers.csv
     write_bandpowers_sidecar_json(args, bands, have_ref, rel_range_used, rel_lo_hz, rel_hi_hz);
 
+    std::vector<std::string> outs;
+    outs.push_back("bandpowers.csv");
+    outs.push_back("bandpowers.json");
+
+    if (args.timeseries) {
+      const std::string ts_path = args.outdir + "/bandpower_timeseries.csv";
+      std::ofstream out_ts(std::filesystem::u8path(ts_path), std::ios::binary);
+      if (!out_ts) throw std::runtime_error("Failed to write bandpower_timeseries.csv: " + ts_path);
+
+      out_ts << "t_end_sec";
+      for (const auto& b : bands) {
+        for (const auto& ch : rec.channel_names) {
+          out_ts << "," << b.name << "_" << ch;
+        }
+      }
+      if (have_ref) {
+        for (const auto& b : bands) {
+          for (const auto& ch : rec.channel_names) {
+            out_ts << "," << b.name << "_" << ch << "_z";
+          }
+        }
+      }
+      out_ts << "\n";
+      out_ts << std::setprecision(12);
+
+      OnlineBandpowerOptions opt;
+      opt.window_seconds = args.window_seconds;
+      opt.update_seconds = args.update_seconds;
+      opt.welch = wopt;
+      opt.relative_power = args.relative_power;
+      if (args.relative_range_specified) {
+        opt.relative_fmin_hz = args.relative_fmin_hz;
+        opt.relative_fmax_hz = args.relative_fmax_hz;
+      }
+      opt.log10_power = args.log10_power;
+
+      OnlineWelchBandpower eng(rec.channel_names, rec.fs_hz, bands, opt);
+
+      const size_t chunk_samples = 512;
+      std::vector<std::vector<float>> block(rec.n_channels());
+      for (size_t pos = 0; pos < rec.n_samples(); pos += chunk_samples) {
+        const size_t end = std::min(rec.n_samples(), pos + chunk_samples);
+        for (size_t c = 0; c < rec.n_channels(); ++c) {
+          block[c].assign(rec.data[c].begin() + static_cast<std::ptrdiff_t>(pos),
+                          rec.data[c].begin() + static_cast<std::ptrdiff_t>(end));
+        }
+
+        const auto frames = eng.push_block(block);
+        for (const auto& fr : frames) {
+          out_ts << fr.t_end_sec;
+          for (size_t b = 0; b < fr.bands.size(); ++b) {
+            for (size_t c = 0; c < fr.channel_names.size(); ++c) {
+              out_ts << "," << fr.powers[b][c];
+            }
+          }
+          if (have_ref) {
+            for (size_t b = 0; b < fr.bands.size(); ++b) {
+              for (size_t c = 0; c < fr.channel_names.size(); ++c) {
+                const double v = fr.powers[b][c];
+                double z = std::numeric_limits<double>::quiet_NaN();
+                if (std::isfinite(v)) {
+                  double tmp = 0.0;
+                  if (compute_zscore(ref, fr.channel_names[c], fr.bands[b].name, v, &tmp)) {
+                    z = tmp;
+                  }
+                }
+                out_ts << "," << z;
+              }
+            }
+          }
+          out_ts << "\n";
+        }
+      }
+
+      write_bandpower_timeseries_sidecar_json(args, bands, rec.channel_names, have_ref,
+                                              rel_range_used, rel_lo_hz, rel_hi_hz);
+      outs.push_back("bandpower_timeseries.csv");
+      outs.push_back("bandpower_timeseries.json");
+    }
+
     // Lightweight run manifest for qeeg_ui_cli / qeeg_ui_server_cli
     {
       const std::string meta_path = args.outdir + "/bandpower_run_meta.json";
-      std::vector<std::string> outs;
-      outs.push_back("bandpowers.csv");
-      outs.push_back("bandpowers.json");
       outs.push_back("bandpower_run_meta.json");
       if (!write_run_meta_json(meta_path, "qeeg_bandpower_cli", args.outdir, args.input_path, outs)) {
         std::cerr << "Warning: failed to write run meta JSON: " << meta_path << "\n";
@@ -391,6 +588,9 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Wrote: " << args.outdir << "/bandpowers.csv" << "\n";
+    if (args.timeseries) {
+      std::cout << "Wrote: " << args.outdir << "/bandpower_timeseries.csv" << "\n";
+    }
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << "\n";

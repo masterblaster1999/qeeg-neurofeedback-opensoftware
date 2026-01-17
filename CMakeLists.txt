@@ -75,6 +75,9 @@ target_include_directories(qeeg PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
+# Version / build metadata
+target_compile_definitions(qeeg PUBLIC QEEG_VERSION_STRING=\"${PROJECT_VERSION}\")
+
 # Enable warnings (best-effort, portable)
 if (MSVC)
   target_compile_options(qeeg PRIVATE /W4)
@@ -150,6 +153,10 @@ if (QEEG_BUILD_CLI)
   add_executable(qeeg_info_cli src/info_cli.cpp)
   target_link_libraries(qeeg_info_cli PRIVATE qeeg)
 
+  add_executable(qeeg_version_cli src/version_cli.cpp)
+  target_link_libraries(qeeg_version_cli PRIVATE qeeg)
+
+
   add_executable(qeeg_convert_cli src/convert_cli.cpp)
   target_link_libraries(qeeg_convert_cli PRIVATE qeeg)
 
@@ -221,6 +228,7 @@ if (QEEG_BUILD_CLI)
     qeeg_artifacts_cli
     qeeg_reference_cli
     qeeg_info_cli
+    qeeg_version_cli
     qeeg_convert_cli
     qeeg_export_edf_cli
     qeeg_export_bdf_cli
