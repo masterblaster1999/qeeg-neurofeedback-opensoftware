@@ -39,6 +39,18 @@ static int32_t read_i24_le(std::ifstream& f) {
   return static_cast<int32_t>(u);
 }
 
+static uint32_t read_u24_le(std::ifstream& f) {
+  uint8_t b0 = 0, b1 = 0, b2 = 0;
+  f.read(reinterpret_cast<char*>(&b0), 1);
+  f.read(reinterpret_cast<char*>(&b1), 1);
+  f.read(reinterpret_cast<char*>(&b2), 1);
+  if (!f) throw std::runtime_error("BDF parse error: unexpected EOF while reading samples");
+
+  return static_cast<uint32_t>(b0) |
+         (static_cast<uint32_t>(b1) << 8) |
+         (static_cast<uint32_t>(b2) << 16);
+}
+
 static std::string sanitize_label(std::string label) {
   label = trim(label);
   if (label.empty()) return label;
@@ -141,6 +153,24 @@ static bool looks_like_exg_or_eeg_channel(const std::string& sanitized_label,
   return false;
 }
 
+static bool looks_like_discrete_trigger_channel(const std::string& sanitized_label,
+                                                const std::string& raw_label) {
+  // Heuristic for channels that store integer-coded events (triggers, markers, status words).
+  // For these channels we want:
+  // - preserve the raw integer codes (avoid scaling), and
+  // - resample with zero-order hold (avoid creating interpolated intermediate values).
+  const std::string key = normalize_channel_name(!sanitized_label.empty() ? sanitized_label : raw_label);
+  if (key.empty()) return false;
+
+  if (starts_with(key, "trig") || starts_with(key, "trigger")) return true;
+  if (starts_with(key, "stim") || starts_with(key, "sti")) return true;
+  if (starts_with(key, "marker") || starts_with(key, "event")) return true;
+  if (starts_with(key, "status")) return true;
+  if (starts_with(key, "din") || starts_with(key, "digital")) return true;
+
+  return false;
+}
+
 EEGRecording BDFReader::read(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("Failed to open BDF: " + path);
@@ -234,6 +264,7 @@ EEGRecording BDFReader::read(const std::string& path) {
   std::vector<bool> keep(num_signals, false);
   std::vector<bool> is_annotation(num_signals, false);
   std::vector<bool> eeg_candidate(num_signals, false);
+  std::vector<bool> is_discrete(num_signals, false);
   std::vector<std::string> sig_name(num_signals);
 
   for (int i = 0; i < num_signals; ++i) {
@@ -262,6 +293,7 @@ EEGRecording BDFReader::read(const std::string& path) {
     sig_name[i] = name;
     keep[i] = true;
     eeg_candidate[i] = looks_like_exg_or_eeg_channel(name, phys_dim[i], raw);
+    is_discrete[i] = looks_like_discrete_trigger_channel(name, raw);
   }
 
   // Choose a global sampling rate. Mixed sampling rates are common for NeXus exports
@@ -300,12 +332,15 @@ EEGRecording BDFReader::read(const std::string& path) {
   std::vector<std::string> kept_names;
   kept_names.reserve(static_cast<size_t>(num_signals));
   std::vector<int> kept_index(num_signals, -1);
+  std::vector<bool> kept_is_discrete;
+  kept_is_discrete.reserve(static_cast<size_t>(num_signals));
 
   int ki = 0;
   for (int i = 0; i < num_signals; ++i) {
     if (keep[i]) {
       kept_index[i] = ki++;
       kept_names.push_back(sig_name[i]);
+      kept_is_discrete.push_back(is_discrete[i]);
     }
   }
   if (kept_names.empty()) {
@@ -369,10 +404,18 @@ EEGRecording BDFReader::read(const std::string& path) {
         rec.events.insert(rec.events.end(), ev.begin(), ev.end());
       } else {
         for (int j = 0; j < n; ++j) {
-          const int32_t dig = read_i24_le(f);
-          if (keep[s]) {
-            const double phys = (static_cast<double>(dig) * scale[s] + offset[s]) * unit_mult[s];
-            tmp[static_cast<size_t>(kept_index[s])].push_back(static_cast<float>(phys));
+          if (is_discrete[s]) {
+            // Preserve raw integer codes for trigger-like channels.
+            const uint32_t u = read_u24_le(f);
+            if (keep[s]) {
+              tmp[static_cast<size_t>(kept_index[s])].push_back(static_cast<float>(u));
+            }
+          } else {
+            const int32_t dig = read_i24_le(f);
+            if (keep[s]) {
+              const double phys = (static_cast<double>(dig) * scale[s] + offset[s]) * unit_mult[s];
+              tmp[static_cast<size_t>(kept_index[s])].push_back(static_cast<float>(phys));
+            }
           }
         }
       }
@@ -384,7 +427,8 @@ EEGRecording BDFReader::read(const std::string& path) {
     if (tmp[ch].size() == target_total) {
       rec.data[ch] = std::move(tmp[ch]);
     } else {
-      rec.data[ch] = resample_linear(tmp[ch], target_total);
+      rec.data[ch] = kept_is_discrete[ch] ? resample_hold(tmp[ch], target_total)
+                                          : resample_linear(tmp[ch], target_total);
       if (rec.data[ch].size() != target_total) {
         throw std::runtime_error("BDF: resample failed to produce the expected length");
       }

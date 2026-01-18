@@ -1,4 +1,5 @@
 #include "qeeg/triggers.hpp"
+#include "qeeg/resample.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -75,6 +76,26 @@ int main() {
     const auto r = extract_events_from_triggers_auto(rec);
     assert(r.used_channel.empty());
     assert(r.events.empty());
+  }
+
+  // 4) Resampling trigger channels must not create spurious intermediate codes.
+  //    (NeXus / BioTrace+ exports often contain mixed sampling rates.)
+  {
+    // A 1-second trigger channel sampled at 10 Hz, with a step from 0 -> 7 at t=0.2s.
+    const std::vector<float> trig_10hz = {0, 0, 7, 7, 7, 0, 0, 0, 0, 0};
+    const std::vector<float> trig_100hz = resample_hold(trig_10hz, 100);
+
+    EEGRecording rec;
+    rec.fs_hz = 100.0;
+    rec.channel_names = {"TRIG"};
+    rec.data = {trig_100hz};
+
+    const auto r = extract_events_from_triggers_auto(rec);
+    assert(r.used_channel == "TRIG");
+    // Should contain only the rising edge to code 7 (ignore_zero=true by default).
+    assert(r.events.size() == 1);
+    assert(r.events[0].text == "7");
+    assert(near(r.events[0].onset_sec, 0.20));
   }
 
   std::cout << "All tests passed.\n";

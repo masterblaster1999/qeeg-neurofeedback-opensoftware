@@ -41,4 +41,25 @@ std::vector<float> resample_linear(const std::vector<float>& in, std::size_t out
   return out;
 }
 
+std::vector<float> resample_hold(const std::vector<float>& in, std::size_t out_len) {
+  if (out_len == 0) return {};
+  if (in.empty()) return {};
+  if (in.size() == 1) return std::vector<float>(out_len, in[0]);
+
+  const std::size_t in_len = in.size();
+  const double ratio = static_cast<double>(in_len) / static_cast<double>(out_len);
+
+  std::vector<float> out;
+  out.resize(out_len);
+
+  for (std::size_t j = 0; j < out_len; ++j) {
+    const double pos = static_cast<double>(j) * ratio;
+    std::size_t i0 = static_cast<std::size_t>(std::floor(pos));
+    if (i0 >= in_len) i0 = in_len - 1;
+    out[j] = in[i0];
+  }
+
+  return out;
+}
+
 } // namespace qeeg

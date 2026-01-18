@@ -317,6 +317,7 @@ static std::string http_status_text(int code) {
     case 200: return "OK";
     case 206: return "Partial Content";
     case 204: return "No Content";
+    case 304: return "Not Modified";
     case 409: return "Conflict";
     case 411: return "Length Required";
     case 400: return "Bad Request";
@@ -345,6 +346,173 @@ static std::string content_type_for_path(const std::filesystem::path& p) {
   if (ext == ".bmp") return "image/bmp";
   return "application/octet-stream";
 }
+
+// Best-effort: convert filesystem::file_time_type to a time_t (seconds since epoch).
+//
+// Note: std::filesystem::file_time_type may not use system_clock, so we do a
+// relative conversion via now() values. This is a common portability pattern.
+static bool file_mtime_time_t(const std::filesystem::path& p, std::time_t* out) {
+  if (!out) return false;
+  std::error_code ec;
+  const auto ft = std::filesystem::last_write_time(p, ec);
+  if (ec) return false;
+
+  using namespace std::chrono;
+  const auto sctp = time_point_cast<system_clock::duration>(
+      ft - std::filesystem::file_time_type::clock::now() + system_clock::now());
+  *out = system_clock::to_time_t(sctp);
+  return true;
+}
+
+static std::string format_http_date_gmt(std::time_t t) {
+  std::tm tmv{};
+#if defined(_WIN32)
+  gmtime_s(&tmv, &t);
+#else
+  gmtime_r(&t, &tmv);
+#endif
+  std::ostringstream oss;
+  oss << std::put_time(&tmv, "%a, %d %b %Y %H:%M:%S GMT");
+  return oss.str();
+}
+
+static int month_from_http_abbrev(const std::string& m) {
+  // Month is case-sensitive in IMF-fixdate, but accept any case for robustness.
+  const std::string mm = to_lower(m);
+  if (mm == "jan") return 1;
+  if (mm == "feb") return 2;
+  if (mm == "mar") return 3;
+  if (mm == "apr") return 4;
+  if (mm == "may") return 5;
+  if (mm == "jun") return 6;
+  if (mm == "jul") return 7;
+  if (mm == "aug") return 8;
+  if (mm == "sep") return 9;
+  if (mm == "oct") return 10;
+  if (mm == "nov") return 11;
+  if (mm == "dec") return 12;
+  return 0;
+}
+
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+  // Howard Hinnant's civil calendar algorithm (public domain).
+  // Returns days relative to 1970-01-01.
+  y -= (m <= 2);
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(y - era * 400); // [0, 399]
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1; // [0, 365]
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+  return static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+static bool parse_http_date_gmt(const std::string& s, std::time_t* out) {
+  // Parse IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT" (RFC 9110).
+  if (!out) return false;
+  std::string v = trim(s);
+  if (v.empty()) return false;
+
+  // Strip day-of-week prefix if present.
+  const size_t comma = v.find(',');
+  if (comma != std::string::npos) {
+    v = trim(v.substr(comma + 1));
+  }
+
+  // Split into: DD Mon YYYY HH:MM:SS GMT
+  std::istringstream iss(v);
+  std::string dd_s, mon_s, yyyy_s, time_s, tz_s;
+  if (!(iss >> dd_s >> mon_s >> yyyy_s >> time_s >> tz_s)) return false;
+  if (to_lower(tz_s) != "gmt") return false;
+
+  int dd = 0;
+  int yyyy = 0;
+  try {
+    dd = qeeg::to_int(dd_s);
+    yyyy = qeeg::to_int(yyyy_s);
+  } catch (...) {
+    return false;
+  }
+  const int mon = month_from_http_abbrev(mon_s);
+  if (mon <= 0) return false;
+
+  int hh = 0, mm = 0, ss = 0;
+  {
+    // HH:MM:SS
+    const size_t p1 = time_s.find(':');
+    const size_t p2 = (p1 == std::string::npos) ? std::string::npos : time_s.find(':', p1 + 1);
+    if (p1 == std::string::npos || p2 == std::string::npos) return false;
+    try {
+      hh = qeeg::to_int(time_s.substr(0, p1));
+      mm = qeeg::to_int(time_s.substr(p1 + 1, p2 - (p1 + 1)));
+      ss = qeeg::to_int(time_s.substr(p2 + 1));
+    } catch (...) {
+      return false;
+    }
+  }
+
+  if (yyyy < 1970 || dd < 1 || dd > 31) return false;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 60) return false;
+
+  const int64_t days = days_from_civil(yyyy, static_cast<unsigned>(mon), static_cast<unsigned>(dd));
+  const int64_t secs = days * 86400 + static_cast<int64_t>(hh) * 3600 + static_cast<int64_t>(mm) * 60 + static_cast<int64_t>(ss);
+  if (secs < 0) return false;
+  *out = static_cast<std::time_t>(secs);
+  return true;
+}
+
+static std::string strip_weak_etag(std::string s) {
+  s = trim(s);
+  if (starts_with(s, "W/") || starts_with(s, "w/")) {
+    s = trim(s.substr(2));
+  }
+  return s;
+}
+
+static bool etag_matches(const std::string& a, const std::string& b) {
+  return strip_weak_etag(a) == strip_weak_etag(b);
+}
+
+static bool if_none_match_allows_304(const std::string& if_none_match_value,
+                                    const std::string& etag_value) {
+  // If-None-Match can be "*" or a comma-separated list of ETags.
+  const std::string v = trim(if_none_match_value);
+  if (v.empty()) return false;
+  if (v == "*") return true;
+
+  std::istringstream iss(v);
+  std::string tok;
+  while (std::getline(iss, tok, ',')) {
+    tok = trim(tok);
+    if (tok.empty()) continue;
+    if (etag_matches(tok, etag_value)) return true;
+  }
+  return false;
+}
+
+static std::string make_weak_etag(std::time_t mtime, uintmax_t size) {
+  // Weak ETag based on modification time (seconds) and size.
+  // This is dependency-free and sufficient for local caching/revalidation.
+  return std::string("W/\"") + std::to_string(static_cast<long long>(mtime)) + "-" + std::to_string(size) + "\"";
+}
+
+static bool if_range_allows_range(const std::string& if_range_value,
+                                 const std::string& etag_value,
+                                 std::time_t mtime) {
+  const std::string v = trim(if_range_value);
+  if (v.empty()) return true;
+
+  // If-Range may be an ETag (quoted) or an HTTP-date.
+  if (!v.empty() && (v[0] == '"' || starts_with(v, "W/") || starts_with(v, "w/"))) {
+    return etag_matches(v, etag_value);
+  }
+  std::time_t t = 0;
+  if (!parse_http_date_gmt(v, &t)) {
+    // Unknown format: be conservative and ignore Range.
+    return false;
+  }
+  // Allow Range only if resource has not been modified since the provided date.
+  return mtime <= t;
+}
+
 
 // Security headers for the built-in dashboard HTML. We keep 'unsafe-inline' for
 // script/style because the dashboard HTML intentionally uses inline handlers and
@@ -377,12 +545,18 @@ static std::string html_escape(const std::string& s) {
 }
 
 static std::string url_escape_path(const std::string& s) {
-  // Minimal URL percent-encoding for paths. We keep '/' so the browser
-  // navigates directories correctly.
+  // Minimal URL percent-encoding for paths.
+  //
+  // Notes:
+  // - We keep '/' so the browser navigates directories correctly.
+  // - We normalize Windows path separators ('\') to URL separators ('/') to
+  //   avoid broken links when native paths are embedded into href/src.
   static const char* kHex = "0123456789ABCDEF";
   std::string out;
   out.reserve(s.size());
   for (unsigned char c : s) {
+    if (c == '\\') c = '/';
+
     const bool ok =
         (std::isalnum(c) != 0) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
     if (ok) {
@@ -395,6 +569,7 @@ static std::string url_escape_path(const std::string& s) {
   }
   return out;
 }
+
 
 static std::string format_local_time(std::filesystem::file_time_type tp) {
   // Convert std::filesystem::file_time_type -> local time string.
@@ -4298,7 +4473,6 @@ class UiServer {
     send_text(c, 200, body, "text/html; charset=utf-8", extra, true);
   }
 
-
   void serve_file(
 #ifdef _WIN32
       SOCKET c,
@@ -4322,65 +4496,160 @@ class UiServer {
       return;
     }
 
-    std::ifstream f(p, std::ios::binary);
-    if (!f) {
-      send_text(c, 404, "not found\n");
-      return;
+    std::time_t mtime = 0;
+    if (!file_mtime_time_t(p, &mtime)) {
+      // Still serve the file, but omit validators.
+      mtime = 0;
     }
 
     const bool head_only = (req.method == "HEAD");
     const std::string ct = content_type_for_path(p);
 
+    // Cache validators for conditional requests.
+    const std::string etag = make_weak_etag(mtime, sz);
+    const std::string last_modified = (mtime > 0) ? format_http_date_gmt(mtime) : std::string();
+
     std::vector<std::pair<std::string, std::string>> extra;
     extra.emplace_back("Accept-Ranges", "bytes");
+    if (!etag.empty()) extra.emplace_back("ETag", etag);
+    if (!last_modified.empty()) extra.emplace_back("Last-Modified", last_modified);
+
     bool no_store = false;
     if (is_dashboard && starts_with(ct, "text/html")) {
       extra.emplace_back("Content-Security-Policy", kDashboardCsp);
       no_store = true;
+    } else {
+      // Allow caching but require revalidation to avoid stale run outputs.
+      extra.emplace_back("Cache-Control", "no-cache");
     }
 
-    // Optional: handle a single Range request.
+    // Conditional GET/HEAD: If-None-Match has precedence over If-Modified-Since.
+    const auto inm_it = req.headers.find("if-none-match");
+    if (inm_it != req.headers.end()) {
+      if (if_none_match_allows_304(inm_it->second, etag)) {
+        send_headers(c, 304, ct, 0, extra, no_store);
+        return;
+      }
+    } else {
+      const auto ims_it = req.headers.find("if-modified-since");
+      if (ims_it != req.headers.end() && mtime > 0) {
+        std::time_t ims = 0;
+        if (parse_http_date_gmt(ims_it->second, &ims)) {
+          if (mtime <= ims) {
+            send_headers(c, 304, ct, 0, extra, no_store);
+            return;
+          }
+        }
+      }
+    }
+
+    // Optional: handle a single Range request. If-Range can force a full response.
     uintmax_t rstart = 0;
     uintmax_t rend = 0;
-    auto it = req.headers.find("range");
-    if (it != req.headers.end()) {
-      const HttpRangeResult rr = parse_http_byte_range(it->second, sz, &rstart, &rend);
-      if (rr == HttpRangeResult::kUnsatisfiable) {
-        std::vector<std::pair<std::string, std::string>> h = extra;
-        h.emplace_back("Content-Range", std::string("bytes */") + std::to_string(sz));
-        const std::string body = "range not satisfiable\n";
-        send_headers(c, 416, "text/plain; charset=utf-8", static_cast<uintmax_t>(body.size()), h, true);
-        if (!head_only) (void)send_all(c, body.data(), body.size());
-        return;
-      }
-      if (rr == HttpRangeResult::kSatisfiable) {
-        const uintmax_t clen = (rend - rstart) + 1;
-        std::vector<std::pair<std::string, std::string>> h = extra;
-        h.emplace_back("Content-Range",
-                       std::string("bytes ") + std::to_string(rstart) + "-" + std::to_string(rend) + "/" + std::to_string(sz));
-        send_headers(c, 206, ct, clen, h, no_store);
-        if (head_only) return;
+    const auto range_it = req.headers.find("range");
+    if (range_it != req.headers.end()) {
+      const auto ifr_it = req.headers.find("if-range");
+      if (ifr_it != req.headers.end() && mtime > 0) {
+        if (!if_range_allows_range(ifr_it->second, etag, mtime)) {
+          // Ignore Range and fall through to full response.
+        } else {
+          const HttpRangeResult rr = parse_http_byte_range(range_it->second, sz, &rstart, &rend);
+          if (rr == HttpRangeResult::kUnsatisfiable) {
+            std::vector<std::pair<std::string, std::string>> h = extra;
+            h.emplace_back("Content-Range", std::string("bytes */") + std::to_string(sz));
+            const std::string body = "range not satisfiable\n";
+            send_headers(c, 416, "text/plain; charset=utf-8", static_cast<uintmax_t>(body.size()), h, true);
+            if (!head_only) (void)send_all(c, body.data(), body.size());
+            return;
+          }
+          if (rr == HttpRangeResult::kSatisfiable) {
+            const uintmax_t clen = (rend - rstart) + 1;
+            std::vector<std::pair<std::string, std::string>> h = extra;
+            h.emplace_back(
+                "Content-Range",
+                std::string("bytes ") + std::to_string(rstart) + "-" + std::to_string(rend) + "/" + std::to_string(sz));
+            send_headers(c, 206, ct, clen, h, no_store);
+            if (head_only) return;
 
-        // Seek to start and stream the requested range.
-        f.clear();
-        f.seekg(static_cast<std::streamoff>(rstart));
-        char buf[64 * 1024];
-        uintmax_t remaining = clen;
-        while (f && remaining > 0) {
-          const size_t want = static_cast<size_t>(std::min<uintmax_t>(remaining, sizeof(buf)));
-          f.read(buf, static_cast<std::streamsize>(want));
-          const std::streamsize got = f.gcount();
-          if (got <= 0) break;
-          if (!send_all(c, buf, static_cast<size_t>(got))) break;
-          remaining -= static_cast<uintmax_t>(got);
+            std::ifstream f(p, std::ios::binary);
+            if (!f) {
+              send_text(c, 404, "not found\n");
+              return;
+            }
+
+            // Seek to start and stream the requested range.
+            f.clear();
+            f.seekg(static_cast<std::streamoff>(rstart));
+            char buf[64 * 1024];
+            uintmax_t remaining = clen;
+            while (f && remaining > 0) {
+              const size_t want = static_cast<size_t>(std::min<uintmax_t>(remaining, sizeof(buf)));
+              f.read(buf, static_cast<std::streamsize>(want));
+              const std::streamsize got = f.gcount();
+              if (got <= 0) break;
+              if (!send_all(c, buf, static_cast<size_t>(got))) break;
+              remaining -= static_cast<uintmax_t>(got);
+            }
+            return;
+          }
+          // kInvalid: ignore and fall through to full response.
         }
-        return;
       }
-      // kInvalid: ignore and fall through to full response.
+
+      // If-Range not present (or mtime unavailable): treat like a normal Range request.
+      if (ifr_it == req.headers.end() || mtime == 0) {
+        const HttpRangeResult rr = parse_http_byte_range(range_it->second, sz, &rstart, &rend);
+        if (rr == HttpRangeResult::kUnsatisfiable) {
+          std::vector<std::pair<std::string, std::string>> h = extra;
+          h.emplace_back("Content-Range", std::string("bytes */") + std::to_string(sz));
+          const std::string body = "range not satisfiable\n";
+          send_headers(c, 416, "text/plain; charset=utf-8", static_cast<uintmax_t>(body.size()), h, true);
+          if (!head_only) (void)send_all(c, body.data(), body.size());
+          return;
+        }
+        if (rr == HttpRangeResult::kSatisfiable) {
+          const uintmax_t clen = (rend - rstart) + 1;
+          std::vector<std::pair<std::string, std::string>> h = extra;
+          h.emplace_back(
+              "Content-Range",
+              std::string("bytes ") + std::to_string(rstart) + "-" + std::to_string(rend) + "/" + std::to_string(sz));
+          send_headers(c, 206, ct, clen, h, no_store);
+          if (head_only) return;
+
+          std::ifstream f(p, std::ios::binary);
+          if (!f) {
+            send_text(c, 404, "not found\n");
+            return;
+          }
+
+          // Seek to start and stream the requested range.
+          f.clear();
+          f.seekg(static_cast<std::streamoff>(rstart));
+          char buf[64 * 1024];
+          uintmax_t remaining = clen;
+          while (f && remaining > 0) {
+            const size_t want = static_cast<size_t>(std::min<uintmax_t>(remaining, sizeof(buf)));
+            f.read(buf, static_cast<std::streamsize>(want));
+            const std::streamsize got = f.gcount();
+            if (got <= 0) break;
+            if (!send_all(c, buf, static_cast<size_t>(got))) break;
+            remaining -= static_cast<uintmax_t>(got);
+          }
+          return;
+        }
+        // kInvalid: ignore and fall through to full response.
+      }
     }
 
+    // Full response.
     send_headers(c, 200, ct, sz, extra, no_store);
     if (head_only) return;
+
+    std::ifstream f(p, std::ios::binary);
+    if (!f) {
+      send_text(c, 404, "not found\n");
+      return;
+    }
 
     // Send the body in chunks.
     char buf[64 * 1024];
@@ -4393,6 +4662,7 @@ class UiServer {
   }
 
  private:
+
   std::filesystem::path root_;
   std::filesystem::path root_canon_;
   std::filesystem::path bin_dir_;

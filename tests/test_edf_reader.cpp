@@ -45,10 +45,11 @@ int main() {
     std::ofstream f(path, std::ios::binary);
     assert(static_cast<bool>(f));
 
-    const int num_signals = 4;
+    const int num_signals = 5;
     const int num_records = 1;
     const double record_duration = 1.0;
-    const std::vector<int> samples_per_record = {4, 4, 1, 4}; // EEG, ExG, GSR(peripheral), Annotations
+    // EEG/ExG are high-rate, TRIG/GSR are low-rate, plus an (empty) EDF+ annotations signal.
+    const std::vector<int> samples_per_record = {4, 4, 2, 1, 4}; // EEG, ExG, TRIG, GSR(peripheral), Annotations
     const int header_bytes = 256 + 256 * num_signals;
 
     // Fixed header (256 bytes total)
@@ -66,6 +67,7 @@ int main() {
     // labels (16)
     f << pad("EEG Fz", 16);
     f << pad("ExG 1", 16);
+    f << pad("TRIG", 16);
     f << pad("GSR", 16);
     f << pad("EDF Annotations", 16);
 
@@ -75,6 +77,7 @@ int main() {
     // phys dim (8)
     f << pad("uV", 8);  // EEG
     f << pad("uV", 8);  // ExG
+    f << pad("", 8);    // TRIG (discrete)
     f << pad("uS", 8);  // GSR (peripheral)
     f << pad("", 8);    // annotations
 
@@ -102,13 +105,15 @@ int main() {
     // Data record
     const std::vector<int16_t> eeg = {-100, 0, 100, -200};
     const std::vector<int16_t> exg = {1, 2, 3, 4};
+    const std::vector<int16_t> trig = {0, 5};
 
     for (int16_t v : eeg) write_i16_le(f, v);
     for (int16_t v : exg) write_i16_le(f, v);
+    for (int16_t v : trig) write_i16_le(f, v);
     write_i16_le(f, 7); // one low-rate peripheral sample
 
     // Annotation samples: keep empty/zero for this test.
-    for (int i = 0; i < samples_per_record[3]; ++i) write_i16_le(f, 0);
+    for (int i = 0; i < samples_per_record[4]; ++i) write_i16_le(f, 0);
   }
 
   // 1) Direct EDFReader
@@ -117,16 +122,18 @@ int main() {
     EEGRecording rec = r.read(path);
 
     // The mixed-rate peripheral channel should be kept and resampled to the EEG rate.
-    assert(rec.n_channels() == 3);
-    assert(rec.channel_names.size() == 3);
+    assert(rec.n_channels() == 4);
+    assert(rec.channel_names.size() == 4);
     assert(rec.channel_names[0] == "Fz");
     assert(rec.channel_names[1] == "ExG1");
-    assert(rec.channel_names[2] == "GSR");
+    assert(rec.channel_names[2] == "TRIG");
+    assert(rec.channel_names[3] == "GSR");
     assert(rec.fs_hz == 4.0);
 
     assert(rec.data[0].size() == 4);
     assert(rec.data[1].size() == 4);
     assert(rec.data[2].size() == 4);
+    assert(rec.data[3].size() == 4);
 
     assert(rec.data[0][0] == -100.0f);
     assert(rec.data[0][1] == 0.0f);
@@ -138,8 +145,14 @@ int main() {
     assert(rec.data[1][2] == 3.0f);
     assert(rec.data[1][3] == 4.0f);
 
+    // TRIG is a discrete channel: it should be resampled with hold (no interpolated intermediate codes).
+    assert(rec.data[2][0] == 0.0f);
+    assert(rec.data[2][1] == 0.0f);
+    assert(rec.data[2][2] == 5.0f);
+    assert(rec.data[2][3] == 5.0f);
+
     // The single GSR sample should be stretched to the target length.
-    for (float v : rec.data[2]) {
+    for (float v : rec.data[3]) {
       assert(v == 7.0f);
     }
   }
@@ -147,11 +160,17 @@ int main() {
   // 2) read_recording_auto dispatch by extension
   {
     EEGRecording rec = read_recording_auto(path, /*fs_hz_for_csv=*/0.0);
-    assert(rec.n_channels() == 3);
+    assert(rec.n_channels() == 4);
     assert(rec.channel_names[0] == "Fz");
     assert(rec.channel_names[1] == "ExG1");
-    assert(rec.channel_names[2] == "GSR");
+    assert(rec.channel_names[2] == "TRIG");
+    assert(rec.channel_names[3] == "GSR");
     assert(rec.fs_hz == 4.0);
+
+    // No EDF+ annotations were written; read_recording_auto should recover triggers from TRIG.
+    assert(rec.events.size() == 1);
+    assert(rec.events[0].text == "5");
+    assert(rec.events[0].onset_sec == 0.5);
   }
 
   std::remove(path.c_str());

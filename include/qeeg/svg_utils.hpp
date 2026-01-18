@@ -33,6 +33,14 @@ inline std::string url_escape(const std::string& s) {
   std::ostringstream oss;
   oss << std::hex;
   for (unsigned char c : s) {
+    // Normalize Windows path separators to URL-style separators.
+    //
+    // Many qeeg tools generate links for local files (HTML reports, dashboards).
+    // On Windows, std::filesystem::path::u8string() can yield native '\\'
+    // separators, which can produce broken/odd URLs. Browsers and servers
+    // expect '/' separators in URL paths.
+    if (c == '\\') c = '/';
+
     const bool safe = (std::isalnum(c) != 0) || c == '-' || c == '_' || c == '.' || c == '/' || c == '~';
     if (safe) {
       oss << static_cast<char>(c);
