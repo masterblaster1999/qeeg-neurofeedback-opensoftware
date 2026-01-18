@@ -33,7 +33,9 @@ void fft_inplace(std::vector<std::complex<double>>& a, bool inverse) {
 
   // bit-reversal permutation
   unsigned bits = 0;
-  while ((1u << bits) < n) ++bits;
+  // Use size_t for the shift to avoid MSVC warning C4334 (32-bit shift
+  // implicitly converted to 64-bit). Guard against shifting by >= width.
+  while (bits < sizeof(size_t) * 8 && (static_cast<size_t>(1) << bits) < n) ++bits;
 
   for (size_t i = 0; i < n; ++i) {
     size_t j = reverse_bits(i, bits);

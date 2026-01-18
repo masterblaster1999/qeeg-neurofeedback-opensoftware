@@ -538,6 +538,25 @@ static bool gmtime_safe(std::time_t t, std::tm* out) {
 #endif
 }
 
+static std::string ctime_safe(std::time_t t) {
+#if defined(_WIN32)
+  // MSVC deprecates ctime() in favor of the bounds-checked ctime_s().
+  char buf[26] = {};
+  if (ctime_s(buf, sizeof(buf), &t) != 0) return std::string();
+  std::string s(buf);
+#else
+  // POSIX thread-safe variant.
+  char buf[26] = {};
+  if (ctime_r(&t, buf) == nullptr) return std::string();
+  std::string s(buf);
+#endif
+
+  // ctime_s/ctime_r append a trailing newline.
+  if (!s.empty() && s.back() == '\n') s.pop_back();
+  return s;
+}
+
+
 static long utc_offset_seconds(std::time_t t) {
   std::tm local_tm{};
   std::tm gm_tm{};
@@ -583,11 +602,9 @@ std::string now_string_local() {
 
   std::tm tm{};
   if (!localtime_safe(t, &tm)) {
-    // Fallback: ctime() is not thread-safe, but returning *something* is more
-    // helpful than an empty string for logs/UI.
-    std::string s = std::ctime(&t);
-    if (!s.empty() && s.back() == '\n') s.pop_back();
-    return s;
+    // Fallback for the extremely unlikely case localtime_s/localtime_r fails.
+    // Keep logs/UI usable without relying on deprecated ctime().
+    return ctime_safe(t);
   }
 
   // ISO-8601 local time with numeric UTC offset, e.g.

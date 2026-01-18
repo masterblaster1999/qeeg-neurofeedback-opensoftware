@@ -564,9 +564,9 @@ std::string marker_cell_to_label(const std::string& cell, char delim) {
     if (!std::isfinite(v) || std::fabs(v) <= 1e-12) return "";
 
     // Prefer integer-like labels if close.
-    const double r = std::llround(v);
-    if (std::fabs(v - r) <= 1e-6) {
-      return std::to_string(static_cast<long long>(r));
+    const long long r = std::llround(v);
+    if (std::fabs(v - static_cast<double>(r)) <= 1e-6) {
+      return std::to_string(r);
     }
     return t;
   } catch (const std::exception&) {

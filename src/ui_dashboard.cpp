@@ -1318,6 +1318,7 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
 
 o << "  <div id=\"toastWrap\" class=\"toast-wrap\" aria-live=\"polite\" aria-atomic=\"false\"></div>\n";
 
+  // JS payload is split into chunks to avoid MSVC error C2026 (string literal too big).
 o << R"JS(<script>
 function copyText(id){const el=document.getElementById(id); if(!el) return; const t=el.innerText||el.textContent||''; navigator.clipboard.writeText(t).then(()=>{showToast('Copied');},()=>{});}
 function copyFullCmd(_ignored, argsId, tool){const el=document.getElementById(argsId); const args=(el&&el.value)?el.value:''; const cmd=(tool+' '+args).trim(); navigator.clipboard.writeText(cmd).then(()=>{showToast('Copied full command');},()=>{});}
@@ -1605,7 +1606,9 @@ function openCmdPalette(){
   if(isModalOpen('previewBackdrop') || isModalOpen('flagsBackdrop') || isModalOpen('noteBackdrop') || isModalOpen('batchBackdrop')) return;
 
   // If the navigation drawer is open (mobile), close it so we don't stack overlays.
-  // Preserve the *pre-drawer* focus (sidebarLastFocus) so Esc returns to something visible.
+)JS";
+
+o << R"JS(  // Preserve the *pre-drawer* focus (sidebarLastFocus) so Esc returns to something visible.
   let lf = document.activeElement;
   if(sidebarEl && sidebarEl.classList.contains('open')){
     lf = sidebarLastFocus || navToggleBtn || lf;
@@ -2038,7 +2041,9 @@ class QeegFxEngine{
       if(p.y < -10) p.y = h+10;
       if(p.y > h+10) p.y = -10;
 
-      // Very small velocity wobble to avoid perfect loops.
+)JS";
+
+o << R"JS(      // Very small velocity wobble to avoid perfect loops.
       p.phase += dt * (0.35 + act*0.8);
       p.vx += 0.002 * Math.cos(p.phase);
       p.vy += 0.002 * Math.sin(p.phase*1.3);
@@ -2448,7 +2453,9 @@ function fxUpdateUi(){
   if(st) st.textContent = fxEnabled ? 'on' : 'off';
 
   if(hint){
-    if(fxReduceMotion && !fxHasUserPref){
+)JS";
+
+o << R"JS(    if(fxReduceMotion && !fxHasUserPref){
       hint.textContent = 'Disabled by system reduced-motion preference.';
     }else{
       hint.textContent = fxEnabled ? 'Procedural canvas effects are enabled (local-only).' : 'Animations disabled.';
@@ -2872,7 +2879,9 @@ function setSelectedInput(p, type){
 
 function initSelectionBar(){
   const bBrowse=document.getElementById('selBrowseBtn');
-  if(bBrowse) bBrowse.onclick=()=>{ try{ selectionBrowse(); }catch(e){} };
+)JS";
+
+o << R"JS(  if(bBrowse) bBrowse.onclick=()=>{ try{ selectionBrowse(); }catch(e){} };
   const bPrev=document.getElementById('selPreviewBtn');
   if(bPrev) bPrev.onclick=()=>{ try{ selectionPreview(); }catch(e){} };
   const bCopy=document.getElementById('selCopyBtn');
@@ -3246,7 +3255,9 @@ async function maybeInitServerPresets(){
     const localHas = storeHasPresets(presetsStore);
 
     presetsServerEnabled = true;
-    presetsSource = 'server';
+)JS";
+
+o << R"JS(    presetsSource = 'server';
 
     if(serverHas){
       presetsStore = serverStore;
@@ -3612,7 +3623,9 @@ async function fsUploadFiles(files){
             break; // skip
           }
           if(!r.ok){
-            throw new Error((j && j.error) ? String(j.error) : ('upload failed (HTTP '+r.status+')'));
+)JS";
+
+o << R"JS(            throw new Error((j && j.error) ? String(j.error) : ('upload failed (HTTP '+r.status+')'));
           }
           break;
         }catch(e){
@@ -3998,7 +4011,9 @@ async function selectPathAuto(p){
   }
   try{
     const r=await apiFetch('/api/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:p})});
-    if(r.ok){
+)JS";
+
+o << R"JS(    if(r.ok){
       const j=await r.json();
       if(j && j.ok){
         setSelectedInput(p, 'dir');
@@ -4266,7 +4281,9 @@ function renderFs(){
         '<button class="btn" onclick="copyPath(\\''+pjs+'\\')">Copy</button> '+
         '<button class="btn" onclick="openPreview(encodePath(\\''+pjs+'\\'),\\''+njs+'\\')">Preview</button> '+
         '<a href="'+encodePath(path)+'" target="_blank">Open</a> '+
-        '<button class="btn" onclick="fsRenamePath(\\''+pjs+'\\',\\''+tjs+'\\')">Rename</button> '+
+)JS";
+
+o << R"JS(        '<button class="btn" onclick="fsRenamePath(\\''+pjs+'\\',\\''+tjs+'\\')">Rename</button> '+
         (inTrash ? '' : '<button class="btn" onclick="fsTrashItem(\\''+pjs+'\\',\\''+tjs+'\\')">Trash</button>');
     }
     const nameCell = (type==='dir')
@@ -4607,7 +4624,9 @@ function updateBadgeEl(el, live, kind){
 }
 
 function updateLiveBadges(){
-  const secs = document.querySelectorAll('section.tool[data-tool]');
+)JS";
+
+o << R"JS(  const secs = document.querySelectorAll('section.tool[data-tool]');
   for(const sec of secs){
     const tool = sec && sec.dataset ? (sec.dataset.tool||'') : '';
     const id = sec ? (sec.id||'') : '';
@@ -4897,7 +4916,9 @@ async function refreshLog(btn){
 const logFollowers = new Map(); // jobId -> {timer,offset,lastSize,mode,code,pre}
 
 function stopLogFollowForStatus(statusEl){
-  const id = statusEl && statusEl.dataset && statusEl.dataset.jobId ? parseInt(statusEl.dataset.jobId,10) : 0;
+)JS";
+
+o << R"JS(  const id = statusEl && statusEl.dataset && statusEl.dataset.jobId ? parseInt(statusEl.dataset.jobId,10) : 0;
   if(id && logFollowers.has(id)){
     const st = logFollowers.get(id);
     if(st && st.timer) clearInterval(st.timer);
@@ -5255,7 +5276,9 @@ async function deleteRun(btn){
     const runBtn = runBtnId ? document.getElementById(runBtnId) : null;
     const stopBtn = stopBtnId ? document.getElementById(stopBtnId) : null;
     if(stopBtn) stopBtn.disabled = true;
-    if(runBtn) runBtn.disabled = !(qeegApiOk && qeegApiToken);
+)JS";
+
+o << R"JS(    if(runBtn) runBtn.disabled = !(qeegApiOk && qeegApiToken);
 
     // If an outputs panel is open, replace with a simple message.
     if(status && status.dataset){
@@ -5657,7 +5680,9 @@ function detectNumericMatrix(rows){
       if(!isFinite(v)) return null;
       row.push(v);
       if(v < minV) minV = v;
-      if(v > maxV) maxV = v;
+)JS";
+
+o << R"JS(      if(v > maxV) maxV = v;
       if(row.length > 256) return null;
     }
     if(i === rowStart) nCols = row.length;
@@ -5992,7 +6017,9 @@ function drawHeatmap(canvas, matrix){
   const W = canvas.width;
   const H = canvas.height;
   ctx.clearRect(0,0,W,H);
-  const minV = matrix.min;
+)JS";
+
+o << R"JS(  const minV = matrix.min;
   const maxV = matrix.max;
   const inv = 1.0 / (maxV - minV);
   const cw = W / nC;
@@ -6366,7 +6393,9 @@ function renderCsvPreviewSeriesOnly(){
     const d = buildData(idxs, hoverIndex);
     // Compute meta
     if(meta) meta.textContent = String(idxs.length) + ' series · points: ' + String(d.xs.length);
-    drawTimeSeriesChart(canvas, d.xs, d.series, {title: String(csvPreviewCtx.label||'') , xLabel: timeName, hoverIndex: hoverIndex});
+)JS";
+
+o << R"JS(    drawTimeSeriesChart(canvas, d.xs, d.series, {title: String(csvPreviewCtx.label||'') , xLabel: timeName, hoverIndex: hoverIndex});
 
     // Update hover label
     if(hover && hoverIndex>=0 && hoverIndex<d.xs.length){
@@ -6761,7 +6790,9 @@ function qeegRatiosFromMap(m){
   }
   const out = [];
   if(('theta' in m) && ('beta' in m)) out.push({name:'theta/beta', v:safeRatio('theta','beta')});
-  if(('alpha' in m) && ('theta' in m)) out.push({name:'alpha/theta', v:safeRatio('alpha','theta')});
+)JS";
+
+o << R"JS(  if(('alpha' in m) && ('theta' in m)) out.push({name:'alpha/theta', v:safeRatio('alpha','theta')});
   if(('beta' in m) && ('alpha' in m)) out.push({name:'beta/alpha', v:safeRatio('beta','alpha')});
   if(('delta' in m) && ('alpha' in m)) out.push({name:'delta/alpha', v:safeRatio('delta','alpha')});
   return out;
@@ -7094,7 +7125,9 @@ function renderCsvPreviewQeegOnly(){
     const outWrap = document.getElementById('qeegTopoOutliers');
 
     if(topoCanvas && band){
-      const idx = (q.metric==='z' && band.zIdx>=0) ? band.zIdx : band.idx;
+)JS";
+
+o << R"JS(      const idx = (q.metric==='z' && band.zIdx>=0) ? band.zIdx : band.idx;
       const topo = qeegBuildTopomapData(rows, q.channelIdx, idx, csvPreviewCtx.filter);
       const diverge = (q.metric==='z');
       qeegDrawTopomap(topoCanvas, topo, {diverge:diverge, highlight:(q.selChannel && q.selChannel!=='__mean__') ? q.selChannel : ''});
@@ -7385,7 +7418,9 @@ async function openPreview(url, label){
         series: null,
       };
       csvPreviewCtx.matrix = detectNumericMatrix(csvPreviewCtx.rows);
-      csvPreviewCtx.qeeg = detectQeegCsv(csvPreviewCtx.rows, csvPreviewCtx.label);
+)JS";
+
+o << R"JS(      csvPreviewCtx.qeeg = detectQeegCsv(csvPreviewCtx.rows, csvPreviewCtx.label);
       csvPreviewCtx.series = detectTimeSeriesCsv(csvPreviewCtx.rows, csvPreviewCtx.label);
       renderCsvPreview();
       return;
@@ -7789,7 +7824,9 @@ function getBatchInjectFlag(){
 
 async function batchRefresh(){
   if(!(qeegApiOk && qeegApiToken)) return;
-  const status=document.getElementById('batchStatus');
+)JS";
+
+o << R"JS(  const status=document.getElementById('batchStatus');
   if(status) status.textContent='Loading…';
   try{
     const r = await apiFetch('/api/list', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({dir:batchDir, show_hidden:!!fsShowHidden, sort:'name', desc:false})});
