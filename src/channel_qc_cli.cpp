@@ -48,6 +48,8 @@ struct Args {
   double ptp_z{6.0};
   double rms_z{6.0};
   double kurtosis_z{6.0};
+  double ptp_z_low{0.0};
+  double rms_z_low{0.0};
   size_t min_bad_channels{1};
 
   // Optional fixes
@@ -79,7 +81,8 @@ static void print_help() {
       << "  qeeg_channel_qc_cli --input <in.edf|in.bdf|in.csv|in.txt> --outdir <out> [options]\n\n"
       << "Core options:\n"
       << "  --channel-map <map.csv>      Remap/drop channels before QC (e.g., ExG1->C3).\n"
-      << "  --montage <path.csv>         Montage CSV (name,x,y). If omitted, uses builtin 10-20 19ch.\n"
+      << "  --montage SPEC               Montage spec: montage CSV (name,x,y) OR builtin:standard_1020_19 / builtin:standard_1010_61.\n"
+      << "                            If omitted, uses builtin:standard_1020_19.\n"
       << "  --interpolate                Interpolate bad channels using spherical spline + montage.\n"
       << "  --drop-bad                   Drop bad channels (no montage required).\n"
       << "  --output <out.edf|out.csv>   Optional export after interpolation/drop.\n"
@@ -99,6 +102,8 @@ static void print_help() {
       << "  --ptp-z <Z>                  (default 6)\n"
       << "  --rms-z <Z>                  (default 6)\n"
       << "  --kurtosis-z <Z>             (default 6)\n"
+      << "  --ptp-z-low <Z>             Low PTP z threshold for flatline/dropouts (default 0; <=0 disables)\n"
+      << "  --rms-z-low <Z>             Low RMS z threshold for flatline/dropouts (default 0; <=0 disables)\n"
       << "  --min-bad-ch <N>             (default 1)\n\n"
       << "CSV input:\n"
       << "  --fs <Hz>                    Sampling rate hint if there is no time column.\n"
@@ -123,6 +128,31 @@ static bool is_flag(const std::string& a, const char* s1, const char* s2 = nullp
 static std::string require_value(int& i, int argc, char** argv, const std::string& flag) {
   if (i + 1 >= argc) throw std::runtime_error("Missing value for " + flag);
   return std::string(argv[++i]);
+}
+
+static Montage load_montage_spec(const std::string& spec) {
+  std::string low = to_lower(spec);
+
+  // Convenience aliases
+  if (low == "builtin" || low == "default") {
+    return Montage::builtin_standard_1020_19();
+  }
+
+  // Support: builtin:<key>
+  std::string key = low;
+  if (starts_with(key, "builtin:")) {
+    key = key.substr(std::string("builtin:").size());
+  }
+
+  if (key == "standard_1020_19" || key == "1020_19" || key == "standard_1020" || key == "1020") {
+    return Montage::builtin_standard_1020_19();
+  }
+  if (key == "standard_1010_61" || key == "1010_61" || key == "standard_1010" || key == "1010" ||
+      key == "standard_10_10" || key == "10_10" || key == "10-10") {
+    return Montage::builtin_standard_1010_61();
+  }
+
+  return Montage::load_csv(spec);
 }
 
 static void ensure_dir(const std::string& path) {
@@ -265,6 +295,10 @@ int main(int argc, char** argv) {
         args.rms_z = std::stod(require_value(i, argc, argv, a));
       } else if (a == "--kurtosis-z") {
         args.kurtosis_z = std::stod(require_value(i, argc, argv, a));
+      } else if (a == "--ptp-z-low") {
+        args.ptp_z_low = std::stod(require_value(i, argc, argv, a));
+      } else if (a == "--rms-z-low") {
+        args.rms_z_low = std::stod(require_value(i, argc, argv, a));
       } else if (a == "--min-bad-ch") {
         args.min_bad_channels = static_cast<size_t>(std::stoll(require_value(i, argc, argv, a)));
       } else if (a == "--record-duration") {
@@ -317,6 +351,8 @@ int main(int argc, char** argv) {
     qopt.artifact_opt.ptp_z = args.ptp_z;
     qopt.artifact_opt.rms_z = args.rms_z;
     qopt.artifact_opt.kurtosis_z = args.kurtosis_z;
+    qopt.artifact_opt.ptp_z_low = args.ptp_z_low;
+    qopt.artifact_opt.rms_z_low = args.rms_z_low;
     qopt.artifact_opt.min_bad_channels = args.min_bad_channels;
 
     const ChannelQCResult qc = evaluate_channel_qc(rec, qopt);
@@ -347,7 +383,7 @@ int main(int argc, char** argv) {
       if (args.montage_path.empty()) {
         montage = Montage::builtin_standard_1020_19();
       } else {
-        montage = Montage::load_csv(args.montage_path);
+        montage = load_montage_spec(args.montage_path);
       }
 
       interp_rep = interpolate_bad_channels_spherical_spline(&rec, montage, qc.bad_indices);
@@ -451,6 +487,8 @@ int main(int argc, char** argv) {
         meta << "    \"PtpZ\": " << args.ptp_z << ",\n";
         meta << "    \"RmsZ\": " << args.rms_z << ",\n";
         meta << "    \"KurtosisZ\": " << args.kurtosis_z << ",\n";
+        meta << "    \"PtpZLow\": " << args.ptp_z_low << ",\n";
+        meta << "    \"RmsZLow\": " << args.rms_z_low << ",\n";
         meta << "    \"MinBadChannels\": " << args.min_bad_channels << "\n";
         meta << "  },\n";
 

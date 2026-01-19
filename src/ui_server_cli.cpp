@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -19,6 +20,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -59,6 +61,7 @@ using qeeg::trim;
 struct Args {
   std::string root;
   std::string bin_dir;
+  std::string toolbox; // optional multicall runner (e.g., qeeg_offline_app_cli)
   std::string host{"127.0.0.1"};
   int port{8765};
   int max_parallel{0}; // 0 = unlimited
@@ -76,10 +79,11 @@ static void print_help() {
     << "Serve the QEEG Tools dashboard locally and expose a small local-only HTTP API\n"
     << "to run qeeg_*_cli executables from the browser UI.\n\n"
     << "Usage:\n"
-    << "  qeeg_ui_server_cli --root <dir> --bin-dir <build/bin> [--host 127.0.0.1] [--port 8765] [--max-parallel N] [--open]\n\n"
+    << "  qeeg_ui_server_cli --root <dir> [--bin-dir <build/bin>] [--toolbox <exe>] [--host 127.0.0.1] [--port 8765] [--max-parallel N] [--open]\n\n"
     << "Options:\n"
     << "  --root DIR          Root directory to serve files from (required).\n"
-    << "  --bin-dir DIR       Directory containing qeeg_*_cli executables (required).\n"
+    << "  --bin-dir DIR       Directory containing qeeg_*_cli executables (default: directory containing this executable).\n"
+    << "  --toolbox EXE       Optional multicall runner (e.g., qeeg_offline_app_cli). Used when a per-tool exe is not present in --bin-dir.\n"
     << "  --host HOST         Bind address (default: 127.0.0.1).\n"
     << "  --port N            Port to listen on (default: 8765).\n"
     << "  --max-parallel N    Max concurrent jobs; extra runs are queued (default: 0 = unlimited).\n"
@@ -92,7 +96,20 @@ static void print_help() {
     << "  -h, --help          Show this help.\n\n"
     << "Security:\n"
     << "  - /api/* endpoints are loopback-only (127.0.0.1).\n"
-    << "  - All /api endpoints except /api/status require X-QEEG-Token (printed on startup).\n";
+    << "  - All /api endpoints except /api/status require X-QEEG-Token (printed on startup).\n"
+    << "  - The UI may request /api/help to fetch tool --help output on demand.\n";
+}
+
+static std::filesystem::path self_dir(char** argv) {
+  if (!argv || !argv[0]) return std::filesystem::current_path();
+  std::error_code ec;
+  std::filesystem::path p = std::filesystem::u8path(argv[0]);
+  if (p.empty()) return std::filesystem::current_path();
+  if (p.is_relative()) {
+    p = std::filesystem::absolute(p, ec);
+  }
+  if (ec) return std::filesystem::current_path();
+  return p.parent_path();
 }
 
 static Args parse_args(int argc, char** argv) {
@@ -106,6 +123,8 @@ static Args parse_args(int argc, char** argv) {
       a.root = argv[++i];
     } else if (arg == "--bin-dir" && i + 1 < argc) {
       a.bin_dir = argv[++i];
+    } else if (arg == "--toolbox" && i + 1 < argc) {
+      a.toolbox = argv[++i];
     } else if (arg == "--host" && i + 1 < argc) {
       a.host = argv[++i];
     } else if (arg == "--port" && i + 1 < argc) {
@@ -142,6 +161,44 @@ static void try_open_browser_url(const std::string& url) {
   std::string cmd = "xdg-open \"" + url + "\"";
   std::system(cmd.c_str());
 #endif
+}
+
+struct CaptureResult {
+  std::string text;
+  bool truncated{false};
+};
+
+// Capture a command's stdout (best-effort) up to max_bytes.
+//
+// Used for serving tool --help output to the browser UI via /api/help.
+static CaptureResult capture_stdout_limited(const std::string& cmd, size_t max_bytes) {
+  CaptureResult r;
+  if (max_bytes == 0) max_bytes = 1024 * 1024;
+
+#if defined(_WIN32)
+  FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+  FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+  if (!pipe) return r;
+
+  r.text.reserve(4096);
+  char buf[4096];
+  while (std::fgets(buf, static_cast<int>(sizeof(buf)), pipe) != nullptr) {
+    r.text.append(buf);
+    if (r.text.size() >= max_bytes) {
+      r.text.resize(max_bytes);
+      r.truncated = true;
+      break;
+    }
+  }
+
+#if defined(_WIN32)
+  _pclose(pipe);
+#else
+  pclose(pipe);
+#endif
+  return r;
 }
 
 static std::string now_compact_local() {
@@ -1189,7 +1246,9 @@ static std::vector<std::string> scan_run_dir_outputs(const std::filesystem::path
 struct RunJob {
   int id{0};
   std::string tool;
+  std::string exe_path; // resolved executable path (tool or toolbox)
   std::string args;
+  std::string launch_args; // actual args passed to process (may include toolbox prefix)
   std::string run_dir_rel;
   std::string log_rel;
   std::string meta_rel;
@@ -1238,6 +1297,7 @@ class UiServer {
   }
 
   void set_index_html(std::filesystem::path p) { index_html_ = std::move(p); }
+  void set_toolbox_exe(std::filesystem::path p) { toolbox_exe_ = std::move(p); }
   void set_host(std::string h) { host_ = std::move(h); }
   void set_port(int p) { port_ = p; }
   void set_api_token(std::string t) { api_token_ = std::move(t); }
@@ -1433,6 +1493,14 @@ class UiServer {
 
     if (req.path == "/api/status") {
       handle_status(c);
+      return;
+    }
+    if (req.path == "/api/help") {
+      if (req.method != "GET") {
+        send_json(c, 405, "{\"error\":\"method not allowed\"}");
+        return;
+      }
+      handle_help(c, query_string);
       return;
     }
     if (req.path == "/api/run") {
@@ -1678,6 +1746,71 @@ class UiServer {
     send_json(c, 200, oss.str());
   }
 
+
+  void handle_help(
+#ifdef _WIN32
+      SOCKET c,
+#else
+      int c,
+#endif
+      const std::string& query_string) {
+    const std::map<std::string, std::string> qp = parse_query_params(query_string);
+    auto it = qp.find("tool");
+    const std::string tool = (it != qp.end()) ? it->second : std::string();
+    if (tool.empty()) {
+      send_json(c, 400, "{\"error\":\"missing tool\"}");
+      return;
+    }
+    if (!looks_like_qeeg_cli(tool)) {
+      send_json(c, 403, "{\"error\":\"tool not allowed\"}");
+      return;
+    }
+
+    auto hit = help_cache_.find(tool);
+    if (hit != help_cache_.end()) {
+      std::ostringstream oss;
+      oss << "{\"ok\":true,\"tool\":\"" << qeeg::json_escape(tool)
+          << "\",\"help\":\"" << qeeg::json_escape(hit->second.text) << "\"";
+      if (hit->second.truncated) oss << ",\"truncated\":true";
+      oss << "}";
+      send_json(c, 200, oss.str());
+      return;
+    }
+
+    bool used_toolbox = false;
+    std::filesystem::path exe = resolve_exe_path(bin_dir_, tool);
+    if (exe.empty()) {
+      if (!toolbox_exe_.empty()) {
+        exe = toolbox_exe_;
+        used_toolbox = true;
+      } else {
+        send_json(c, 404, "{\"error\":\"tool not found in bin-dir\"}");
+        return;
+      }
+    }
+
+    // Capture both stdout and stderr (some tools print help to stderr).
+    std::string cmd;
+    if (used_toolbox) {
+      cmd = "\"" + exe.u8string() + "\" " + tool + " --help 2>&1";
+    } else {
+      cmd = "\"" + exe.u8string() + "\" --help 2>&1";
+    }
+    const CaptureResult cap = capture_stdout_limited(cmd, 512 * 1024);
+
+    HelpEntry ent;
+    ent.text = cap.text;
+    ent.truncated = cap.truncated;
+    help_cache_[tool] = ent;
+
+    std::ostringstream oss;
+    oss << "{\"ok\":true,\"tool\":\"" << qeeg::json_escape(tool)
+        << "\",\"help\":\"" << qeeg::json_escape(ent.text) << "\"";
+    if (ent.truncated) oss << ",\"truncated\":true";
+    oss << "}";
+    send_json(c, 200, oss.str());
+  }
+
   bool is_allowed_api_origin(const HttpRequest& req) const {
     // Browsers send Origin on cross-origin requests. For this local server,
     // we only allow the expected loopback origins for API calls.
@@ -1746,15 +1879,26 @@ class UiServer {
       return false;
     }
 
-    const std::filesystem::path exe = resolve_exe_path(bin_dir_, job->tool);
-    if (exe.empty()) {
-      if (out_error) *out_error = "tool not found in bin-dir";
-      return false;
+    std::filesystem::path exe;
+    if (!job->exe_path.empty()) {
+      exe = std::filesystem::u8path(job->exe_path);
+      if (!std::filesystem::exists(exe)) {
+        if (out_error) *out_error = "executable not found: " + job->exe_path;
+        return false;
+      }
+    } else {
+      exe = resolve_exe_path(bin_dir_, job->tool);
+      if (exe.empty()) {
+        if (out_error) *out_error = "tool not found in bin-dir";
+        return false;
+      }
     }
 
     const std::filesystem::path run_dir = root_ / std::filesystem::u8path(job->run_dir_rel);
     const std::filesystem::path log_path = root_ / std::filesystem::u8path(job->log_rel);
     qeeg::ensure_directory(run_dir.u8string());
+
+    const std::string& arg_str = job->launch_args.empty() ? job->args : job->launch_args;
 
 #ifdef _WIN32
     // Build a single command line string for CreateProcess.
@@ -1770,7 +1914,7 @@ class UiServer {
     //  2) re-quote each token using join_commandline_args_win32()
     std::vector<std::string> argv_s;
     argv_s.push_back(exe.u8string());
-    for (const auto& t : qeeg::split_commandline_args(job->args)) {
+    for (const auto& t : qeeg::split_commandline_args(arg_str)) {
       argv_s.push_back(t);
     }
     const std::string cmd = qeeg::join_commandline_args_win32(argv_s);
@@ -1842,7 +1986,7 @@ class UiServer {
 #else
     std::vector<std::string> argv_s;
     argv_s.push_back(exe.u8string());
-    for (const auto& t : qeeg::split_commandline_args(job->args)) {
+    for (const auto& t : qeeg::split_commandline_args(arg_str)) {
       argv_s.push_back(t);
     }
 
@@ -4093,10 +4237,16 @@ class UiServer {
       return;
     }
 
-    const std::filesystem::path exe = resolve_exe_path(bin_dir_, tool);
+    bool used_toolbox = false;
+    std::filesystem::path exe = resolve_exe_path(bin_dir_, tool);
     if (exe.empty()) {
-      send_json(c, 404, "{\"error\":\"tool not found in bin-dir\"}");
-      return;
+      if (!toolbox_exe_.empty()) {
+        exe = toolbox_exe_;
+        used_toolbox = true;
+      } else {
+        send_json(c, 404, "{\"error\":\"tool not found in bin-dir\"}");
+        return;
+      }
     }
 
     // Keep job statuses fresh so our concurrency limiter has an accurate view.
@@ -4142,6 +4292,11 @@ class UiServer {
     // Write lightweight per-run metadata so qeeg_ui_cli can auto-discover
     // UI-launched runs and surface their artifacts.
     const std::string input_path = infer_input_path_from_args(expanded_args);
+    // If we're using a multicall toolbox runner (e.g., qeeg_offline_app_cli),
+    // prefix the tool name as the first argv token.
+    const std::string process_args = used_toolbox
+        ? (tool + (expanded_args.empty() ? "" : (" " + expanded_args)))
+        : expanded_args;
     const std::string meta_rel = run_dir_rel + "/ui_server_run_meta.json";
     const std::filesystem::path meta_path = run_dir / "ui_server_run_meta.json";
     const std::filesystem::path cmd_path = run_dir / "command.txt";
@@ -4159,7 +4314,7 @@ class UiServer {
         f << "started: " << started << "\n";
         f << "cwd: " << root_.u8string() << "\n";
         f << "command: \"" << exe.u8string() << "\"";
-        if (!expanded_args.empty()) f << ' ' << expanded_args;
+        if (!process_args.empty()) f << ' ' << process_args;
         f << "\n";
         if (!input_path.empty()) f << "input_path: " << input_path << "\n";
       }
@@ -4178,7 +4333,9 @@ class UiServer {
     RunJob job;
     job.id = job_id;
     job.tool = tool;
+    job.exe_path = exe.u8string();
     job.args = expanded_args;
+    job.launch_args = process_args;
     job.started = started;
     job.run_dir_rel = run_dir_rel;
     job.log_rel = run_dir_rel + "/run.log";
@@ -4666,11 +4823,18 @@ class UiServer {
   std::filesystem::path root_;
   std::filesystem::path root_canon_;
   std::filesystem::path bin_dir_;
+  std::filesystem::path toolbox_exe_; // optional multicall runner (e.g., qeeg_offline_app_cli)
   std::filesystem::path index_html_;
   std::string host_{"127.0.0.1"};
   int port_{8765};
   int max_parallel_{0};
   std::string api_token_;
+
+  struct HelpEntry {
+    std::string text;
+    bool truncated{false};
+  };
+  std::unordered_map<std::string, HelpEntry> help_cache_;
 
   std::vector<RunJob> jobs_;
   int next_job_id_{0};
@@ -4680,14 +4844,55 @@ class UiServer {
 
 int main(int argc, char** argv) {
   try {
-    const Args a = parse_args(argc, argv);
-    if (a.root.empty() || a.bin_dir.empty()) {
-      std::cerr << "qeeg_ui_server_cli: --root and --bin-dir are required (see --help)\n";
+    Args a = parse_args(argc, argv);
+    if (a.root.empty()) {
+      std::cerr << "qeeg_ui_server_cli: --root is required (see --help)\n";
       return 2;
+    }
+
+    // Default bin-dir: directory containing this executable.
+    if (a.bin_dir.empty()) {
+      a.bin_dir = self_dir(argv).u8string();
     }
 
     const std::filesystem::path root = std::filesystem::u8path(a.root);
     const std::filesystem::path bin_dir = std::filesystem::u8path(a.bin_dir);
+
+    // Optional multicall toolbox runner (e.g., qeeg_offline_app_cli).
+    //
+    // If provided, the server can run tools even when the per-tool qeeg_*_cli
+    // executable isn't present in --bin-dir by invoking:
+    //   <toolbox> <tool> <args...>
+    std::filesystem::path toolbox_exe;
+    if (!a.toolbox.empty()) {
+      const std::filesystem::path tb = std::filesystem::u8path(a.toolbox);
+      auto try_exists = [](const std::filesystem::path& p) -> std::filesystem::path {
+        if (p.empty()) return {};
+        if (std::filesystem::exists(p)) return p;
+        std::filesystem::path pe = p;
+        pe += ".exe";
+        if (std::filesystem::exists(pe)) return pe;
+        return {};
+      };
+
+      if (tb.is_absolute() || tb.has_parent_path()) {
+        // Treat as a path (absolute or relative).
+        toolbox_exe = try_exists(tb);
+        if (toolbox_exe.empty() && tb.is_relative()) {
+          toolbox_exe = try_exists(bin_dir / tb);
+        }
+      } else {
+        // Treat as an executable name within --bin-dir.
+        toolbox_exe = resolve_exe_path(bin_dir, a.toolbox);
+      }
+
+      if (toolbox_exe.empty()) {
+        throw std::runtime_error("--toolbox not found: " + a.toolbox);
+      }
+    } else {
+      // Auto-detect common offline toolbox name if present.
+      toolbox_exe = resolve_exe_path(bin_dir, "qeeg_offline_app_cli");
+    }
 
     const std::filesystem::path ui_html = root / "qeeg_ui.html";
     if (!a.no_generate_ui) {
@@ -4704,6 +4909,11 @@ int main(int argc, char** argv) {
     }
 
     UiServer s(root, bin_dir);
+    if (!toolbox_exe.empty()) {
+      s.set_toolbox_exe(toolbox_exe);
+      std::cout << "Toolbox runner: " << toolbox_exe.u8string() << "\n";
+    }
+
     s.set_host(a.host);
     s.set_port(a.port);
     s.set_max_parallel(a.max_parallel);

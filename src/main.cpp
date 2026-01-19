@@ -91,7 +91,7 @@ static void print_help() {
     << "  --input PATH            Input EDF or CSV\n"
     << "  --fs HZ                 Sampling rate for CSV (optional if first column is time); required for --demo\n"
     << "  --outdir DIR            Output directory (default: out)\n"
-    << "  --montage SPEC          'builtin:standard_1020_19' (default) or PATH to montage CSV\n"
+    << "  --montage SPEC          'builtin:standard_1020_19' (default), 'builtin:standard_1010_61', or PATH to montage CSV\n"
     << "  --bands SPEC            Band spec, e.g. 'delta:0.5-4,theta:4-7,alpha:8-12'\n"
     << "                         IAF-relative convenience forms:\n"
     << "                           --bands iaf=10.2\n"
@@ -202,10 +202,26 @@ static Args parse_args(int argc, char** argv) {
 
 static Montage load_montage(const std::string& spec) {
   std::string low = to_lower(spec);
-  if (low == "builtin:standard_1020_19" || low == "standard_1020_19" ||
-      low == "builtin" || low == "default") {
+
+  // Convenience aliases
+  if (low == "builtin" || low == "default") {
     return Montage::builtin_standard_1020_19();
   }
+
+  // Support: builtin:<key>
+  std::string key = low;
+  if (starts_with(key, "builtin:")) {
+    key = key.substr(std::string("builtin:").size());
+  }
+
+  if (key == "standard_1020_19" || key == "1020_19" || key == "standard_1020" || key == "1020") {
+    return Montage::builtin_standard_1020_19();
+  }
+  if (key == "standard_1010_61" || key == "1010_61" || key == "standard_1010" || key == "1010" ||
+      key == "standard_10_10" || key == "10_10" || key == "10-10") {
+    return Montage::builtin_standard_1010_61();
+  }
+
   return Montage::load_csv(spec);
 }
 

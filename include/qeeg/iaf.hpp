@@ -48,6 +48,19 @@ struct IafEstimate {
   bool found{false};
   double iaf_hz{std::numeric_limits<double>::quiet_NaN()};
 
+  // Optional: Alpha-band center of gravity (CoG) estimate within the alpha
+  // search range.
+  //
+  // This is a complementary estimator to peak alpha frequency (PAF). CoG is
+  // commonly defined as a power-weighted mean frequency within the alpha band.
+  //
+  // In this first-pass implementation, CoG is computed from the same spectrum
+  // used for peak detection (after optional detrend + smoothing) by converting
+  // the dB spectrum back to linear units and weighting only the *above-median*
+  // portion within the alpha band. If no above-median mass is present, this
+  // value will remain NaN.
+  double cog_hz{std::numeric_limits<double>::quiet_NaN()};
+
   // Value at the detected peak (units: dB if detrend_1_f=false; otherwise the
   // detrended dB residual).
   double peak_value_db{std::numeric_limits<double>::quiet_NaN()};

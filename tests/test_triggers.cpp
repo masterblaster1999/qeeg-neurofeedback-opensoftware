@@ -13,7 +13,7 @@ static bool near(double a, double b, double eps = 1e-9) {
 int main() {
   using namespace qeeg;
 
-  // 1) Simple TRIG channel edge extraction.
+  // 1) Simple TRIG channel extraction (segments with durations).
   {
     EEGRecording rec;
     rec.fs_hz = 100.0;
@@ -32,9 +32,10 @@ int main() {
     assert(r.used_channel == "TRIG");
     assert(r.events.size() == 2);
     assert(near(r.events[0].onset_sec, 10.0 / 100.0));
-    assert(r.events[0].duration_sec == 0.0);
+    assert(near(r.events[0].duration_sec, 3.0 / 100.0));
     assert(r.events[0].text == "5");
     assert(near(r.events[1].onset_sec, 50.0 / 100.0));
+    assert(near(r.events[1].duration_sec, 1.0 / 100.0));
     assert(r.events[1].text == "2");
   }
 
@@ -57,8 +58,10 @@ int main() {
     assert(r.used_channel == "Status");
     assert(r.events.size() == 2);
     assert(near(r.events[0].onset_sec, 64.0 / 256.0));
+    assert(near(r.events[0].duration_sec, 2.0 / 256.0));
     assert(r.events[0].text == "7");
     assert(near(r.events[1].onset_sec, 128.0 / 256.0));
+    assert(near(r.events[1].duration_sec, 1.0 / 256.0));
     assert(r.events[1].text == "300");
   }
 
@@ -96,6 +99,7 @@ int main() {
     assert(r.events.size() == 1);
     assert(r.events[0].text == "7");
     assert(near(r.events[0].onset_sec, 0.20));
+    assert(near(r.events[0].duration_sec, 0.30));
   }
 
   std::cout << "All tests passed.\n";

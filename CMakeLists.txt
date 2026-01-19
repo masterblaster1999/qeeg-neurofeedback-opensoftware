@@ -184,6 +184,9 @@ if (QEEG_BUILD_CLI)
   add_executable(qeeg_ui_server_cli src/ui_server_cli.cpp)
   target_link_libraries(qeeg_ui_server_cli PRIVATE qeeg)
 
+  add_executable(qeeg_bundle_cli src/bundle_cli.cpp)
+  target_link_libraries(qeeg_bundle_cli PRIVATE qeeg)
+
   add_executable(qeeg_clean_cli src/clean_cli.cpp)
   target_link_libraries(qeeg_clean_cli PRIVATE qeeg)
 
@@ -195,6 +198,86 @@ if (QEEG_BUILD_CLI)
 
   add_executable(qeeg_channel_qc_cli src/channel_qc_cli.cpp)
   target_link_libraries(qeeg_channel_qc_cli PRIVATE qeeg)
+
+
+  # Offline multicall app: build a single binary that can dispatch to any qeeg_*_cli tool.
+  #
+  # This is useful for offline distribution (one executable) and as a "toolbox" runner for
+  # qeeg_ui_server_cli --toolbox, which lets the browser UI run tools even if individual
+  # qeeg_*_cli executables aren't present in --bin-dir.
+  function(qeeg_add_cli_entry obj_target src_file entry_symbol)
+    add_library(${obj_target} OBJECT ${src_file})
+    target_link_libraries(${obj_target} PRIVATE qeeg)
+    target_compile_definitions(${obj_target} PRIVATE main=${entry_symbol})
+  endfunction()
+
+  qeeg_add_cli_entry(qeeg_cli_entry_map src/main.cpp qeeg_map_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_bandpower src/bandpower_cli.cpp qeeg_bandpower_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_bandratios src/bandratios_cli.cpp qeeg_bandratios_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_nf src/nf_cli.cpp qeeg_nf_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_coherence src/coherence_cli.cpp qeeg_coherence_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_plv src/plv_cli.cpp qeeg_plv_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_epoch src/epoch_cli.cpp qeeg_epoch_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_spectrogram src/spectrogram_cli.cpp qeeg_spectrogram_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_trace_plot src/trace_plot_cli.cpp qeeg_trace_plot_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_spectral_features src/spectral_features_cli.cpp qeeg_spectral_features_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_iaf src/iaf_cli.cpp qeeg_iaf_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_microstates src/microstates_cli.cpp qeeg_microstates_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_pac src/pac_cli.cpp qeeg_pac_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_artifacts src/artifacts_cli.cpp qeeg_artifacts_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_reference src/reference_cli.cpp qeeg_reference_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_info src/info_cli.cpp qeeg_info_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_version src/version_cli.cpp qeeg_version_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_convert src/convert_cli.cpp qeeg_convert_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_export_edf src/export_edf_cli.cpp qeeg_export_edf_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_export_bdf src/export_bdf_cli.cpp qeeg_export_bdf_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_export_brainvision src/export_brainvision_cli.cpp qeeg_export_brainvision_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_export_bids src/export_bids_cli.cpp qeeg_export_bids_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_bids_scan src/bids_scan_cli.cpp qeeg_bids_scan_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_export_derivatives src/export_derivatives_cli.cpp qeeg_export_derivatives_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_ui src/ui_cli.cpp qeeg_ui_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_ui_server src/ui_server_cli.cpp qeeg_ui_server_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_bundle src/bundle_cli.cpp qeeg_bundle_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_clean src/clean_cli.cpp qeeg_clean_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_quality src/quality_cli.cpp qeeg_quality_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_preprocess src/preprocess_cli.cpp qeeg_preprocess_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_channel_qc src/channel_qc_cli.cpp qeeg_channel_qc_cli_entry)
+
+  add_executable(qeeg_offline_app_cli
+    src/offline_app_cli.cpp
+    $<TARGET_OBJECTS:qeeg_cli_entry_map>
+    $<TARGET_OBJECTS:qeeg_cli_entry_bandpower>
+    $<TARGET_OBJECTS:qeeg_cli_entry_bandratios>
+    $<TARGET_OBJECTS:qeeg_cli_entry_nf>
+    $<TARGET_OBJECTS:qeeg_cli_entry_coherence>
+    $<TARGET_OBJECTS:qeeg_cli_entry_plv>
+    $<TARGET_OBJECTS:qeeg_cli_entry_epoch>
+    $<TARGET_OBJECTS:qeeg_cli_entry_spectrogram>
+    $<TARGET_OBJECTS:qeeg_cli_entry_trace_plot>
+    $<TARGET_OBJECTS:qeeg_cli_entry_spectral_features>
+    $<TARGET_OBJECTS:qeeg_cli_entry_iaf>
+    $<TARGET_OBJECTS:qeeg_cli_entry_microstates>
+    $<TARGET_OBJECTS:qeeg_cli_entry_pac>
+    $<TARGET_OBJECTS:qeeg_cli_entry_artifacts>
+    $<TARGET_OBJECTS:qeeg_cli_entry_reference>
+    $<TARGET_OBJECTS:qeeg_cli_entry_info>
+    $<TARGET_OBJECTS:qeeg_cli_entry_version>
+    $<TARGET_OBJECTS:qeeg_cli_entry_convert>
+    $<TARGET_OBJECTS:qeeg_cli_entry_export_edf>
+    $<TARGET_OBJECTS:qeeg_cli_entry_export_bdf>
+    $<TARGET_OBJECTS:qeeg_cli_entry_export_brainvision>
+    $<TARGET_OBJECTS:qeeg_cli_entry_export_bids>
+    $<TARGET_OBJECTS:qeeg_cli_entry_bids_scan>
+    $<TARGET_OBJECTS:qeeg_cli_entry_export_derivatives>
+    $<TARGET_OBJECTS:qeeg_cli_entry_ui>
+    $<TARGET_OBJECTS:qeeg_cli_entry_ui_server>
+    $<TARGET_OBJECTS:qeeg_cli_entry_bundle>
+    $<TARGET_OBJECTS:qeeg_cli_entry_clean>
+    $<TARGET_OBJECTS:qeeg_cli_entry_quality>
+    $<TARGET_OBJECTS:qeeg_cli_entry_preprocess>
+    $<TARGET_OBJECTS:qeeg_cli_entry_channel_qc>
+  )
+  target_link_libraries(qeeg_offline_app_cli PRIVATE qeeg)
 endif()
 
 
@@ -242,6 +325,8 @@ if (QEEG_BUILD_CLI)
     qeeg_channel_qc_cli
     qeeg_ui_cli
     qeeg_ui_server_cli
+    qeeg_bundle_cli
+    qeeg_offline_app_cli
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   )
 endif()
@@ -274,6 +359,12 @@ install(EXPORT qeegTargets
 
 if(QEEG_BUILD_TESTS)
   enable_testing()
+
+  # Offline app/toolbox sanity checks (only when CLI tools are built).
+  if (QEEG_BUILD_CLI)
+    add_test(NAME qeeg_test_offline_app_list_tools COMMAND qeeg_offline_app_cli --list-tools)
+    add_test(NAME qeeg_test_offline_app_dispatch_version_help COMMAND qeeg_offline_app_cli qeeg_version_cli --help)
+  endif()
 
   add_executable(qeeg_test_fft tests/test_fft.cpp)
   target_link_libraries(qeeg_test_fft PRIVATE qeeg)
@@ -545,6 +636,11 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_montage_aliases tests/test_montage_aliases.cpp)
   target_link_libraries(qeeg_test_montage_aliases PRIVATE qeeg)
   add_test(NAME qeeg_test_montage_aliases COMMAND qeeg_test_montage_aliases)
+
+  add_executable(qeeg_test_montage_builtin_1010 tests/test_montage_builtin_1010.cpp)
+  target_link_libraries(qeeg_test_montage_builtin_1010 PRIVATE qeeg)
+  add_test(NAME qeeg_test_montage_builtin_1010 COMMAND qeeg_test_montage_builtin_1010)
+
 
   add_executable(qeeg_test_nf_metric_spec tests/test_nf_metric_spec.cpp)
   target_link_libraries(qeeg_test_nf_metric_spec PRIVATE qeeg)

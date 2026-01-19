@@ -29,6 +29,8 @@ struct Args {
   double ptp_z{6.0};
   double rms_z{6.0};
   double kurtosis_z{6.0};
+  double ptp_z_low{0.0};
+  double rms_z_low{0.0};
   size_t min_bad_channels{1};
 
   // How much of a time gap (in seconds) to allow when merging overlapping
@@ -65,6 +67,8 @@ static void print_help() {
     << "  --ptp-z Z               Peak-to-peak robust z threshold (default: 6; <=0 disables)\n"
     << "  --rms-z Z               RMS robust z threshold (default: 6; <=0 disables)\n"
     << "  --kurtosis-z Z          Kurtosis robust z threshold (default: 6; <=0 disables)\n"
+    << "  --ptp-z-low Z           Low PTP robust z threshold for flatline/dropouts (default: 0; <=0 disables)\n"
+    << "  --rms-z-low Z           Low RMS robust z threshold for flatline/dropouts (default: 0; <=0 disables)\n"
     << "  --min-bad-channels N    Mark window bad if >=N channels are flagged (default: 1)\n"
     << "  --merge-gap SEC         Merge bad windows with gaps <=SEC into segments (default: 0)\n"
     << "  --export-bids-events     Write artifact_events.tsv and artifact_events.json (merged segments)\n"
@@ -101,6 +105,10 @@ static Args parse_args(int argc, char** argv) {
       a.rms_z = to_double(argv[++i]);
     } else if (arg == "--kurtosis-z" && i + 1 < argc) {
       a.kurtosis_z = to_double(argv[++i]);
+    } else if (arg == "--ptp-z-low" && i + 1 < argc) {
+      a.ptp_z_low = to_double(argv[++i]);
+    } else if (arg == "--rms-z-low" && i + 1 < argc) {
+      a.rms_z_low = to_double(argv[++i]);
     } else if (arg == "--min-bad-channels" && i + 1 < argc) {
       a.min_bad_channels = static_cast<size_t>(to_int(argv[++i]));
     } else if (arg == "--merge-gap" && i + 1 < argc) {
@@ -200,6 +208,8 @@ int main(int argc, char** argv) {
     aopt.ptp_z = args.ptp_z;
     aopt.rms_z = args.rms_z;
     aopt.kurtosis_z = args.kurtosis_z;
+    aopt.ptp_z_low = args.ptp_z_low;
+    aopt.rms_z_low = args.rms_z_low;
     aopt.min_bad_channels = args.min_bad_channels;
 
     std::cout << "Loaded recording: " << rec.n_channels() << " channels, "
@@ -263,6 +273,8 @@ int main(int argc, char** argv) {
       f << "ptp_z: " << res.opt.ptp_z << "\n";
       f << "rms_z: " << res.opt.rms_z << "\n";
       f << "kurtosis_z: " << res.opt.kurtosis_z << "\n";
+      f << "ptp_z_low: " << res.opt.ptp_z_low << "\n";
+      f << "rms_z_low: " << res.opt.rms_z_low << "\n";
       f << "min_bad_channels: " << res.opt.min_bad_channels << "\n\n";
       f << "windows_total: " << res.windows.size() << "\n";
       f << "windows_bad: " << res.total_bad_windows << "\n";

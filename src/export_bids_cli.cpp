@@ -124,8 +124,10 @@ static void print_help() {
       << "  --events-levels                Include a trial_type Levels map in *_events.json (only if unique values are few).\n"
       << "  --electrodes <file.{tsv|csv}>  Input electrode positions table; writes *_electrodes.tsv and *_coordsystem.json.\n"
       << "                               Header must include: name,x,y (z optional; optional: type,material,impedance).\n"
-      << "  --electrodes-from-montage <SPEC> Generate electrodes.tsv from a qeeg montage spec (builtin:standard_1020_19 or montage CSV name,x,y).\n"
+      << "  --electrodes-from-montage <SPEC> Generate electrodes.tsv from a qeeg montage spec (builtin:standard_1020_19, builtin:standard_1010_61, or montage CSV name,x,y).\n"
       << "                               This writes x/y from the montage and sets z to n/a.\n"
+      << "                               Note: BIDS intends electrodes.tsv/coordsystem.json for *digitized* (measured) electrode positions;\n"
+      << "                               template/idealized montages may not be appropriate for all workflows.\n"
       << "  --eeg-coord-system <value>     EEGCoordinateSystem for *_coordsystem.json (e.g., CapTrak, EEGLAB, EEGLAB-HJ, Other).\n"
       << "  --eeg-coord-units <m|mm|cm|n/a> EEGCoordinateUnits for *_coordsystem.json.\n"
       << "  --eeg-coord-desc <text>        EEGCoordinateSystemDescription (REQUIRED if --eeg-coord-system Other).\n"
@@ -176,11 +178,27 @@ static int parse_int_or_throw(const std::string& s, const std::string& flag) {
 }
 
 static Montage load_montage_spec(const std::string& spec) {
-  const std::string low = to_lower(spec);
-  if (low == "builtin:standard_1020_19" || low == "standard_1020_19" ||
-      low == "builtin" || low == "default") {
+  std::string low = to_lower(spec);
+
+  // Convenience aliases
+  if (low == "builtin" || low == "default") {
     return Montage::builtin_standard_1020_19();
   }
+
+  // Support: builtin:<key>
+  std::string key = low;
+  if (starts_with(key, "builtin:")) {
+    key = key.substr(std::string("builtin:").size());
+  }
+
+  if (key == "standard_1020_19" || key == "1020_19" || key == "standard_1020" || key == "1020") {
+    return Montage::builtin_standard_1020_19();
+  }
+  if (key == "standard_1010_61" || key == "1010_61" || key == "standard_1010" || key == "1010" ||
+      key == "standard_10_10" || key == "10_10" || key == "10-10") {
+    return Montage::builtin_standard_1010_61();
+  }
+
   return Montage::load_csv(spec);
 }
 
@@ -486,9 +504,9 @@ int main(int argc, char** argv) {
                   << ", bad=" << bad << ")\n";
       }
 
-      write_bids_channels_tsv(channels_tsv.u8string(), rec, status, status_desc);
+      write_bids_channels_tsv(channels_tsv.u8string(), rec, status, status_desc, args.eeg_reference);
     } else {
-      write_bids_channels_tsv(channels_tsv.u8string(), rec);
+      write_bids_channels_tsv(channels_tsv.u8string(), rec, /*status=*/{}, /*status_desc=*/{}, args.eeg_reference);
     }
 
     // Write eeg.json metadata.

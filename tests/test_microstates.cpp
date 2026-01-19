@@ -95,6 +95,15 @@ int main() {
 
   expect_true(r.gev > 0.50, "GEV unexpectedly low");
 
+  // Per-state GEV contributions should sum to global GEV.
+  expect_true(r.gev_state.size() == 4, "expected gev_state size == k");
+  double gev_sum = 0.0;
+  for (double x : r.gev_state) {
+    expect_true(x >= -1e-12, "gev_state contains negative value");
+    gev_sum += x;
+  }
+  expect_true(std::fabs(gev_sum - r.gev) < 1e-6, "gev_state does not sum to gev");
+
   std::cout << "test_microstates OK (GEV=" << r.gev << ")\n";
   return 0;
 }

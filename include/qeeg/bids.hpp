@@ -155,11 +155,19 @@ void write_bids_eeg_json(const std::string& path,
 std::string guess_bids_channel_type(const std::string& channel_name);
 
 // Write channels.tsv with required columns: name, type, units.
-// Also writes status/status_description as optional columns.
+//
+// For convenience and better interoperability with BIDS tooling, qeeg also
+// writes several OPTIONAL columns by default:
+//   description, sampling_frequency, reference, low_cutoff, high_cutoff, notch,
+//   status, status_description.
+//
+// If all channels share the same reference, you can specify it in *_eeg.json
+// (EEGReference) and optionally repeat it here via common_reference.
 void write_bids_channels_tsv(const std::string& path,
                              const EEGRecording& rec,
                              const std::vector<std::string>& channel_status = {},
-                             const std::vector<std::string>& channel_status_desc = {});
+                             const std::vector<std::string>& channel_status_desc = {},
+                             const std::string& common_reference = {});
 
 // Write channels.tsv from a provided channel name list.
 //
@@ -172,7 +180,8 @@ void write_bids_channels_tsv(const std::string& path,
 void write_bids_channels_tsv(const std::string& path,
                              const std::vector<std::string>& channel_names,
                              const std::vector<std::string>& channel_status = {},
-                             const std::vector<std::string>& channel_status_desc = {});
+                             const std::vector<std::string>& channel_status_desc = {},
+                             const std::string& common_reference = {});
 
 // Load the `name` column from a BIDS *_channels.tsv (or a similar table).
 //

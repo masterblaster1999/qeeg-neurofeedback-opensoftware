@@ -216,11 +216,14 @@ int main() {
     assert(eeg.find("\"PowerLineFrequency\": 50") != std::string::npos);
 
     const std::string ch = slurp(channels_tsv);
+    // Required columns must appear first.
     assert(ch.find("name\ttype\tunits") != std::string::npos);
-    assert(ch.find("Cz\tEEG\tuV") != std::string::npos);
-    assert(ch.find("VEOG\tVEOG\tuV") != std::string::npos);
-    assert(ch.find("TRIG\tTRIG\tV") != std::string::npos);
-    assert(ch.find("REF\tREF\tuV") != std::string::npos);
+    // qeeg emits several optional columns for better interoperability.
+    assert(ch.find("description\tsampling_frequency\treference\tlow_cutoff\thigh_cutoff\tnotch") != std::string::npos);
+    assert(ch.find("Cz\tEEG\tuV\tn/a\t250.000000") != std::string::npos);
+    assert(ch.find("VEOG\tVEOG\tuV\tn/a\t250.000000") != std::string::npos);
+    assert(ch.find("TRIG\tTRIG\tV\tn/a\t250.000000") != std::string::npos);
+    assert(ch.find("REF\tREF\tuV\tn/a\t250.000000") != std::string::npos);
 
     // Load channels.tsv name list (used by derivatives exporters to preserve ordering).
     {
@@ -241,9 +244,9 @@ int main() {
 
       write_bids_channels_tsv(channels2_tsv.u8string(), names, status, desc);
       const std::string ch2 = slurp(channels2_tsv);
-      assert(ch2.find("VEOG\tVEOG\tuV\tbad\tqeeg_channel_qc:noisy") != std::string::npos);
-      assert(ch2.find("Cz\tEEG\tuV\tgood") != std::string::npos);
-      assert(ch2.find("TRIG\tTRIG\tV\tgood") != std::string::npos);
+      assert(ch2.find("VEOG\tVEOG\tuV\tn/a\tn/a\tn/a\tn/a\tn/a\tn/a\tbad\tqeeg_channel_qc:noisy") != std::string::npos);
+      assert(ch2.find("Cz\tEEG\tuV\tn/a\tn/a\tn/a\tn/a\tn/a\tn/a\tgood\tn/a") != std::string::npos);
+      assert(ch2.find("TRIG\tTRIG\tV\tn/a\tn/a\tn/a\tn/a\tn/a\tn/a\tgood\tn/a") != std::string::npos);
     }
 
     const std::string ev = slurp(events_tsv);

@@ -127,6 +127,10 @@ static double parabolic_refine_hz(const std::vector<double>& freqs,
   return freqs[static_cast<size_t>(i)] + delta * df;
 }
 
+static double pow10(double x) {
+  return std::pow(10.0, x);
+}
+
 } // namespace
 
 IafEstimate estimate_iaf(const PsdResult& psd, const IafOptions& opt) {
@@ -215,6 +219,36 @@ IafEstimate estimate_iaf(const PsdResult& psd, const IafOptions& opt) {
     if (is_finite(v)) band_vals.push_back(v);
   }
   const double band_med = median_copy(band_vals);
+
+  // Optional: alpha-band center of gravity (CoG).
+  //
+  // Compute a power-weighted average frequency in the alpha band. To reduce
+  // sensitivity to a flat spectrum (which would yield a near-midband CoG), we
+  // weight only the *above-median* portion of the (optionally detrended +
+  // smoothed) spectrum.
+  if (is_finite(band_med)) {
+    const double base_w = pow10(band_med / 10.0);
+    double sum_w = 0.0;
+    double sum_fw = 0.0;
+    for (int i = i0; i <= i1; ++i) {
+      const double v_db = y_smooth[static_cast<size_t>(i)];
+      if (!is_finite(v_db)) continue;
+      double w = pow10(v_db / 10.0);
+      if (!is_finite(w)) continue;
+      w -= base_w;
+      if (!(w > 0.0)) continue;
+      const double f = psd.freqs_hz[static_cast<size_t>(i)];
+      if (!is_finite(f)) continue;
+      sum_w += w;
+      sum_fw += f * w;
+    }
+    if (sum_w > 0.0 && is_finite(sum_fw)) {
+      out.cog_hz = sum_fw / sum_w;
+      // Clamp to alpha range for safety.
+      if (out.cog_hz < opt.alpha_min_hz) out.cog_hz = opt.alpha_min_hz;
+      if (out.cog_hz > opt.alpha_max_hz) out.cog_hz = opt.alpha_max_hz;
+    }
+  }
 
   // Find max in band.
   int i_peak = -1;

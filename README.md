@@ -145,6 +145,63 @@ dashboard are enabled only when you serve the UI with the local server:
 Tip: add `--max-parallel N` to limit how many tools run at once; additional runs are kept in a **queued** state until a slot is free.
 
 
+#### Optional: single-binary offline toolbox
+
+If you prefer to distribute **one executable** instead of many `qeeg_*_cli` binaries, build/use the
+multicall wrapper:
+
+```bash
+./build/qeeg_offline_app_cli --list-tools
+./build/qeeg_offline_app_cli qeeg_version_cli --help
+./build/qeeg_offline_app_cli qeeg_map_cli --help
+```
+
+Optionally, you can create per-tool *shim* command names next to the toolbox binary (implemented
+as hardlinks/symlinks where possible):
+
+```bash
+# Create qeeg_map_cli, qeeg_ui_server_cli, ... next to qeeg_offline_app_cli
+./build/qeeg_offline_app_cli --install-shims ./build
+
+# Now you can call tools directly
+./build/qeeg_map_cli --help
+```
+
+
+The UI server can also use it as a fallback runner (so the dashboard can still execute tools even if
+the per-tool executables aren't present in `--bin-dir`):
+
+```bash
+./build/qeeg_ui_server_cli --root /path/to/runs --bin-dir ./build --toolbox qeeg_offline_app_cli --open
+```
+
+#### Optional: create a portable offline app folder
+
+To ship a **single folder** (e.g., zip it and share), you can build a bundle that contains:
+- `bin/` (executables)
+- `runs/` (a writable root for UI runs + outputs)
+- `start_qeeg_ui.sh` / `start_qeeg_ui.bat` launch scripts
+
+```bash
+# Create the bundle folder
+./build/qeeg_bundle_cli --bin-dir ./build --outdir ./qeeg_offline_bundle
+
+# Run it (Linux/macOS)
+cd qeeg_offline_bundle
+./start_qeeg_ui.sh
+
+# Run it (Windows)
+start_qeeg_ui.bat
+```
+
+By default the bundle is **minimal**: it copies `qeeg_offline_app_cli` and then generates per-tool
+shims (hardlinks/symlinks where possible) inside `bin/`. This lets you run `qeeg_map_cli`,
+`qeeg_ui_server_cli`, etc. directly while still shipping a single binary. Disable shim creation with
+`--no-tool-shims`.
+
+The launcher scripts start the dashboard via the embedded `qeeg_ui_server_cli` entrypoint (inside the
+toolbox) and serve the pre-generated `runs/qeeg_ui.html` without regenerating it on startup.
+
 This serves the dashboard at `http://127.0.0.1:8765/` and exposes a tiny local-only API that lets the
 UI launch `qeeg_*_cli` executables and write per-run logs under `.../ui_runs/`.
 

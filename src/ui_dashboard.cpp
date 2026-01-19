@@ -232,6 +232,11 @@ static std::vector<ToolSpec> default_tools() {
      "Serve the dashboard locally and enable one-click runs via a small local-only HTTP API.",
      "qeeg_ui_server_cli --root . --bin-dir ./build --port 8765 --open",
      "", "--root"},
+
+    {"qeeg_bundle_cli", "UI",
+     "Build a portable offline app folder (bin/ + runs/ + start scripts) that can run the dashboard and tools without an install.",
+     "qeeg_bundle_cli --bin-dir ./build --outdir ./qeeg_offline_bundle",
+     "--outdir", "--bin-dir"},
   };
 }
 
@@ -994,13 +999,13 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
         const std::string full_id = id + "_full";
         const std::string preset_id = id + "_preset";
         o << "            <button class=\"btn\" onclick=\"copyFullCmd('" << full_id << "','" << args_id << "','" << html_escape(t.name) << "')\">Copy full command</button>\n";
-        if (args.embed_help) {
-          o << "            <button class=\"btn\" data-tool=\"" << html_escape(t.name)
-            << "\" data-args-id=\"" << args_id
-            << "\" data-help-id=\"" << helpcode_id
-            << "\" data-inject-sel-id=\"" << injectsel_id
-            << "\" onclick=\"openFlagHelper(this)\">Flags</button>\n";
-        }
+        // Flag helper: works with embedded help (when available) or can fetch
+        // on-demand from qeeg_ui_server_cli via /api/help.
+        o << "            <button class=\"btn\" data-tool=\"" << html_escape(t.name)
+          << "\" data-args-id=\"" << args_id
+          << "\" data-help-id=\"" << helpcode_id
+          << "\" data-inject-sel-id=\"" << injectsel_id
+          << "\" onclick=\"openFlagHelper(this)\">Flags</button>\n";
         o << "            <button class=\"btn\" id=\"" << stopbtn_id << "\" data-status-id=\"" << status_id << "\" disabled onclick=\"stopJob(this)\">Stop</button>\n";
         o << "            <button class=\"btn\" data-status-id=\"" << status_id << "\" data-logwrap-id=\"" << logwrap_id << "\" data-log-id=\"" << log_id << "\" onclick=\"toggleLog(this)\">Tail log</button>\n";
         o << "            <button class=\"btn\" data-status-id=\"" << status_id << "\" data-outwrap-id=\"" << outwrap_id << "\" data-out-id=\"" << out_id << "\" onclick=\"toggleOutputs(this)\">Outputs</button>\\n";
@@ -1029,7 +1034,7 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
         o << "            <button class=\"btn\" onclick=\"importPresets(\'" << html_escape(t.name) << "\',\'" << preset_id << "\')\">Import</button>\n";
         o << "            <button class=\"btn\" onclick=\"resetArgs(\'" << args_id << "\')\">Reset</button>\n";
         o << "          </div>\n";
-        o << "          <div class=\"statusline\" id=\"" << status_id << "\" data-outwrap-id=\"" << outwrap_id << "\" data-out-id=\"" << out_id << "\">Server not detected. Start: <code>qeeg_ui_server_cli --root . --bin-dir ./build</code></div>\\n";
+        o << "          <div class=\"statusline\" id=\"" << status_id << "\" data-outwrap-id=\"" << outwrap_id << "\" data-out-id=\"" << out_id << "\">Server not detected. Start: <code>qeeg_ui_server_cli --root . --bin-dir ./build</code> (or omit <code>--bin-dir</code> if tools live next to the server)</div>\\n";
         o << "          <div id=\"" << logwrap_id << "\" class=\"hidden\" style=\"margin-top:10px\">\n";
         o << "            <div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap\">\n";
         o << "              <div class=\"small\">Log tail (live while open; latest ~64KB)</div>\n";
@@ -5472,7 +5477,7 @@ function renderFlagHelper(){
   meta.textContent = String(shown) + ' / ' + String(items.length) + ' shown' + (selectedInputPath ? (' · selection: ' + selectedInputType) : '');
 }
 
-function openFlagHelper(btn){
+async function openFlagHelper(btn){
   const back = document.getElementById('flagsBackdrop');
   const list = document.getElementById('flagsList');
   const meta = document.getElementById('flagsMeta');
@@ -5494,16 +5499,43 @@ function openFlagHelper(btn){
   searchEl.oninput = renderFlagHelper;
 
   const helpEl = helpId ? document.getElementById(helpId) : null;
-  const helpText = helpEl ? (helpEl.textContent||'') : '';
+  let helpText = helpEl ? (helpEl.textContent||'') : '';
+
+  // If help wasn't embedded, try to fetch it on-demand from the local UI
+  // server. This keeps the static HTML lightweight while still providing a
+  // convenient flag browser.
   if(!helpText.trim()){
-    list.innerHTML = '<span class="small">No embedded help found for this tool. Generate the dashboard with <code>--bin-dir</code> and help embedding enabled, or run the tool in a terminal with <code>--help</code>.</span>';
+    if(qeegApiOk && qeegApiToken && tool){
+      list.innerHTML = '<span class="small">Loading help from server…</span>';
+      meta.textContent = '';
+      try{
+        const r = await apiFetch('/api/help?tool='+encodeURIComponent(tool));
+        if(r && r.ok){
+          const j = await r.json();
+          helpText = (j && j.help) ? String(j.help) : '';
+          if(helpEl && helpText.trim()) helpEl.textContent = helpText;
+        } else {
+          list.innerHTML = '<span class="small">Failed to fetch help from server (HTTP '+String(r&&r.status?r.status:'?')+').</span>';
+          meta.textContent = '';
+          return;
+        }
+      }catch(e){
+        list.innerHTML = '<span class="small">Error fetching help: '+esc(e&&e.message?e.message:String(e))+'</span>';
+        meta.textContent = '';
+        return;
+      }
+    }
+  }
+
+  if(!helpText.trim()){
+    list.innerHTML = '<span class="small">No help available. Either generate the dashboard with embedded help (enable <code>--bin-dir</code> and help embedding), or run <code>qeeg_ui_server_cli</code> so the UI can fetch <code>--help</code> output on demand.</span>';
     meta.textContent = '';
     return;
   }
 
   flagsCtx.items = parseHelpOptions(helpText);
   if(!flagsCtx.items.length){
-    list.innerHTML = '<span class="small">Could not parse options from the embedded help output.</span>';
+    list.innerHTML = '<span class="small">Could not parse options from the tool\'s help output.</span>';
     meta.textContent = '';
     return;
   }

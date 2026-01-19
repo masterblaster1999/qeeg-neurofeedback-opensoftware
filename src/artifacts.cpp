@@ -184,6 +184,8 @@ ArtifactDetectionResult detect_artifacts(const EEGRecording& rec, const Artifact
       if (opt.ptp_z > 0.0 && cm.ptp_z > opt.ptp_z) bad = true;
       if (opt.rms_z > 0.0 && cm.rms_z > opt.rms_z) bad = true;
       if (opt.kurtosis_z > 0.0 && cm.kurtosis_z > opt.kurtosis_z) bad = true;
+      if (opt.ptp_z_low > 0.0 && cm.ptp_z < -opt.ptp_z_low) bad = true;
+      if (opt.rms_z_low > 0.0 && cm.rms_z < -opt.rms_z_low) bad = true;
       cm.bad = bad;
       if (bad) ++bad_ch;
 

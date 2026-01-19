@@ -17,17 +17,22 @@ namespace qeeg {
 //
 // This module provides a conservative heuristic to:
 //   1) identify a likely trigger channel, and
-//   2) convert transitions in that channel into AnnotationEvent entries.
+//   2) convert constant-code runs (segments) in that channel into AnnotationEvent entries.
 //
 // It is intended to improve interoperability for exports that do not include EDF+/BDF+
 // annotations (e.g., some BDF recordings store triggers in a "Status" channel).
+
+// Notes:
+// - Events are emitted on transitions *into* a code (the initial segment starting at sample 0 is ignored).
+// - AnnotationEvent::duration_sec is set to the duration of the constant-code run (in seconds).
+
 
 struct TriggerExtractionOptions {
   // If non-empty, force a specific channel name (matched via normalize_channel_name).
   // If empty, a trigger-like channel will be chosen automatically.
   std::string channel_name;
 
-  // Optional bitmask applied to the rounded integer value before edge detection.
+  // Optional bitmask applied to the rounded integer value before segment detection.
   // For example, BioSemi "Status" words often carry trigger codes in the lower 16 bits.
   // 0 means "no mask".
   std::uint32_t mask{0};

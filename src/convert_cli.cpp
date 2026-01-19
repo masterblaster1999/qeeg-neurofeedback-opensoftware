@@ -1,11 +1,17 @@
+#include "qeeg/biquad.hpp"
 #include "qeeg/channel_map.hpp"
 #include "qeeg/csv_io.hpp"
 #include "qeeg/event_ops.hpp"
 #include "qeeg/nf_session.hpp"
+#include "qeeg/pattern.hpp"
 #include "qeeg/reader.hpp"
+#include "qeeg/resample.hpp"
+#include "qeeg/triggers.hpp"
 #include "qeeg/types.hpp"
 #include "qeeg/utils.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -30,6 +36,11 @@ struct Args {
   std::vector<std::string> extra_events;
   std::string nf_outdir;
   double fs_csv{0.0};
+  double resample_hz{0.0};
+  bool resample_antialias{false};
+  double resample_antialias_cutoff_hz{0.0};
+  bool resample_hold_auto{true};
+  std::vector<std::string> resample_hold_patterns;
   bool write_time{true};
 };
 
@@ -46,6 +57,14 @@ static void print_help() {
       << "  .csv/.txt/.tsv/.asc     (ASCII exports)\n\n"
       << "Options:\n"
       << "  --fs <Hz>                    Sampling rate for CSV/TXT inputs (if no time column).\n"
+      << "  --resample <Hz>              Resample channels to <Hz> before writing data outputs.\n"
+      << "  --resample-antialias         When downsampling (target < input), apply a low-pass filter\n"
+      << "                               before resampling continuous channels (helps reduce aliasing).\n"
+      << "  --resample-antialias-cutoff <Hz>\n"
+      << "                               Cutoff for antialias low-pass (default: 0.45 * target_fs).\n"
+      << "  --resample-hold <glob>       Resample matching channels using zero-order hold (repeatable).\n"
+      << "                               Useful for discrete trigger/status channels (avoids spurious codes).\n"
+      << "  --no-resample-hold-auto      Disable auto-detection of trigger-like channels for hold resampling.\n"
       << "  --channel-map <path>         CSV mapping file to rename/drop channels.\n"
       << "                               Format: old,new   (or old=new). Use new=DROP to drop.\n"
       << "  --channel-map-template <path>Write a template mapping CSV for this recording (old,new).\n"
@@ -78,6 +97,16 @@ static Args parse_args(int argc, char** argv) {
       a.output_csv = argv[++i];
     } else if (arg == "--fs" && i + 1 < argc) {
       a.fs_csv = to_double(argv[++i]);
+    } else if ((arg == "--resample" || arg == "--resample-hz") && i + 1 < argc) {
+      a.resample_hz = to_double(argv[++i]);
+    } else if (arg == "--resample-antialias") {
+      a.resample_antialias = true;
+    } else if (arg == "--resample-antialias-cutoff" && i + 1 < argc) {
+      a.resample_antialias_cutoff_hz = to_double(argv[++i]);
+    } else if (arg == "--resample-hold" && i + 1 < argc) {
+      a.resample_hold_patterns.push_back(argv[++i]);
+    } else if (arg == "--no-resample-hold-auto") {
+      a.resample_hold_auto = false;
     } else if (arg == "--channel-map" && i + 1 < argc) {
       a.channel_map_path = argv[++i];
     } else if (arg == "--channel-map-template" && i + 1 < argc) {
@@ -110,6 +139,127 @@ static Args parse_args(int argc, char** argv) {
   return a;
 }
 
+struct ResampleReport {
+  std::size_t hold_channels{0};
+  std::string auto_hold_channel;
+  bool antialias_applied{false};
+  double antialias_cutoff_hz{0.0};
+};
+
+static bool match_any_hold_pattern(const std::string& name,
+                                  const std::vector<std::string>& patterns) {
+  for (const auto& p : patterns) {
+    if (wildcard_match(name, p, /*case_sensitive=*/false)) return true;
+  }
+  return false;
+}
+
+static ResampleReport resample_recording_inplace(EEGRecording* rec,
+                                                 double target_fs_hz,
+                                                 const Args& args) {
+  ResampleReport rep;
+  if (!rec) return rep;
+  if (!(target_fs_hz > 0.0)) return rep;
+  if (!(rec->fs_hz > 0.0)) {
+    throw std::runtime_error("Cannot resample: input sampling rate is not known (fs_hz <= 0)");
+  }
+  const size_t in_len = rec->n_samples();
+  if (in_len == 0 || rec->n_channels() == 0) return rep;
+
+  if (std::fabs(target_fs_hz - rec->fs_hz) < 1e-12) return rep;
+
+  const long double out_len_f = static_cast<long double>(in_len) * (static_cast<long double>(target_fs_hz) / static_cast<long double>(rec->fs_hz));
+  long long out_ll = static_cast<long long>(std::llround(out_len_f));
+  if (out_ll < 1) out_ll = 1;
+  const size_t out_len = static_cast<size_t>(out_ll);
+
+  if (out_len == in_len) {
+    rec->fs_hz = target_fs_hz;
+    return rep;
+  }
+
+  // Decide which channels should be resampled using zero-order-hold.
+  //
+  // Motivation: Trigger/status channels are often discrete-valued, and linear interpolation
+  // can create spurious intermediate values that later get decoded as false events.
+  std::vector<bool> hold;
+  hold.resize(rec->n_channels(), false);
+
+  // 1) User-provided wildcard patterns.
+  if (!args.resample_hold_patterns.empty()) {
+    for (std::size_t ch = 0; ch < rec->n_channels(); ++ch) {
+      if (match_any_hold_pattern(rec->channel_names[ch], args.resample_hold_patterns)) {
+        hold[ch] = true;
+      }
+    }
+  }
+
+  // 2) Auto-detect a trigger-like channel (conservative heuristic).
+  if (args.resample_hold_auto) {
+    const auto tr = extract_events_from_triggers_auto(*rec);
+    rep.auto_hold_channel = tr.used_channel;
+    if (!tr.used_channel.empty()) {
+      const std::string want = normalize_channel_name(tr.used_channel);
+      for (std::size_t ch = 0; ch < rec->n_channels(); ++ch) {
+        if (normalize_channel_name(rec->channel_names[ch]) == want) {
+          hold[ch] = true;
+          break;
+        }
+      }
+    }
+  }
+
+  for (bool b : hold) {
+    if (b) ++rep.hold_channels;
+  }
+
+  // Optional: antialias filtering for downsampling.
+  const double in_fs = rec->fs_hz;
+  const bool do_antialias = args.resample_antialias && (target_fs_hz < in_fs);
+  std::vector<BiquadCoeffs> antialias_stages;
+  if (do_antialias) {
+    const double ny_in = 0.5 * in_fs;
+    const double ny_out = 0.5 * target_fs_hz;
+
+    double fc = args.resample_antialias_cutoff_hz;
+    if (!(fc > 0.0)) {
+      // 0.45*target_fs = 0.9*Nyquist_out
+      fc = 0.45 * target_fs_hz;
+    }
+
+    // Clamp to keep the lowpass well below both Nyquist frequencies.
+    if (ny_out > 0.0) {
+      fc = std::min(fc, 0.9 * ny_out);
+    }
+    if (ny_in > 0.0) {
+      fc = std::min(fc, 0.9 * ny_in);
+    }
+
+    if (fc > 0.0 && std::isfinite(fc)) {
+      antialias_stages.push_back(design_lowpass(in_fs, fc, 0.7071067811865476));
+      rep.antialias_applied = true;
+      rep.antialias_cutoff_hz = fc;
+    }
+  }
+
+  for (std::size_t ch = 0; ch < rec->n_channels(); ++ch) {
+    auto& x = rec->data[ch];
+    if (hold[ch]) {
+      x = resample_hold(x, out_len);
+      continue;
+    }
+
+    if (!antialias_stages.empty()) {
+      // Forward-backward for ~zero phase distortion (offline conversion).
+      filtfilt_inplace(&x, antialias_stages);
+    }
+    x = resample_linear(x, out_len);
+  }
+
+  rec->fs_hz = target_fs_hz;
+  return rep;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -125,6 +275,28 @@ int main(int argc, char** argv) {
     if (!args.channel_map_path.empty()) {
       const ChannelMap m = load_channel_map_file(args.channel_map_path);
       apply_channel_map(&rec, m);
+    }
+
+    if (args.resample_hz > 0.0) {
+      if (rec.fs_hz <= 0.0) {
+        throw std::runtime_error("--resample requires a valid sampling rate (fs_hz). For CSV/TXT inputs, pass --fs <Hz> if no time column is present.");
+      }
+      const size_t in_len = rec.n_samples();
+      const double in_fs = rec.fs_hz;
+      const ResampleReport rep = resample_recording_inplace(&rec, args.resample_hz, args);
+      const size_t out_len = rec.n_samples();
+      std::cerr << "Resampled recording: fs " << in_fs << " -> " << rec.fs_hz
+                << " Hz, samples " << in_len << " -> " << out_len;
+      if (rep.hold_channels > 0) {
+        std::cerr << ", hold_channels=" << rep.hold_channels;
+        if (!rep.auto_hold_channel.empty()) {
+          std::cerr << " (auto: " << rep.auto_hold_channel << ")";
+        }
+      }
+      if (rep.antialias_applied) {
+        std::cerr << ", antialias_cutoff_hz=" << rep.antialias_cutoff_hz;
+      }
+      std::cerr << "\n";
     }
 
     // Merge additional events (e.g., NF-derived segments) into the recording.

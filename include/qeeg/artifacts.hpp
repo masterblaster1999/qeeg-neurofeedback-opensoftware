@@ -34,6 +34,12 @@ struct ArtifactDetectionOptions {
   double rms_z{6.0};
   double kurtosis_z{6.0};
 
+  // Robust z-score thresholds for *low* outliers (flatline / dropouts).
+  // If <= 0, that feature is disabled.
+  // A channel is flagged if z < -threshold.
+  double ptp_z_low{0.0};
+  double rms_z_low{0.0};
+
   // A window is flagged as "bad" if at least this many channels are flagged.
   size_t min_bad_channels{1};
 };

@@ -27,6 +27,12 @@ struct Args {
   bool occipital{false};       // use a small occipital/parietal set for aggregate IAF
   std::string aggregate{"median"}; // median|mean|none
 
+  // Which per-channel estimator to use for the aggregate IAF and outputs that
+  // depend on a single IAF value (e.g., iaf_band_spec.txt, topomap_iaf.bmp).
+  // - "peak": peak alpha frequency (PAF) (default)
+  // - "cog" : alpha-band center of gravity (CoG)
+  std::string metric{"peak"};
+
   // CSV inputs
   double fs_csv{0.0};
 
@@ -78,6 +84,7 @@ static void print_help() {
     << "  --channels LIST           Comma-separated channel list used for aggregate IAF (default: all)\n"
     << "  --occipital               Use a default occipital/parietal set for aggregate (O1,O2,Oz,Pz,P3,P4)\n"
     << "  --aggregate MODE          Aggregate mode: median|mean|none (default: median)\n"
+    << "  --metric METHOD           Which IAF estimator to aggregate: peak|cog (default: peak)\n"
     << "  --alpha MIN MAX           Alpha peak search band in Hz (default: 7 13)\n"
     << "  --no-detrend              Disable 1/f detrending (enabled by default)\n"
     << "  --detrend-range MIN MAX   Detrend fit range in Hz (default: 2 40)\n"
@@ -93,7 +100,7 @@ static void print_help() {
     << "  --zero-phase              Offline: forward-backward filtering (less phase distortion)\n"
     << "  --no-topomap              Do not render topomap_iaf.bmp\n"
     << "  --no-annotate             Render plain BMP (no head outline/electrodes/colorbar)\n"
-    << "  --montage SPEC            builtin:standard_1020_19 (default) or path to montage CSV\n"
+    << "  --montage SPEC            builtin:standard_1020_19 (default), builtin:standard_1010_61, or path to montage CSV\n"
     << "  --grid N                  Topomap grid size (default: 256)\n"
     << "  --interp METHOD           idw|spline (default: idw)\n"
     << "  --idw-power P             IDW power parameter (default: 2.0)\n"
@@ -125,6 +132,8 @@ static Args parse_args(int argc, char** argv) {
       a.occipital = true;
     } else if (arg == "--aggregate" && i + 1 < argc) {
       a.aggregate = to_lower(argv[++i]);
+    } else if (arg == "--metric" && i + 1 < argc) {
+      a.metric = to_lower(argv[++i]);
     } else if (arg == "--alpha" && i + 2 < argc) {
       a.alpha_min_hz = to_double(argv[++i]);
       a.alpha_max_hz = to_double(argv[++i]);
@@ -181,10 +190,26 @@ static Args parse_args(int argc, char** argv) {
 
 static Montage load_montage(const std::string& spec) {
   std::string low = to_lower(spec);
-  if (low == "builtin:standard_1020_19" || low == "standard_1020_19" ||
-      low == "builtin" || low == "default") {
+
+  // Convenience aliases
+  if (low == "builtin" || low == "default") {
     return Montage::builtin_standard_1020_19();
   }
+
+  // Support: builtin:<key>
+  std::string key = low;
+  if (starts_with(key, "builtin:")) {
+    key = key.substr(std::string("builtin:").size());
+  }
+
+  if (key == "standard_1020_19" || key == "1020_19" || key == "standard_1020" || key == "1020") {
+    return Montage::builtin_standard_1020_19();
+  }
+  if (key == "standard_1010_61" || key == "1010_61" || key == "standard_1010" || key == "1010" ||
+      key == "standard_10_10" || key == "10_10" || key == "10-10") {
+    return Montage::builtin_standard_1010_61();
+  }
+
   return Montage::load_csv(spec);
 }
 
@@ -230,6 +255,12 @@ int main(int argc, char** argv) {
       print_help();
       throw std::runtime_error("--input is required");
     }
+
+    if (!(args.metric == "peak" || args.metric == "paf" || args.metric == "cog")) {
+      std::cerr << "Warning: unknown --metric: " << args.metric << " (using peak)\n";
+      args.metric = "peak";
+    }
+    if (args.metric == "paf") args.metric = "peak";
 
     ensure_directory(args.outdir);
 
@@ -293,37 +324,46 @@ int main(int argc, char** argv) {
       for (size_t c = 0; c < rec.n_channels(); ++c) agg_ch.push_back(static_cast<int>(c));
     }
 
-    std::vector<double> iaf_vals;
+    std::vector<double> paf_vals;
+    std::vector<double> cog_vals;
     for (int idx : agg_ch) {
       if (idx < 0 || idx >= static_cast<int>(rec.n_channels())) continue;
-      if (per_ch[static_cast<size_t>(idx)].found) {
-        iaf_vals.push_back(per_ch[static_cast<size_t>(idx)].iaf_hz);
+      const auto& e = per_ch[static_cast<size_t>(idx)];
+      if (e.found) {
+        paf_vals.push_back(e.iaf_hz);
+      }
+      if (std::isfinite(e.cog_hz)) {
+        cog_vals.push_back(e.cog_hz);
       }
     }
 
-    double iaf_agg = std::numeric_limits<double>::quiet_NaN();
-    if (!iaf_vals.empty()) {
+    auto aggregate_one = [&](std::vector<double> v) -> double {
+      if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
       if (args.aggregate == "mean") {
-        iaf_agg = mean(iaf_vals);
+        return mean(v);
       } else if (args.aggregate == "median") {
-        iaf_agg = median_inplace(&iaf_vals);
+        return median_inplace(&v);
       } else if (args.aggregate == "none") {
-        // keep NaN
+        return std::numeric_limits<double>::quiet_NaN();
       } else {
         std::cerr << "Warning: unknown --aggregate mode: " << args.aggregate << " (using median)\n";
-        iaf_agg = median_inplace(&iaf_vals);
+        return median_inplace(&v);
       }
-    }
+    };
+
+    const double paf_agg = aggregate_one(paf_vals);
+    const double cog_agg = aggregate_one(cog_vals);
+    const double iaf_agg = (args.metric == "cog") ? cog_agg : paf_agg;
 
     // Write per-channel CSV.
     {
       std::ofstream f(args.outdir + "/iaf_by_channel.csv");
       if (!f) throw std::runtime_error("Failed to write iaf_by_channel.csv");
-      f << "channel,iaf_hz,found,peak_value_db,prominence_db\n";
+      f << "channel,iaf_hz,found,peak_value_db,prominence_db,cog_hz\n";
       for (size_t c = 0; c < rec.n_channels(); ++c) {
         const auto& e = per_ch[c];
         f << rec.channel_names[c] << "," << e.iaf_hz << "," << (e.found ? 1 : 0)
-          << "," << e.peak_value_db << "," << e.prominence_db << "\n";
+          << "," << e.peak_value_db << "," << e.prominence_db << "," << e.cog_hz << "\n";
       }
     }
 
@@ -349,6 +389,9 @@ int main(int argc, char** argv) {
       f << "require_local_max=" << (args.require_local_max ? 1 : 0) << "\n";
       f << "\n";
       f << "aggregate_mode=" << args.aggregate << "\n";
+      f << "metric=" << args.metric << "\n";
+      f << "aggregate_paf_hz=" << paf_agg << "\n";
+      f << "aggregate_cog_hz=" << cog_agg << "\n";
       f << "aggregate_iaf_hz=" << iaf_agg << "\n";
     }
 
@@ -367,7 +410,11 @@ int main(int argc, char** argv) {
 
       std::vector<double> vals(rec.n_channels(), std::numeric_limits<double>::quiet_NaN());
       for (size_t c = 0; c < rec.n_channels(); ++c) {
-        if (per_ch[c].found) vals[c] = per_ch[c].iaf_hz;
+        if (args.metric == "cog") {
+          if (std::isfinite(per_ch[c].cog_hz)) vals[c] = per_ch[c].cog_hz;
+        } else {
+          if (per_ch[c].found) vals[c] = per_ch[c].iaf_hz;
+        }
       }
 
       TopomapOptions topt;
@@ -433,7 +480,10 @@ int main(int argc, char** argv) {
         meta << "  \"ChannelCount\": " << rec.n_channels() << ",\n";
         meta << "  \"MontageSpec\": \"" << json_escape(args.montage_spec) << "\",\n";
         meta << "  \"AggregateMode\": \"" << json_escape(args.aggregate) << "\",\n";
+        meta << "  \"Metric\": \"" << json_escape(args.metric) << "\",\n";
         meta << "  \"AggregateIAFHz\": " << iaf_agg << ",\n";
+        meta << "  \"AggregatePAFHz\": " << paf_agg << ",\n";
+        meta << "  \"AggregateCoGHz\": " << cog_agg << ",\n";
         meta << "  \"Options\": {\n";
         meta << "    \"AlphaMinHz\": " << args.alpha_min_hz << ",\n";
         meta << "    \"AlphaMaxHz\": " << args.alpha_max_hz << ",\n";
@@ -461,7 +511,13 @@ int main(int argc, char** argv) {
     }
     std::cout << "Done. Outputs written to: " << args.outdir << "\n";
     if (std::isfinite(iaf_agg)) {
-      std::cout << "Aggregate IAF (" << args.aggregate << ") = " << iaf_agg << " Hz\n";
+      std::cout << "Aggregate IAF (" << args.aggregate << ", metric=" << args.metric << ") = " << iaf_agg << " Hz\n";
+    }
+    if (args.metric != "peak" && std::isfinite(paf_agg)) {
+      std::cout << "Aggregate PAF (" << args.aggregate << ") = " << paf_agg << " Hz\n";
+    }
+    if (args.metric != "cog" && std::isfinite(cog_agg)) {
+      std::cout << "Aggregate CoG (" << args.aggregate << ") = " << cog_agg << " Hz\n";
     }
     return 0;
   } catch (const std::exception& e) {

@@ -85,7 +85,7 @@ static void print_help() {
     << "  --input PATH            Input EDF/BDF/CSV\n"
     << "  --fs HZ                 Sampling rate for CSV (optional if first column is time)\n"
     << "  --outdir DIR            Output directory (default: out)\n"
-    << "  --montage SPEC          builtin:standard_1020_19 (default) or PATH to montage CSV\n"
+    << "  --montage SPEC          builtin:standard_1020_19 (default), builtin:standard_1010_61, or PATH to montage CSV\n"
     << "  --channel-qc PATH       Channel QC (channel_qc.csv, bad_channels.txt, or qc outdir) to exclude bad channels\n"
     << "  --start S               Start time in seconds (default: 0)\n"
     << "  --duration S            Duration in seconds (0 => full remainder)\n"
@@ -189,10 +189,26 @@ static Args parse_args(int argc, char** argv) {
 
 static Montage load_montage(const std::string& spec) {
   std::string low = to_lower(spec);
-  if (low == "builtin:standard_1020_19" || low == "standard_1020_19" ||
-      low == "builtin" || low == "default") {
+
+  // Convenience aliases
+  if (low == "builtin" || low == "default") {
     return Montage::builtin_standard_1020_19();
   }
+
+  // Support: builtin:<key>
+  std::string key = low;
+  if (starts_with(key, "builtin:")) {
+    key = key.substr(std::string("builtin:").size());
+  }
+
+  if (key == "standard_1020_19" || key == "1020_19" || key == "standard_1020" || key == "1020") {
+    return Montage::builtin_standard_1020_19();
+  }
+  if (key == "standard_1010_61" || key == "1010_61" || key == "standard_1010" || key == "1010" ||
+      key == "standard_10_10" || key == "10_10" || key == "10-10") {
+    return Montage::builtin_standard_1010_61();
+  }
+
   return Montage::load_csv(spec);
 }
 
@@ -820,12 +836,16 @@ int main(int argc, char** argv) {
     {
       std::ofstream f(a.outdir + "/microstate_state_stats.csv");
       if (!f) throw std::runtime_error("Failed to open output CSV");
-      f << "microstate,coverage,mean_duration_sec,occurrence_per_sec\n";
+      f << "microstate,coverage,mean_duration_sec,occurrence_per_sec,gev_contrib,gev_frac\n";
       for (int k = 0; k < K; ++k) {
+        const double gev_c = (static_cast<size_t>(k) < r.gev_state.size()) ? r.gev_state[static_cast<size_t>(k)] : 0.0;
+        const double gev_f = (r.gev > 0.0) ? (gev_c / r.gev) : 0.0;
         f << state_name(k)
           << "," << r.coverage[static_cast<size_t>(k)]
           << "," << r.mean_duration_sec[static_cast<size_t>(k)]
           << "," << r.occurrence_per_sec[static_cast<size_t>(k)]
+          << "," << gev_c
+          << "," << gev_f
           << "\n";
       }
     }
@@ -859,11 +879,16 @@ int main(int argc, char** argv) {
       f << "GEV: " << r.gev << "\n\n";
 
       f << "Per-state stats:\n";
-      f << "state,coverage,mean_duration_sec,occurrence_per_sec\n";
+      f << "state,coverage,mean_duration_sec,occurrence_per_sec,gev_contrib,gev_frac\n";
       for (int k = 0; k < K; ++k) {
+        const double gev_c = (static_cast<size_t>(k) < r.gev_state.size()) ? r.gev_state[static_cast<size_t>(k)] : 0.0;
+        const double gev_f = (r.gev > 0.0) ? (gev_c / r.gev) : 0.0;
         f << state_name(k) << "," << r.coverage[static_cast<size_t>(k)]
           << "," << r.mean_duration_sec[static_cast<size_t>(k)]
-          << "," << r.occurrence_per_sec[static_cast<size_t>(k)] << "\n";
+          << "," << r.occurrence_per_sec[static_cast<size_t>(k)]
+          << "," << gev_c
+          << "," << gev_f
+          << "\n";
       }
     }
     emit_out("microstate_summary.txt");

@@ -491,16 +491,33 @@ MicrostatesResult estimate_microstates(const EEGRecording& rec, const Microstate
     }
   }
 
-  // Global explained variance (GEV).
+  // Global explained variance (GEV) and per-state contributions.
+  //
+  // Global:    sum_t GFP(t)^2 * corr(t)^2 / sum_t GFP(t)^2
+  // Per-state: sum_{t in state k} GFP(t)^2 * corr(t)^2 / sum_t GFP(t)^2
+  std::vector<double> num_state(static_cast<size_t>(k), 0.0);
   double num = 0.0;
   double den = 0.0;
   for (size_t t = 0; t < N; ++t) {
     const double w = out.gfp[t] * out.gfp[t];
     den += w;
     const double c = out.corr[t];
-    num += w * c * c;
+    const double contrib = w * c * c;
+    num += contrib;
+
+    const int lab = out.labels[t];
+    if (lab >= 0 && lab < k) {
+      num_state[static_cast<size_t>(lab)] += contrib;
+    }
   }
   out.gev = (den > 0.0) ? (num / den) : 0.0;
+
+  out.gev_state.assign(static_cast<size_t>(k), 0.0);
+  if (den > 0.0) {
+    for (int j = 0; j < k; ++j) {
+      out.gev_state[static_cast<size_t>(j)] = num_state[static_cast<size_t>(j)] / den;
+    }
+  }
 
   return out;
 }

@@ -42,7 +42,8 @@ static void print_help() {
       << "  - EEG recordings follow sub-*/[ses-*]/eeg/*_eeg.<ext> layout\n"
       << "  - Sidecar files exist (eeg.json / channels.tsv / events.tsv/json)\n"
       << "  - eeg.json contains required EEG keys (best-effort string search)\n"
-      << "  - channels.tsv has required columns (name, type, units) in order\n\n"
+      << "  - channels.tsv has required columns (name, type, units) in order\n"
+      << "  - events.tsv (if present) includes required columns (onset, duration)\n\n"
       << "Outputs (under --outdir):\n"
       << "  bids_index.json\n"
       << "  bids_index.csv\n"
@@ -500,10 +501,44 @@ int main(int argc, char** argv) {
           }
         }
 
-        if (rec.has_events_tsv && !rec.has_events_json) {
-          // events.json is not strictly required by BIDS, but it is recommended when additional columns exist.
-          push_issue(&warnings, &rec.issues, "[WARN] ",
-                     "events.tsv exists but events.json is missing (consider adding column descriptions)");
+        if (rec.has_events_tsv) {
+          std::ifstream f(events_tsv_path, std::ios::binary);
+          std::string header;
+          std::getline(f, header);
+          const auto cols = split_header_cols(header);
+          auto find_col = [&](const std::string& name) -> int {
+            for (size_t ci = 0; ci < cols.size(); ++ci) {
+              if (cols[ci] == name) return static_cast<int>(ci);
+            }
+            return -1;
+          };
+          const int i_onset = find_col("onset");
+          const int i_duration = find_col("duration");
+          if (cols.size() < 2) {
+            push_issue(&warnings, &rec.issues, "[WARN] ",
+                       "events.tsv header has fewer than 2 columns (expected onset\t duration)");
+          } else {
+            if (i_onset < 0 || i_duration < 0) {
+              push_issue(&warnings, &rec.issues, "[WARN] ",
+                         "events.tsv is missing required columns: onset and/or duration");
+            } else if (!(i_onset == 0 && i_duration == 1)) {
+              push_issue(&warnings, &rec.issues, "[WARN] ",
+                         "events.tsv recommended first columns are: onset\t duration");
+            }
+          }
+
+          bool has_extra_cols = false;
+          for (const auto& c : cols) {
+            if (c.empty()) continue;
+            if (c == "onset" || c == "duration") continue;
+            has_extra_cols = true;
+            break;
+          }
+          if (has_extra_cols && !rec.has_events_json) {
+            // events.json is not strictly required by BIDS, but it is recommended when additional columns exist.
+            push_issue(&warnings, &rec.issues, "[WARN] ",
+                       "events.tsv has additional columns but events.json is missing (consider adding column descriptions)");
+          }
         }
 
         if (rec.has_electrodes_tsv && !rec.has_coordsystem_json) {

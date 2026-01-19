@@ -49,7 +49,9 @@ int main() {
   IafEstimate est = estimate_iaf_from_signal(x, fs, wopt, iopt);
   expect_true(est.found, "expected to find an alpha peak");
   expect_true(std::fabs(est.iaf_hz - f_alpha) < 1.0, "IAF not near 10 Hz");
+  expect_true(std::isfinite(est.cog_hz), "expected a finite CoG estimate");
+  expect_true(std::fabs(est.cog_hz - f_alpha) < 1.0, "CoG not near 10 Hz");
 
-  std::cout << "test_iaf OK (iaf_hz=" << est.iaf_hz << ")\n";
+  std::cout << "test_iaf OK (iaf_hz=" << est.iaf_hz << ", cog_hz=" << est.cog_hz << ")\n";
   return 0;
 }

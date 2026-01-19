@@ -567,7 +567,8 @@ void write_bids_coordsystem_json(const std::string& path,
 void write_bids_channels_tsv(const std::string& path,
                             const EEGRecording& rec,
                             const std::vector<std::string>& channel_status,
-                            const std::vector<std::string>& channel_status_desc) {
+                            const std::vector<std::string>& channel_status_desc,
+                            const std::string& common_reference) {
   if (path.empty()) throw std::runtime_error("BIDS: channels.tsv path is empty");
 
   if (rec.channel_names.size() != rec.data.size()) {
@@ -596,8 +597,13 @@ void write_bids_channels_tsv(const std::string& path,
   f.imbue(std::locale::classic());
 
   // Required columns: name, type, units (in this order).
-  // We also include status/status_description for compatibility with QC tooling.
-  f << "name\ttype\tunits\tstatus\tstatus_description\n";
+  // qeeg also writes several OPTIONAL columns (in the order they are introduced
+  // in the BIDS specification) for better interoperability with downstream tools.
+  // See: https://bids-specification.readthedocs.io/en/stable/modality-specific-files/electroencephalography.html
+  f << "name\ttype\tunits\tdescription\tsampling_frequency\treference\tlow_cutoff\thigh_cutoff\tnotch\tstatus\tstatus_description\n";
+
+  const std::string ref = trim(common_reference).empty() ? "n/a" : common_reference;
+  const std::optional<double> fs = (rec.fs_hz > 0.0) ? std::optional<double>(rec.fs_hz) : std::nullopt;
 
   for (size_t i = 0; i < rec.channel_names.size(); ++i) {
     const std::string& name = rec.channel_names[i];
@@ -618,9 +624,20 @@ void write_bids_channels_tsv(const std::string& path,
       status_desc = channel_status_desc[i].empty() ? "n/a" : channel_status_desc[i];
     }
 
+    // Required.
     f << tsv_sanitize(name) << "\t";
     f << tsv_sanitize(type_uc) << "\t";
     f << tsv_sanitize(units) << "\t";
+
+    // Optional columns (we always emit them):
+    f << "n/a\t";  // description
+    f << tsv_sanitize(format_double_or_na(fs, /*precision=*/6)) << "\t";
+    f << tsv_sanitize(ref) << "\t";
+    f << "n/a\t";  // low_cutoff
+    f << "n/a\t";  // high_cutoff
+    f << "n/a\t";  // notch
+
+    // QC columns.
     f << tsv_sanitize(status) << "\t";
     f << tsv_sanitize(status_desc) << "\n";
   }
@@ -629,7 +646,8 @@ void write_bids_channels_tsv(const std::string& path,
 void write_bids_channels_tsv(const std::string& path,
                             const std::vector<std::string>& channel_names,
                             const std::vector<std::string>& channel_status,
-                            const std::vector<std::string>& channel_status_desc) {
+                            const std::vector<std::string>& channel_status_desc,
+                            const std::string& common_reference) {
   if (path.empty()) throw std::runtime_error("BIDS: channels.tsv path is empty");
 
   // Validate uniqueness of channel names (BIDS requirement).
@@ -657,8 +675,10 @@ void write_bids_channels_tsv(const std::string& path,
   f.imbue(std::locale::classic());
 
   // Required columns: name, type, units (in this order).
-  // We also include status/status_description for compatibility with QC tooling.
-  f << "name\ttype\tunits\tstatus\tstatus_description\n";
+  // qeeg also writes several OPTIONAL columns for interoperability.
+  f << "name\ttype\tunits\tdescription\tsampling_frequency\treference\tlow_cutoff\thigh_cutoff\tnotch\tstatus\tstatus_description\n";
+
+  const std::string ref = trim(common_reference).empty() ? "n/a" : common_reference;
 
   for (size_t i = 0; i < channel_names.size(); ++i) {
     const std::string& name = channel_names[i];
@@ -679,9 +699,20 @@ void write_bids_channels_tsv(const std::string& path,
       status_desc = channel_status_desc[i].empty() ? "n/a" : channel_status_desc[i];
     }
 
+    // Required.
     f << tsv_sanitize(name) << "\t";
     f << tsv_sanitize(type_uc) << "\t";
     f << tsv_sanitize(units) << "\t";
+
+    // Optional columns.
+    f << "n/a\t";  // description
+    f << "n/a\t";  // sampling_frequency (unknown)
+    f << tsv_sanitize(ref) << "\t";
+    f << "n/a\t";  // low_cutoff
+    f << "n/a\t";  // high_cutoff
+    f << "n/a\t";  // notch
+
+    // QC columns.
     f << tsv_sanitize(status) << "\t";
     f << tsv_sanitize(status_desc) << "\n";
   }

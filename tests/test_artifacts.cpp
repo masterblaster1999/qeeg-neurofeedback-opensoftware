@@ -9,8 +9,9 @@ int main() {
   using namespace qeeg;
 
   // Synthetic 2-channel recording:
-  // - baseline: low-amplitude sine + small noise
+  // - baseline: low-amplitude sine + small deterministic noise
   // - inject a large spike artifact into channel 0 around t=5s
+  // - inject a flatline dropout into channel 1 around t=7..8s
 
   EEGRecording rec;
   rec.fs_hz = 250.0;
@@ -31,20 +32,34 @@ int main() {
     rec.data[1][i] += static_cast<float>(0.01 * std::cos(2.0 * pi * 7.0 * t));
   }
 
-  // Inject artifact into channel 0.
+  // Inject spike artifact into channel 0.
   const size_t spike_center = static_cast<size_t>(std::llround(5.0 * rec.fs_hz));
   for (size_t k = 0; k < 10; ++k) {
     const size_t idx = spike_center + k;
     if (idx < n) rec.data[0][idx] += 100.0f;
   }
 
+  // Inject flatline dropout into channel 1 from 7s to 8s.
+  const size_t flat_start = static_cast<size_t>(std::llround(7.0 * rec.fs_hz));
+  const size_t flat_end = static_cast<size_t>(std::llround(8.0 * rec.fs_hz));
+  for (size_t i = flat_start; i < flat_end && i < n; ++i) {
+    rec.data[1][i] = 0.0f;
+  }
+
   ArtifactDetectionOptions opt;
   opt.window_seconds = 1.0;
   opt.step_seconds = 0.5;
   opt.baseline_seconds = 2.0;
+
+  // High-outlier thresholds (classic spike/noise detection).
   opt.ptp_z = 6.0;
   opt.rms_z = 6.0;
   opt.kurtosis_z = 6.0;
+
+  // Low-outlier thresholds (flatline/dropouts).
+  opt.ptp_z_low = 6.0;
+  opt.rms_z_low = 6.0;
+
   opt.min_bad_channels = 1;
 
   const auto res = detect_artifacts(rec, opt);
@@ -53,22 +68,35 @@ int main() {
   // We expect at least one window to be flagged as bad.
   assert(res.total_bad_windows > 0);
 
-  // Ensure the bad window is driven by channel 0.
-  bool saw_bad_ch0 = false;
+  // Ensure the spike artifact is driven by channel 0 around t=5s.
+  bool saw_bad_ch0_spike = false;
   for (const auto& w : res.windows) {
     if (!w.bad) continue;
+    if (!(w.t_start_sec <= 5.0 && w.t_end_sec >= 5.0)) continue;
     if (w.channels.size() >= 1 && w.channels[0].bad) {
-      saw_bad_ch0 = true;
+      saw_bad_ch0_spike = true;
       break;
     }
   }
-  assert(saw_bad_ch0);
+  assert(saw_bad_ch0_spike);
 
-  // New helpers: per-channel counts and merged bad segments.
+  // Ensure the flatline dropout is detected in channel 1 around t=7.25s.
+  bool saw_bad_ch1_flat = false;
+  for (const auto& w : res.windows) {
+    if (!w.bad) continue;
+    if (!(w.t_start_sec <= 7.25 && w.t_end_sec >= 7.25)) continue;
+    if (w.channels.size() >= 2 && w.channels[1].bad) {
+      saw_bad_ch1_flat = true;
+      break;
+    }
+  }
+  assert(saw_bad_ch1_flat);
+
+  // Helpers: per-channel counts and merged bad segments.
   const auto ch_counts = artifact_bad_counts_per_channel(res);
   assert(ch_counts.size() == rec.n_channels());
   assert(ch_counts[0] > 0);
-  assert(ch_counts[0] >= ch_counts[1]);
+  assert(ch_counts[1] > 0);
 
   const auto segs = artifact_bad_segments(res);
   assert(!segs.empty());
@@ -77,9 +105,11 @@ int main() {
   for (const auto& s : segs) {
     if (s.t_start_sec <= 5.0 && s.t_end_sec >= 5.0) {
       covers_spike_time = true;
-      // The injected artifact was only in channel 0.
+      // The injected spike artifact was only in channel 0.
       if (s.bad_windows_per_channel.size() >= 2) {
         assert(s.bad_windows_per_channel[0] > 0);
+        // Channel 1 could still be flagged in overlap windows depending on thresholds,
+        // but channel 0 should be at least as often flagged for this segment.
         assert(s.bad_windows_per_channel[0] >= s.bad_windows_per_channel[1]);
       }
       break;
@@ -87,6 +117,19 @@ int main() {
   }
   assert(covers_spike_time);
 
-  std::cout << "Artifact detection test passed. Bad windows: " << res.total_bad_windows << "\n";
+  bool covers_flat_time = false;
+  for (const auto& s : segs) {
+    if (s.t_start_sec <= 7.25 && s.t_end_sec >= 7.25) {
+      covers_flat_time = true;
+      if (s.bad_windows_per_channel.size() >= 2) {
+        assert(s.bad_windows_per_channel[1] > 0);
+      }
+      break;
+    }
+  }
+  assert(covers_flat_time);
+
+  std::cout << "Artifact detection test passed. Bad windows: " << res.total_bad_windows
+            << ", segments: " << segs.size() << "\n";
   return 0;
 }

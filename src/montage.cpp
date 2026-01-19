@@ -116,6 +116,98 @@ Montage Montage::builtin_standard_1020_19() {
   return m;
 }
 
+
+
+Montage Montage::builtin_standard_1010_61() {
+  Montage m;
+
+  // NOTE: These 2D coordinates are intentionally simple and approximate (unit circle head model).
+  // They provide a reasonable out-of-the-box montage for common 10-10/10-20 channel labels.
+  //
+  // Coordinate convention (matches qeeg topomap renderer):
+  //   x: left (-) to right (+)
+  //   y: frontal/nasion (+) to occipital (-)
+  //
+  // For accurate neurophysiology/clinical work, use digitized electrode locations or a vetted template montage.
+  auto put = [&](const std::string& name, double x, double y) {
+    m.pos_by_name_[key(name)] = Vec2{x, y};
+  };
+
+  // Midline (F...O) and common 10-10 rings (approx).
+  // This set mirrors the lightweight 10-10 coordinates used in the HTML dashboard preview.
+  put("Fp1", -0.35,  0.92);
+  put("Fpz",  0.00,  0.98);
+  put("Fp2",  0.35,  0.92);
+
+  put("AF7", -0.55,  0.80);
+  put("AF3", -0.25,  0.78);
+  put("AFz",  0.00,  0.80);
+  put("AF4",  0.25,  0.78);
+  put("AF8",  0.55,  0.80);
+
+  put("F7",  -0.82,  0.62);
+  put("F5",  -0.62,  0.62);
+  put("F3",  -0.42,  0.62);
+  put("F1",  -0.18,  0.62);
+  put("Fz",   0.00,  0.62);
+  put("F2",   0.18,  0.62);
+  put("F4",   0.42,  0.62);
+  put("F6",   0.62,  0.62);
+  put("F8",   0.82,  0.62);
+
+  put("FT7", -0.92,  0.34);
+  put("FC5", -0.66,  0.34);
+  put("FC3", -0.42,  0.34);
+  put("FC1", -0.18,  0.34);
+  put("FCz",  0.00,  0.34);
+  put("FC2",  0.18,  0.34);
+  put("FC4",  0.42,  0.34);
+  put("FC6",  0.66,  0.34);
+  put("FT8",  0.92,  0.34);
+
+  put("T7",  -1.00,  0.00);
+  put("C5",  -0.66,  0.00);
+  put("C3",  -0.42,  0.00);
+  put("C1",  -0.18,  0.00);
+  put("Cz",   0.00,  0.00);
+  put("C2",   0.18,  0.00);
+  put("C4",   0.42,  0.00);
+  put("C6",   0.66,  0.00);
+  put("T8",   1.00,  0.00);
+
+  put("TP7", -0.92, -0.34);
+  put("CP5", -0.66, -0.34);
+  put("CP3", -0.42, -0.34);
+  put("CP1", -0.18, -0.34);
+  put("CPz",  0.00, -0.34);
+  put("CP2",  0.18, -0.34);
+  put("CP4",  0.42, -0.34);
+  put("CP6",  0.66, -0.34);
+  put("TP8",  0.92, -0.34);
+
+  put("P7",  -0.82, -0.62);
+  put("P5",  -0.62, -0.62);
+  put("P3",  -0.42, -0.62);
+  put("P1",  -0.18, -0.62);
+  put("Pz",   0.00, -0.62);
+  put("P2",   0.18, -0.62);
+  put("P4",   0.42, -0.62);
+  put("P6",   0.62, -0.62);
+  put("P8",   0.82, -0.62);
+
+  put("PO7", -0.55, -0.80);
+  put("PO3", -0.25, -0.80);
+  put("POz",  0.00, -0.84);
+  put("PO4",  0.25, -0.80);
+  put("PO8",  0.55, -0.80);
+
+  put("O1",  -0.35, -0.94);
+  put("Oz",   0.00, -0.98);
+  put("O2",   0.35, -0.94);
+
+  return m;
+}
+
 Montage Montage::load_csv(const std::string& path) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("Failed to open montage CSV: " + path);

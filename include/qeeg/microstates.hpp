@@ -77,6 +77,11 @@ struct MicrostatesResult {
   // Computed as sum_t (GFP(t)^2 * corr(t)^2) / sum_t GFP(t)^2.
   double gev{0.0};
 
+  // Per-state contribution to GEV (length = k).
+  // Defined as: sum_{t in state k} GFP(t)^2 * corr(t)^2 / sum_t GFP(t)^2.
+  // These contributions sum to the global GEV (up to numerical precision).
+  std::vector<double> gev_state;
+
   // Basic per-state stats (length = k).
   std::vector<double> coverage;            // fraction of samples assigned to each state
   std::vector<double> mean_duration_sec;   // mean segment duration

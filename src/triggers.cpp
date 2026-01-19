@@ -135,12 +135,12 @@ static std::uint32_t default_mask_for_channel(const std::string& name_key,
   return 0;
 }
 
-static std::vector<AnnotationEvent> extract_edges(const std::vector<float>& x,
-                                                  double fs_hz,
-                                                  std::uint32_t mask,
-                                                  double zero_epsilon,
-                                                  bool ignore_zero,
-                                                  double min_interval_sec) {
+static std::vector<AnnotationEvent> extract_segments(const std::vector<float>& x,
+                                                     double fs_hz,
+                                                     std::uint32_t mask,
+                                                     double zero_epsilon,
+                                                     bool ignore_zero,
+                                                     double min_interval_sec) {
   std::vector<AnnotationEvent> out;
   if (x.empty() || fs_hz <= 0.0) return out;
 
@@ -156,8 +156,6 @@ static std::vector<AnnotationEvent> extract_edges(const std::vector<float>& x,
     if (std::fabs(static_cast<double>(code)) <= zero_epsilon) return 0;
     return code;
   };
-
-  int prev = decode(x[0]);
 
   // Debounce by code.
   // We keep only a small fixed number of recent codes to avoid unbounded memory.
@@ -190,22 +188,43 @@ static std::vector<AnnotationEvent> extract_edges(const std::vector<float>& x,
     recent[oldest] = {code, t};
   };
 
-  for (std::size_t i = 1; i < x.size(); ++i) {
-    const int cur = decode(x[i]);
-    if (cur == prev) continue;
-    prev = cur;
-    if (ignore_zero && cur == 0) continue;
+  // Convert constant-code runs into events.
+  // To preserve backwards-compatible behavior with the prior "edge" extractor,
+  // we do NOT emit an event for the initial segment starting at sample 0.
+  int prev = decode(x[0]);
+  std::size_t seg_start = 0;
 
-    const double t = static_cast<double>(i) / fs_hz;
-    if (seen_recent(cur, t)) continue;
-    push_recent(cur, t);
+  auto push_segment_event = [&](int code, std::size_t start, std::size_t end) {
+    if (start == 0) return; // only emit on transitions (not initial state)
+    if (ignore_zero && code == 0) return;
+    if (end <= start) return;
+
+    const double t = static_cast<double>(start) / fs_hz;
+    if (seen_recent(code, t)) return;
+    push_recent(code, t);
 
     AnnotationEvent ev;
     ev.onset_sec = t;
-    ev.duration_sec = 0.0;
-    ev.text = std::to_string(cur);
+    ev.duration_sec = static_cast<double>(end - start) / fs_hz;
+    ev.text = std::to_string(code);
     out.push_back(std::move(ev));
+  };
+
+  for (std::size_t i = 1; i < x.size(); ++i) {
+    const int cur = decode(x[i]);
+    if (cur == prev) continue;
+
+    // Close previous segment [seg_start, i).
+    push_segment_event(prev, seg_start, i);
+
+    // Start new segment.
+    prev = cur;
+    seg_start = i;
   }
+
+  // Close final segment.
+  push_segment_event(prev, seg_start, x.size());
+
   return out;
 }
 
@@ -296,7 +315,7 @@ TriggerExtractionResult extract_events_from_trigger_channel(const EEGRecording& 
 
   TriggerExtractionResult res;
   res.used_channel = used;
-  res.events = extract_edges(rec.data[idx], rec.fs_hz, mask, opt.zero_epsilon, opt.ignore_zero,
+  res.events = extract_segments(rec.data[idx], rec.fs_hz, mask, opt.zero_epsilon, opt.ignore_zero,
                              opt.min_event_interval_sec);
   return res;
 }
