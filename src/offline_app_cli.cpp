@@ -1,14 +1,32 @@
 #include "qeeg/utils.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+#elif defined(__APPLE__)
+  #include <mach-o/dyld.h>
+  #include <unistd.h>
+#else
+  #include <unistd.h>
+#endif
 
 
 // Declarations of tool entrypoints compiled into this binary.
@@ -17,6 +35,9 @@
 // a preprocessor definition that renames `main` -> `<tool>_entry`.
 // See CMakeLists.txt for the mapping.
 int qeeg_map_cli_entry(int argc, char** argv);
+int qeeg_topomap_cli_entry(int argc, char** argv);
+int qeeg_region_summary_cli_entry(int argc, char** argv);
+int qeeg_connectivity_map_cli_entry(int argc, char** argv);
 int qeeg_bandpower_cli_entry(int argc, char** argv);
 int qeeg_bandratios_cli_entry(int argc, char** argv);
 int qeeg_nf_cli_entry(int argc, char** argv);
@@ -47,6 +68,7 @@ int qeeg_quality_cli_entry(int argc, char** argv);
 int qeeg_preprocess_cli_entry(int argc, char** argv);
 int qeeg_channel_qc_cli_entry(int argc, char** argv);
 int qeeg_bundle_cli_entry(int argc, char** argv);
+int qeeg_pipeline_cli_entry(int argc, char** argv);
 
 namespace {
 
@@ -68,6 +90,9 @@ static std::string base_name(const std::string& path) {
 static std::unordered_map<std::string, EntryFn> make_tools() {
   std::unordered_map<std::string, EntryFn> m;
   m["qeeg_map_cli"] = &qeeg_map_cli_entry;
+  m["qeeg_topomap_cli"] = &qeeg_topomap_cli_entry;
+  m["qeeg_region_summary_cli"] = &qeeg_region_summary_cli_entry;
+  m["qeeg_connectivity_map_cli"] = &qeeg_connectivity_map_cli_entry;
   m["qeeg_bandpower_cli"] = &qeeg_bandpower_cli_entry;
   m["qeeg_bandratios_cli"] = &qeeg_bandratios_cli_entry;
   m["qeeg_nf_cli"] = &qeeg_nf_cli_entry;
@@ -98,6 +123,7 @@ static std::unordered_map<std::string, EntryFn> make_tools() {
   m["qeeg_preprocess_cli"] = &qeeg_preprocess_cli_entry;
   m["qeeg_channel_qc_cli"] = &qeeg_channel_qc_cli_entry;
   m["qeeg_bundle_cli"] = &qeeg_bundle_cli_entry;
+  m["qeeg_pipeline_cli"] = &qeeg_pipeline_cli_entry;
   return m;
 }
 
@@ -115,14 +141,24 @@ static void print_help(const std::unordered_map<std::string, EntryFn>& tools) {
     << "\n"
     << "Usage:\n"
     << "  qeeg_offline_app_cli <tool> [args...]\n"
-    << "  qeeg_offline_app_cli --list-tools\n"
-    << "  qeeg_offline_app_cli --install-shims [DIR] [--force]\n"
+    << "  qeeg_offline_app_cli --list-tools [--json] [--pretty]\n"
+    << "  qeeg_offline_app_cli --install-shims [DIR] [--force] [--tool TOOL]... [--dry-run]\n"
+    << "  qeeg_offline_app_cli --uninstall-shims [DIR] [--force] [--tool TOOL]... [--dry-run]\n"
     << "  qeeg_offline_app_cli --help\n"
+    << "\n"
+    << "Notes:\n"
+    << "  - Without --force, uninstall only removes shims that appear to point back\n"
+    << "    to the currently-running qeeg_offline_app_cli.\n"
+    << "  - When dispatching a tool, this sets the environment variable QEEG_TOOLBOX\n"
+    << "    (unless already set) to the path of this executable. This lets workflows\n"
+    << "    like qeeg_pipeline_cli re-invoke other tools through the same binary.\n"
     << "\n"
     << "Examples:\n"
     << "  qeeg_offline_app_cli qeeg_version_cli\n"
     << "  qeeg_offline_app_cli qeeg_map_cli --help\n"
     << "  qeeg_offline_app_cli --install-shims ./bin\n"
+    << "  qeeg_offline_app_cli --install-shims ./bin --tool qeeg_version_cli\n"
+    << "  qeeg_offline_app_cli --uninstall-shims ./bin --tool qeeg_version_cli\n"
     << "  qeeg_ui_server_cli --root . --bin-dir . --toolbox qeeg_offline_app_cli --open\n"
     << "\n"
     << "Tools:\n";
@@ -181,7 +217,84 @@ static std::vector<std::string> split_path_env(const std::string& s) {
   return out;
 }
 
+static void set_env_if_unset(const char* key, const std::string& value) {
+  if (!key || !*key) return;
+  const char* cur = std::getenv(key);
+  if (cur && *cur) return;
+#if defined(_WIN32)
+  (void)_putenv_s(key, value.c_str());
+#else
+  (void)setenv(key, value.c_str(), 0);
+#endif
+}
+
+
+static std::filesystem::path canonicalize_best_effort(const std::filesystem::path& p) {
+  if (p.empty()) return {};
+  std::error_code ec;
+  std::filesystem::path c = std::filesystem::canonical(p, ec);
+  if (!ec) return c;
+  ec.clear();
+  c = std::filesystem::weakly_canonical(p, ec);
+  if (!ec) return c;
+  ec.clear();
+  c = std::filesystem::absolute(p, ec);
+  if (!ec) return c;
+  return p;
+}
+
+static std::filesystem::path resolve_self_path_platform() {
+#if defined(_WIN32)
+  std::vector<wchar_t> buf(static_cast<size_t>(MAX_PATH));
+  for (;;) {
+    const DWORD n = GetModuleFileNameW(NULL, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0) return {};
+    if (n < static_cast<DWORD>(buf.size())) {
+      std::filesystem::path p(buf.data());
+      return canonicalize_best_effort(p);
+    }
+    // Buffer too small; grow.
+    if (buf.size() > (1u << 20)) return {};
+    buf.resize(buf.size() * 2);
+  }
+#elif defined(__APPLE__)
+  uint32_t sz = 0;
+  // First call: get required size.
+  (void)_NSGetExecutablePath(nullptr, &sz);
+  if (sz == 0) return {};
+
+  std::vector<char> buf(static_cast<size_t>(sz) + 1u);
+  if (_NSGetExecutablePath(buf.data(), &sz) != 0) return {};
+  buf[static_cast<size_t>(sz)] = '\0';
+
+  std::filesystem::path p = std::filesystem::u8path(buf.data());
+  return canonicalize_best_effort(p);
+#else
+  // Linux and many Unix-like systems expose /proc/self/exe as a symlink.
+  std::vector<char> buf(4096);
+  for (;;) {
+    const ssize_t n = readlink("/proc/self/exe", buf.data(), buf.size() - 1);
+    if (n < 0) return {};
+    if (static_cast<size_t>(n) < buf.size() - 1) {
+      buf[static_cast<size_t>(n)] = '\0';
+      std::filesystem::path p = std::filesystem::u8path(buf.data());
+      return canonicalize_best_effort(p);
+    }
+    // Buffer too small; grow.
+    if (buf.size() > (1u << 20)) return {};
+    buf.resize(buf.size() * 2);
+  }
+#endif
+}
+
 static std::filesystem::path resolve_self_path(const char* argv0) {
+  // Prefer a platform-specific way to locate the currently-running executable.
+  // This makes --install-shims more reliable when argv[0] is ambiguous.
+  {
+    const std::filesystem::path p = resolve_self_path_platform();
+    if (!p.empty()) return p;
+  }
+
   if (!argv0) return {};
   const std::string s = argv0;
   if (s.empty()) return {};
@@ -245,7 +358,7 @@ static std::string sh_quote(const std::string& s) {
   out.push_back('\'');
   for (char c : s) {
     if (c == '\'') {
-      out += "'\\''";
+      out += "'\\\\''";
     } else {
       out.push_back(c);
     }
@@ -262,7 +375,11 @@ static void write_wrapper_script(const std::filesystem::path& dst,
     throw std::runtime_error("Failed to write shim: " + dst.u8string());
   }
 
+  // NOTE: Keep these comments stable so --uninstall-shims can safely recognize them.
   f << "#!/usr/bin/env bash\n";
+  f << "# qeeg_offline_app_cli shim\n";
+  f << "# tool: " << tool << "\n";
+  f << "# self: " << self_path.u8string() << "\n";
   f << "set -e\n";
   f << "exec " << sh_quote(self_path.u8string()) << " " << tool << " \"$@\"\n";
 
@@ -279,33 +396,134 @@ static void write_wrapper_script(const std::filesystem::path& dst,
 }
 #endif
 
-static int install_shims(const std::unordered_map<std::string, EntryFn>& tools,
-                         const std::filesystem::path& self_path,
+struct ShimArgs {
+  std::string dir;
+  bool force = false;
+  bool dry_run = false;
+  std::vector<std::string> tools; // If empty: all tools
+};
+
+static bool parse_shim_args(int argc, char** argv, int start_index, ShimArgs& out, std::string& err) {
+  for (int i = start_index; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--force") {
+      out.force = true;
+      continue;
+    }
+    if (a == "--dry-run") {
+      out.dry_run = true;
+      continue;
+    }
+    if (a == "--tool") {
+      if (i + 1 >= argc) {
+        err = "--tool expects a value";
+        return false;
+      }
+      out.tools.push_back(strip_exe_suffix(base_name(argv[++i])));
+      continue;
+    }
+    const std::string prefix = "--tool=";
+    if (qeeg::starts_with(a, prefix)) {
+      out.tools.push_back(strip_exe_suffix(base_name(a.substr(prefix.size()))));
+      continue;
+    }
+
+    // Positional: [DIR]
+    if (!a.empty() && a[0] == '-') {
+      err = "unknown argument: " + a;
+      return false;
+    }
+    if (out.dir.empty()) {
+      out.dir = a;
+      continue;
+    }
+    err = "unexpected argument: " + a;
+    return false;
+  }
+  return true;
+}
+
+static bool select_tools(const std::unordered_map<std::string, EntryFn>& tools,
+                         const std::vector<std::string>& requested,
+                         std::vector<std::string>& out,
+                         std::string& err) {
+  out.clear();
+  if (requested.empty()) {
+    out.reserve(tools.size());
+    for (const auto& kv : tools) out.push_back(kv.first);
+    std::sort(out.begin(), out.end());
+    return true;
+  }
+
+  out.reserve(requested.size());
+  for (const auto& t0 : requested) {
+    const std::string t = strip_exe_suffix(t0);
+    if (tools.find(t) == tools.end()) {
+      err = "unknown tool: " + t;
+      return false;
+    }
+    out.push_back(t);
+  }
+
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return true;
+}
+
+static int install_shims(const std::filesystem::path& self_path,
                          const std::filesystem::path& dir,
-                         bool force) {
+                         const std::vector<std::string>& tool_names,
+                         bool force,
+                         bool dry_run) {
   if (self_path.empty() || !std::filesystem::exists(self_path)) {
     std::cerr << "qeeg_offline_app_cli: cannot resolve self executable path.\n";
     std::cerr << "Tip: run from the directory that contains qeeg_offline_app_cli, or provide an explicit path.\n";
     return 2;
   }
 
+  bool would_create_dir = false;
+
   std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
+  const bool dir_exists = std::filesystem::exists(dir, ec);
   if (ec) {
-    std::cerr << "qeeg_offline_app_cli: failed to create directory: " << dir.u8string() << ": " << ec.message() << "\n";
+    std::cerr << "qeeg_offline_app_cli: failed to stat directory: " << dir.u8string() << ": " << ec.message() << "\n";
     return 1;
   }
 
-  std::vector<std::string> names;
-  names.reserve(tools.size());
-  for (const auto& kv : tools) names.push_back(kv.first);
-  std::sort(names.begin(), names.end());
+  if (!dry_run) {
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+      std::cerr << "qeeg_offline_app_cli: failed to create directory: " << dir.u8string() << ": " << ec.message() << "\n";
+      return 1;
+    }
+    ec.clear();
+    if (!std::filesystem::is_directory(dir, ec) || ec) {
+      std::cerr << "qeeg_offline_app_cli: shim path is not a directory: " << dir.u8string() << "\n";
+      return 1;
+    }
+  } else {
+    // Dry-run MUST NOT modify the filesystem.
+    // We still validate obvious path issues when the directory already exists.
+    if (dir_exists) {
+      ec.clear();
+      if (!std::filesystem::is_directory(dir, ec) || ec) {
+        std::cerr << "qeeg_offline_app_cli: shim path is not a directory: " << dir.u8string() << "\n";
+        return 1;
+      }
+    } else {
+      would_create_dir = true;
+    }
+  }
+
+  if (dry_run && would_create_dir) {
+    std::cout << "[dry-run] would create directory: " << dir.u8string() << "\n";
+  }
 
   const std::filesystem::path self_filename = self_path.filename();
   size_t created = 0;
   size_t skipped = 0;
 
-  for (const auto& tool : names) {
+  for (const auto& tool : tool_names) {
     const std::filesystem::path dst = dir / std::filesystem::u8path(exe_name(tool));
 
     std::error_code ec_exists;
@@ -314,7 +532,15 @@ static int install_shims(const std::unordered_map<std::string, EntryFn>& tools,
         ++skipped;
         continue;
       }
-      std::filesystem::remove(dst, ec_exists);
+      if (!dry_run) {
+        std::filesystem::remove(dst, ec_exists);
+      }
+    }
+
+    if (dry_run) {
+      std::cout << "[dry-run] would create shim: " << dst.u8string() << " -> " << self_filename.u8string() << "\n";
+      ++created;
+      continue;
     }
 
     std::error_code ec1;
@@ -360,9 +586,225 @@ static int install_shims(const std::unordered_map<std::string, EntryFn>& tools,
 #endif
   }
 
-  std::cout << "Installed tool shims into: " << dir.u8string() << "\n";
+  std::cout << (dry_run ? "Dry-run: would install tool shims into: " : "Installed tool shims into: ")
+            << dir.u8string() << "\n";
   std::cout << "  self: " << self_filename.u8string() << "\n";
   std::cout << "  created: " << created << ", skipped: " << skipped << "\n";
+  if (dry_run) {
+    std::cout << "  note: dry-run (no changes were made)\n";
+  }
+  return 0;
+}
+
+static bool fnv1a64_file(const std::filesystem::path& p, std::uint64_t& out, std::string& err) {
+  std::ifstream f(p, std::ios::binary);
+  if (!f) {
+    err = "cannot open: " + p.u8string();
+    return false;
+  }
+
+  constexpr std::uint64_t kOffset = 14695981039346656037ull;
+  constexpr std::uint64_t kPrime = 1099511628211ull;
+
+  std::uint64_t h = kOffset;
+  std::vector<char> buf(64 * 1024);
+  while (f) {
+    f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    const std::streamsize n = f.gcount();
+    for (std::streamsize i = 0; i < n; ++i) {
+      h ^= static_cast<unsigned char>(buf[static_cast<size_t>(i)]);
+      h *= kPrime;
+    }
+  }
+
+  if (!f.eof()) {
+    err = "read failure: " + p.u8string();
+    return false;
+  }
+
+  out = h;
+  return true;
+}
+
+#ifndef _WIN32
+static bool is_wrapper_script_for_self(const std::filesystem::path& dst,
+                                       const std::filesystem::path& self_canon,
+                                       const std::string& tool) {
+  std::ifstream f(dst);
+  if (!f) return false;
+
+  std::string text;
+  text.reserve(4096);
+
+  std::string line;
+  for (int i = 0; i < 12 && std::getline(f, line); ++i) {
+    text += line;
+    text.push_back('\n');
+    if (text.size() > 16 * 1024) break;
+  }
+
+  if (text.rfind("#!/", 0) != 0) return false;
+
+  // Marker-based detection (preferred).
+  const std::string marker = "# qeeg_offline_app_cli shim";
+  if (text.find(marker) != std::string::npos) {
+    const std::string tool_prefix = "# tool: ";
+    const std::string self_prefix = "# self: ";
+
+    const auto tool_pos = text.find(tool_prefix);
+    const auto self_pos = text.find(self_prefix);
+    if (tool_pos != std::string::npos && self_pos != std::string::npos) {
+      const auto tool_end = text.find('\n', tool_pos);
+      const auto self_end = text.find('\n', self_pos);
+
+      const std::string tool_line = text.substr(tool_pos + tool_prefix.size(),
+                                                tool_end == std::string::npos ? std::string::npos
+                                                                              : tool_end - (tool_pos + tool_prefix.size()));
+      const std::string self_line = text.substr(self_pos + self_prefix.size(),
+                                                self_end == std::string::npos ? std::string::npos
+                                                                              : self_end - (self_pos + self_prefix.size()));
+
+      if (tool_line == tool && !self_line.empty()) {
+        const std::filesystem::path p = canonicalize_best_effort(std::filesystem::u8path(self_line));
+        if (!p.empty() && !self_canon.empty() && p == self_canon) {
+          return true;
+        }
+      }
+    }
+    // Marker present but couldn't validate; fall through to heuristic.
+  }
+
+  // Heuristic for old wrapper scripts: look for an exec line referencing this tool and the
+  // current executable filename.
+  if (text.find("exec ") == std::string::npos) return false;
+  if (text.find(tool) == std::string::npos) return false;
+  const std::string self_file = self_canon.filename().u8string();
+  if (!self_file.empty() && text.find(self_file) != std::string::npos) return true;
+  const std::string self_full = self_canon.u8string();
+  if (!self_full.empty() && text.find(self_full) != std::string::npos) return true;
+  return false;
+}
+#endif
+
+static bool is_shim_to_self(const std::filesystem::path& dst,
+                            const std::filesystem::path& self_canon,
+                            const std::string& tool,
+                            const std::uintmax_t self_size,
+                            std::optional<std::uint64_t>& self_hash) {
+  std::error_code ec;
+  const auto st = std::filesystem::symlink_status(dst, ec);
+  if (ec) return false;
+
+  if (std::filesystem::is_symlink(st)) {
+    std::filesystem::path target = std::filesystem::read_symlink(dst, ec);
+    if (ec) return false;
+    if (target.is_relative()) {
+      target = dst.parent_path() / target;
+    }
+    const auto target_canon = canonicalize_best_effort(target);
+    return !target_canon.empty() && !self_canon.empty() && target_canon == self_canon;
+  }
+
+  // Hardlink (or same file): equivalent() should return true.
+  ec.clear();
+  if (std::filesystem::equivalent(dst, self_canon, ec) && !ec) {
+    return true;
+  }
+
+#ifndef _WIN32
+  // Wrapper scripts are used as a last-resort fallback on POSIX.
+  if (std::filesystem::is_regular_file(st)) {
+    if (is_wrapper_script_for_self(dst, self_canon, tool)) return true;
+  }
+#endif
+
+  // Windows fallback can be a full copy of the binary. Detect by comparing a lightweight hash.
+  if (std::filesystem::is_regular_file(st)) {
+    ec.clear();
+    const std::uintmax_t dst_size = std::filesystem::file_size(dst, ec);
+    if (ec) return false;
+    if (dst_size != self_size) return false;
+
+    std::uint64_t dst_hash = 0;
+    std::string err;
+    if (!fnv1a64_file(dst, dst_hash, err)) return false;
+
+    if (!self_hash.has_value()) {
+      std::uint64_t h = 0;
+      if (!fnv1a64_file(self_canon, h, err)) return false;
+      self_hash = h;
+    }
+
+    return dst_hash == *self_hash;
+  }
+
+  return false;
+}
+
+static int uninstall_shims(const std::filesystem::path& self_path,
+                           const std::filesystem::path& dir,
+                           const std::vector<std::string>& tool_names,
+                           bool force,
+                           bool dry_run) {
+  if (self_path.empty() || !std::filesystem::exists(self_path)) {
+    std::cerr << "qeeg_offline_app_cli: cannot resolve self executable path.\n";
+    return 2;
+  }
+
+  const std::filesystem::path self_canon = canonicalize_best_effort(self_path);
+  std::error_code ec;
+  const std::uintmax_t self_size = std::filesystem::file_size(self_canon, ec);
+  if (ec) {
+    std::cerr << "qeeg_offline_app_cli: cannot stat self executable: " << self_canon.u8string() << ": " << ec.message() << "\n";
+    return 1;
+  }
+
+  size_t removed = 0;
+  size_t skipped = 0;
+  size_t missing = 0;
+  std::optional<std::uint64_t> self_hash;
+
+  for (const auto& tool : tool_names) {
+    const std::filesystem::path dst = dir / std::filesystem::u8path(exe_name(tool));
+
+    ec.clear();
+    if (!std::filesystem::exists(dst, ec) || ec) {
+      ++missing;
+      continue;
+    }
+
+    if (!force) {
+      if (!is_shim_to_self(dst, self_canon, tool, self_size, self_hash)) {
+        ++skipped;
+        continue;
+      }
+    }
+
+    if (dry_run) {
+      std::cout << "[dry-run] would remove shim: " << dst.u8string() << "\n";
+      ++removed;
+      continue;
+    }
+
+    ec.clear();
+    std::filesystem::remove(dst, ec);
+    if (ec) {
+      std::cerr << "qeeg_offline_app_cli: failed to remove: " << dst.u8string() << ": " << ec.message() << "\n";
+      return 1;
+    }
+    ++removed;
+  }
+
+  std::cout << "Uninstalled tool shims from: " << dir.u8string() << "\n";
+  std::cout << "  removed: " << removed << ", skipped: " << skipped << ", missing: " << missing << "\n";
+  if (dry_run) {
+    std::cout << "  note: dry-run (no changes were made)\n";
+  }
+
+  if (!force && skipped > 0) {
+    std::cout << "Tip: re-run with --force to remove shims even if they do not appear to match the current toolbox.\n";
+  }
+
   return 0;
 }
 
@@ -374,6 +816,14 @@ int main(int argc, char** argv) {
   if (argc <= 0 || !argv || !argv[0]) {
     print_help(tools);
     return 2;
+  }
+
+  // Make CLI cross-integration smoother: when dispatching tools from this single-binary
+  // toolbox, expose the toolbox path to child workflows (e.g. qeeg_pipeline_cli) via
+  // QEEG_TOOLBOX, unless the user already set it explicitly.
+  const std::filesystem::path self_path = resolve_self_path(argv[0]);
+  if (!self_path.empty()) {
+    set_env_if_unset("QEEG_TOOLBOX", self_path.u8string());
   }
 
   const std::string invoked = strip_exe_suffix(base_name(argv[0]));
@@ -396,27 +846,55 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (first == "--list-tools") {
+    bool json = false;
+    bool pretty = false;
+    for (int i = 2; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (a == "--json") {
+        json = true;
+      } else if (a == "--pretty") {
+        pretty = true;
+      } else {
+        std::cerr << "qeeg_offline_app_cli: unknown argument for --list-tools: " << a << "\n";
+        return 2;
+      }
+    }
+
     std::vector<std::string> names;
     names.reserve(tools.size());
     for (const auto& kv : tools) names.push_back(kv.first);
     std::sort(names.begin(), names.end());
-    for (const auto& n : names) std::cout << n << "\n";
+
+    if (!json) {
+      for (const auto& n : names) std::cout << n << "\n";
+      return 0;
+    }
+
+    // JSON array of tool names (for machine-readable discovery).
+    // This is intentionally dependency-free and uses qeeg::json_escape.
+    const char* nl = pretty ? "\n" : "";
+    const char* ind = pretty ? "  " : "";
+    std::cout << "[" << nl;
+    for (size_t i = 0; i < names.size(); ++i) {
+      if (i) std::cout << "," << (pretty ? "\n" : "");
+      std::cout << ind << "\"" << qeeg::json_escape(names[i]) << "\"";
+    }
+    std::cout << nl;
+    std::cout << "]\n";
     return 0;
   }
   if (first == "--install-shims") {
-    std::string dir;
-    bool force = false;
+    ShimArgs args;
+    std::string err;
+    if (!parse_shim_args(argc, argv, 2, args, err)) {
+      std::cerr << "qeeg_offline_app_cli: " << err << "\n";
+      return 2;
+    }
 
-    for (int i = 2; i < argc; ++i) {
-      const std::string a = argv[i];
-      if (a == "--force") {
-        force = true;
-      } else if (dir.empty()) {
-        dir = a;
-      } else {
-        std::cerr << "qeeg_offline_app_cli: unknown argument for --install-shims: " << a << "\n";
-        return 2;
-      }
+    std::vector<std::string> tool_names;
+    if (!select_tools(tools, args.tools, tool_names, err)) {
+      std::cerr << "qeeg_offline_app_cli: " << err << "\n";
+      return 2;
     }
 
     const auto self = resolve_self_path(argv[0]);
@@ -426,13 +904,42 @@ int main(int argc, char** argv) {
     }
 
     std::filesystem::path out_dir;
-    if (dir.empty()) {
+    if (args.dir.empty()) {
       out_dir = self.parent_path();
     } else {
-      out_dir = std::filesystem::u8path(dir);
+      out_dir = std::filesystem::u8path(args.dir);
     }
 
-    return install_shims(tools, self, out_dir, force);
+    return install_shims(self, out_dir, tool_names, args.force, args.dry_run);
+  }
+  if (first == "--uninstall-shims") {
+    ShimArgs args;
+    std::string err;
+    if (!parse_shim_args(argc, argv, 2, args, err)) {
+      std::cerr << "qeeg_offline_app_cli: " << err << "\n";
+      return 2;
+    }
+
+    std::vector<std::string> tool_names;
+    if (!select_tools(tools, args.tools, tool_names, err)) {
+      std::cerr << "qeeg_offline_app_cli: " << err << "\n";
+      return 2;
+    }
+
+    const auto self = resolve_self_path(argv[0]);
+    if (self.empty()) {
+      std::cerr << "qeeg_offline_app_cli: could not resolve self executable path.\n";
+      return 2;
+    }
+
+    std::filesystem::path out_dir;
+    if (args.dir.empty()) {
+      out_dir = self.parent_path();
+    } else {
+      out_dir = std::filesystem::u8path(args.dir);
+    }
+
+    return uninstall_shims(self, out_dir, tool_names, args.force, args.dry_run);
   }
 
   const std::string tool = strip_exe_suffix(first);

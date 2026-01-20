@@ -64,14 +64,32 @@ int main() {
   };
 
   const AnnotationEvent* e_start = find_event("Start");
-  assert(e_start);
-  assert(std::fabs(e_start->onset_sec - 0.5) < 1e-3);
-  assert(std::fabs(e_start->duration_sec - 0.0) < 1e-3);
+  if (!e_start) {
+    std::cerr << "Missing BDF+ annotation event: Start\n";
+    return 1;
+  }
+  if (std::fabs(e_start->onset_sec - 0.5) >= 1e-3) {
+    std::cerr << "BDF+ Start onset mismatch\n";
+    return 1;
+  }
+  if (std::fabs(e_start->duration_sec - 0.0) >= 1e-3) {
+    std::cerr << "BDF+ Start duration mismatch\n";
+    return 1;
+  }
 
   const AnnotationEvent* e_task = find_event("Task");
-  assert(e_task);
-  assert(std::fabs(e_task->onset_sec - 1.2) < 1e-3);
-  assert(std::fabs(e_task->duration_sec - 0.3) < 1e-3);
+  if (!e_task) {
+    std::cerr << "Missing BDF+ annotation event: Task\n";
+    return 1;
+  }
+  if (std::fabs(e_task->onset_sec - 1.2) >= 1e-3) {
+    std::cerr << "BDF+ Task onset mismatch\n";
+    return 1;
+  }
+  if (std::fabs(e_task->duration_sec - 0.3) >= 1e-3) {
+    std::cerr << "BDF+ Task duration mismatch\n";
+    return 1;
+  }
 
   float max_err = 0.0f;
   for (size_t ch = 0; ch < rec.data.size(); ++ch) {
@@ -79,7 +97,10 @@ int main() {
       const float e = std::fabs(rec2.data[ch][i] - rec.data[ch][i]);
       if (e > max_err) max_err = e;
       // 24-bit quantization should be very accurate.
-      assert(approx(rec2.data[ch][i], rec.data[ch][i], 0.01f));
+      if (!approx(rec2.data[ch][i], rec.data[ch][i], 0.01f)) {
+        std::cerr << "BDF round-trip sample mismatch (ch=" << ch << ", i=" << i << ")\n";
+        return 1;
+      }
     }
   }
 

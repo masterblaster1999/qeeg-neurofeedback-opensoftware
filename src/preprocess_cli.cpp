@@ -6,9 +6,11 @@
 #include "qeeg/line_noise.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
+#include "qeeg/cli_input.hpp"
 #include "qeeg/recording_ops.hpp"
 #include "qeeg/types.hpp"
 #include "qeeg/utils.hpp"
+#include "qeeg/run_meta.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -75,7 +77,7 @@ static void print_help() {
       << "Apply basic preprocessing (CAR, notch, bandpass) and export to EDF/EDF+, BDF/BDF+, BrainVision, or CSV.\n"
       << "Designed for interoperability with BioTrace+/NeXus exports and quick dataset hygiene.\n\n"
       << "Usage:\n"
-      << "  qeeg_preprocess_cli --input <in.edf|in.bdf|in.csv|in.txt> --output <out.edf|out.bdf|out.vhdr|out.csv> [options]\n\n"
+      << "  qeeg_preprocess_cli --input <file|dir|*_run_meta.json> --output <out.edf|out.bdf|out.vhdr|out.csv> [options]\n\n"
       << "Input formats:\n"
       << "  .edf/.edf+/.bdf/.bdf+   (recommended)\n"
       << "  .csv/.txt/.tsv/.asc     (ASCII exports; pass --fs if there is no time column)\n\n"
@@ -220,6 +222,12 @@ int main(int argc, char** argv) {
       throw std::runtime_error("Missing required arguments. Need --input and --output.");
     }
 
+    const ResolvedInputPath in = resolve_input_recording_path(args.input_path);
+    if (!in.note.empty()) {
+      std::cerr << in.note << "\n";
+    }
+    args.input_path = in.path;
+
     EEGRecording rec = read_recording_auto(args.input_path, args.fs_csv);
 
     if (!args.channel_map_path.empty()) {
@@ -324,6 +332,38 @@ int main(int argc, char** argv) {
 
     if (!args.events_out_csv.empty()) {
       std::cout << "Wrote events CSV: " << args.events_out_csv << "\n";
+    }
+
+    // Write run meta (enables CLI chaining: later tools can accept this run meta or outdir as --input).
+    try {
+      const std::filesystem::path out_path = std::filesystem::u8path(args.output_path);
+      const std::filesystem::path out_dir = out_path.parent_path();
+      const std::string outdir_str = out_dir.empty() ? std::string(".") : out_dir.u8string();
+
+      std::vector<std::string> outs;
+      outs.push_back(out_path.filename().u8string());
+      if (ends_with(to_lower(args.output_path), ".vhdr")) {
+        // BrainVisionWriter also emits .eeg and .vmrk next to the .vhdr.
+        const std::string stem = out_path.stem().u8string();
+        outs.push_back(stem + ".eeg");
+        outs.push_back(stem + ".vmrk");
+      }
+      if (!args.events_out_csv.empty()) {
+        const std::filesystem::path ev = std::filesystem::u8path(args.events_out_csv);
+        if (ev.parent_path() == out_dir) {
+          outs.push_back(ev.filename().u8string());
+        }
+      }
+
+      const std::string meta_name = "preprocess_run_meta.json";
+      const std::string meta_path = outdir_str + "/" + meta_name;
+      outs.push_back(meta_name);
+
+      if (!write_run_meta_json(meta_path, "qeeg_preprocess_cli", outdir_str, args.input_path, outs)) {
+        std::cerr << "Warning: failed to write run meta JSON: " << meta_path << "\n";
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "Warning: failed to write preprocess_run_meta.json: " << e.what() << "\n";
     }
 
     // Echo effective preprocessing summary.

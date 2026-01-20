@@ -4,6 +4,7 @@
 #include "qeeg/montage.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
+#include "qeeg/cli_input.hpp"
 #include "qeeg/topomap.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/welch_psd.hpp"
@@ -88,7 +89,8 @@ static void print_help() {
     << "  qeeg_map_cli --input file_with_time.csv --outdir out\n"
     << "  qeeg_map_cli --demo --fs 250 --seconds 10 --outdir out_demo\n\n"
     << "Options:\n"
-    << "  --input PATH            Input EDF or CSV\n"
+    << "  --input SPEC            Input recording (EDF/BDF/BrainVision .vhdr or CSV/ASCII)\n"
+    << "                         Also accepts a directory or *_run_meta.json for CLI chaining\n"
     << "  --fs HZ                 Sampling rate for CSV (optional if first column is time); required for --demo\n"
     << "  --outdir DIR            Output directory (default: out)\n"
     << "  --montage SPEC          'builtin:standard_1020_19' (default), 'builtin:standard_1010_61', or PATH to montage CSV\n"
@@ -771,6 +773,13 @@ int main(int argc, char** argv) {
         print_help();
         throw std::runtime_error("--input is required (or use --demo)");
       }
+
+      const ResolvedInputPath in = resolve_input_recording_path(args.input_path);
+      if (!in.note.empty()) {
+        std::cerr << in.note << "\n";
+      }
+      args.input_path = in.path;
+
       rec = read_recording_auto(args.input_path, args.fs_csv);
     }
 

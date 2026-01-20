@@ -264,6 +264,9 @@ int main(int argc, char** argv) {
     // If embed_help=true, the generator runs tools from u.bin_dir.
     // Using the bundle's bin/ directory keeps the final folder self-contained.
     u.bin_dir = out_bin.u8string();
+    // Also point the UI generator at the multicall runner so it can embed
+    // help output even when tool shims are disabled.
+    u.toolbox = offline_app_dst.u8string();
     u.embed_help = a.embed_help;
     u.scan_bin_dir = true;
     u.scan_run_meta = true;

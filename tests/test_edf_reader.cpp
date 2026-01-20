@@ -100,7 +100,10 @@ int main() {
 
     // Sanity check header size
     const auto pos = f.tellp();
-    assert(pos == header_bytes);
+    if (pos != std::streampos(header_bytes)) {
+      std::cerr << "EDF test fixture: header size mismatch (tellp vs header_bytes)\n";
+      return 1;
+    }
 
     // Data record
     const std::vector<int16_t> eeg = {-100, 0, 100, -200};
@@ -153,7 +156,10 @@ int main() {
 
     // The single GSR sample should be stretched to the target length.
     for (float v : rec.data[3]) {
-      assert(v == 7.0f);
+      if (v != 7.0f) {
+        std::cerr << "EDFReader: expected peripheral channel to be constant 7.0f\n";
+        return 1;
+      }
     }
   }
 

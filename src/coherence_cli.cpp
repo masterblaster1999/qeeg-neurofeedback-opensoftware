@@ -5,6 +5,7 @@
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/run_meta.hpp"
+#include "qeeg/cli_input.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -68,7 +69,8 @@ static void print_help() {
     << "  qeeg_coherence_cli --input file.bdf --outdir out --band alpha --pair F3:F4 --export-spectrum\n"
     << "  qeeg_coherence_cli --input file.csv --fs 250 --outdir out --band 8-12\n\n"
     << "Options:\n"
-    << "  --input PATH            Input EDF/BDF/CSV (CSV requires --fs)\n"
+    << "  --input SPEC            Input recording (EDF/BDF/CSV/TXT/TSV/ASC/BrainVision .vhdr)\n"
+    << "                         Also accepts a directory or *_run_meta.json for CLI chaining\n"
     << "  --fs HZ                 Sampling rate for CSV (optional if first column is time)\n"
     << "  --outdir DIR            Output directory (default: out_coherence)\n"
     << "  --bands SPEC            Band spec, e.g. 'alpha:8-12,beta:13-30' (default: built-in EEG bands)\n"
@@ -284,7 +286,13 @@ int main(int argc, char** argv) {
 
     ensure_directory(args.outdir);
 
-    EEGRecording rec = read_recording_auto(args.input_path, args.fs_csv);
+    const ResolvedInputPath in = resolve_input_recording_path(args.input_path);
+    if (!in.note.empty()) {
+      std::cerr << in.note << "\n";
+    }
+    const std::string input_path = in.path;
+
+    EEGRecording rec = read_recording_auto(input_path, args.fs_csv);
     if (rec.n_channels() < 2) throw std::runtime_error("Recording must have at least 2 channels");
     if (rec.fs_hz <= 0.0) throw std::runtime_error("Invalid sampling rate");
 
@@ -415,7 +423,7 @@ int main(int argc, char** argv) {
           outs.push_back(stem + "_timeseries.csv");
           outs.push_back(stem + "_timeseries.json");
         }
-        if (!write_run_meta_json(meta_path, "qeeg_coherence_cli", args.outdir, args.input_path, outs)) {
+        if (!write_run_meta_json(meta_path, "qeeg_coherence_cli", args.outdir, input_path, outs)) {
           std::cerr << "Warning: failed to write " << meta_path << "\n";
         }
       }
@@ -478,7 +486,7 @@ int main(int argc, char** argv) {
       outs.push_back("coherence_run_meta.json");
       outs.push_back(stem + "_matrix_" + to_lower(band.name) + ".csv");
       outs.push_back(stem + "_pairs.csv");
-      if (!write_run_meta_json(meta_path, "qeeg_coherence_cli", args.outdir, args.input_path, outs)) {
+      if (!write_run_meta_json(meta_path, "qeeg_coherence_cli", args.outdir, input_path, outs)) {
         std::cerr << "Warning: failed to write " << meta_path << "\n";
       }
     }

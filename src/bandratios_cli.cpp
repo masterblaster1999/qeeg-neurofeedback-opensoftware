@@ -1,4 +1,5 @@
 #include "qeeg/csv_io.hpp"
+#include "qeeg/cli_input.hpp"
 #include "qeeg/run_meta.hpp"
 #include "qeeg/utils.hpp"
 
@@ -47,9 +48,10 @@ static void print_help() {
       << "(as produced by qeeg_map_cli or qeeg_bandpower_cli).\n\n"
       << "Usage:\n"
       << "  qeeg_bandratios_cli --bandpowers out_bp/bandpowers.csv --outdir out_ratios --ratio theta/beta\n"
-      << "  qeeg_bandratios_cli --bandpowers out_bp/bandpowers.csv --outdir out_ratios --ratio tbr=theta/beta --log10 --tsv\n\n"
+      << "  qeeg_bandratios_cli --bandpowers out_bp --outdir out_ratios --ratio theta/beta\n"
+      << "  qeeg_bandratios_cli --input out_bp/bandpower_run_meta.json --outdir out_ratios --ratio tbr=theta/beta --log10 --tsv\n\n"
       << "Options:\n"
-      << "  --bandpowers PATH        Input bandpowers.csv (required). Alias: --input\n"
+      << "  --bandpowers SPEC        Input bandpowers table (CSV/TSV file, *_run_meta.json, or a directory containing bandpowers.*). Alias: --input\n"
       << "  --outdir DIR             Output directory (default: out_bandratios)\n"
       << "  --ratio SPEC             Ratio spec (repeatable).\n"
       << "                          Formats: NUM/DEN  or  NAME=NUM/DEN\n"
@@ -210,6 +212,17 @@ int main(int argc, char** argv) {
       print_help();
       throw std::runtime_error("--bandpowers is required");
     }
+
+    // Allow --bandpowers/--input to be either a file, a *_run_meta.json, or a directory
+    // containing a bandpowers table (for easy CLI chaining).
+    ResolveInputTableOptions opt;
+    opt.preferred_filenames = {"bandpowers.csv", "bandpowers.tsv"};
+    opt.preferred_contains = {"bandpower", "bandpowers"};
+    const ResolvedInputPath resolved = resolve_input_table_path(args.bandpowers_path, opt);
+    if (!resolved.note.empty()) {
+      std::cerr << resolved.note << "\n";
+    }
+    const std::string bandpowers_path = resolved.path;
     if (args.eps <= 0.0) {
       throw std::runtime_error("--eps must be > 0");
     }
@@ -240,17 +253,17 @@ int main(int argc, char** argv) {
 
     ensure_directory(args.outdir);
 
-    std::ifstream in(std::filesystem::u8path(args.bandpowers_path), std::ios::binary);
-    if (!in) throw std::runtime_error("Failed to open bandpowers CSV: " + args.bandpowers_path);
+    std::ifstream in(std::filesystem::u8path(bandpowers_path), std::ios::binary);
+    if (!in) throw std::runtime_error("Failed to open bandpowers CSV: " + bandpowers_path);
 
     std::string header_line;
     if (!std::getline(in, header_line)) {
-      throw std::runtime_error("Empty bandpowers CSV: " + args.bandpowers_path);
+      throw std::runtime_error("Empty bandpowers CSV: " + bandpowers_path);
     }
     if (!header_line.empty() && header_line.back() == '\r') header_line.pop_back();
     const std::vector<std::string> header_raw = split_csv_row(header_line, ',');
     if (header_raw.empty()) {
-      throw std::runtime_error("Failed to parse header row in: " + args.bandpowers_path);
+      throw std::runtime_error("Failed to parse header row in: " + bandpowers_path);
     }
 
     std::vector<std::string> header;
@@ -354,7 +367,7 @@ int main(int argc, char** argv) {
     {
       const std::string meta_path = args.outdir + "/bandratios_run_meta.json";
       outs.push_back("bandratios_run_meta.json");
-      if (!write_run_meta_json(meta_path, "qeeg_bandratios_cli", args.outdir, args.bandpowers_path, outs)) {
+      if (!write_run_meta_json(meta_path, "qeeg_bandratios_cli", args.outdir, bandpowers_path, outs)) {
         std::cerr << "Warning: failed to write run meta JSON: " << meta_path << "\n";
       }
     }

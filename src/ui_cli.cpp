@@ -12,6 +12,7 @@ struct Args {
   std::string root;
   std::string output_html;
   std::string bin_dir;
+  std::string toolbox; // optional multicall runner (e.g., qeeg_offline_app_cli)
   std::string title{"QEEG Tools UI"};
 
   bool embed_help{true};
@@ -26,11 +27,13 @@ static void print_help() {
     << "Generate a self-contained HTML dashboard that integrates all qeeg_*_cli executables\n"
     << "into one navigable UI (tool list + optional embedded --help + optional run-manifest scan).\n\n"
     << "Usage:\n"
-    << "  qeeg_ui_cli --root <dir> [--output qeeg_ui.html] [--bin-dir <build/bin>] [--no-help] [--no-bin-scan]\n\n"
+    << "  qeeg_ui_cli --root <dir> [--output qeeg_ui.html] [--bin-dir <build/bin>] [--toolbox <exe>] [--no-help] [--no-bin-scan]\n\n"
     << "Options:\n"
     << "  --root DIR          Root directory to scan for *_run_meta.json and use as link base (required).\n"
     << "  --output PATH       Output HTML path (default: <root>/qeeg_ui.html).\n"
     << "  --bin-dir DIR       Directory containing executables (used for embedding --help).\n"
+    << "  --toolbox EXE       Optional multicall toolbox runner (e.g., qeeg_offline_app_cli).\n"
+    << "                    Used to embed per-tool --help even when per-tool executables are not present.\n"
     << "  --no-help           Do not embed tool --help outputs (faster / no exe lookup).\n"
     << "  --no-bin-scan       Do not auto-discover tools by scanning --bin-dir for qeeg_*_cli executables.\n"
     << "  --no-scan           Do not scan for *_run_meta.json outputs.\n"
@@ -79,6 +82,8 @@ static Args parse_args(int argc, char** argv) {
       a.output_html = argv[++i];
     } else if (arg == "--bin-dir" && i + 1 < argc) {
       a.bin_dir = argv[++i];
+    } else if (arg == "--toolbox" && i + 1 < argc) {
+      a.toolbox = argv[++i];
     } else if (arg == "--no-help") {
       a.embed_help = false;
     } else if (arg == "--no-bin-scan") {
@@ -121,6 +126,7 @@ int main(int argc, char** argv) {
     u.root = a.root;
     u.output_html = a.output_html;
     u.bin_dir = a.bin_dir;
+    u.toolbox = a.toolbox;
     u.embed_help = a.embed_help;
     u.scan_bin_dir = a.scan_bin_dir;
     u.scan_run_meta = a.scan_run_meta;

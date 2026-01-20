@@ -3,6 +3,7 @@
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/run_meta.hpp"
+#include "qeeg/cli_input.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/welch_psd.hpp"
 
@@ -70,7 +71,8 @@ static void print_help() {
       << "  qeeg_bandpower_cli --input file.edf --outdir out_bp --relative --log10\n"
       << "  qeeg_bandpower_cli --input file.edf --outdir out_bp --timeseries --window 2.0 --update 0.25\n\n"
       << "Options:\n"
-      << "  --input PATH            Input EDF/BDF/CSV/ASCII/BrainVision (.vhdr)\n"
+      << "  --input SPEC            Input recording (EDF/BDF/CSV/TXT/TSV/ASC/BrainVision .vhdr)\n"
+      << "                         Also accepts a directory or *_run_meta.json for CLI chaining\n"
       << "  --fs HZ                 Sampling rate hint for CSV (0 = infer from time column)\n"
       << "  --outdir DIR            Output directory (default: out_bandpower)\n"
       << "  --bands SPEC            Band spec, e.g. 'delta:0.5-4,theta:4-7,alpha:8-12'\n"
@@ -366,7 +368,13 @@ int main(int argc, char** argv) {
 
     ensure_directory(args.outdir);
 
-    EEGRecording rec = read_recording_auto(args.input_path, args.fs_csv);
+    const ResolvedInputPath in = resolve_input_recording_path(args.input_path);
+    if (!in.note.empty()) {
+      std::cerr << in.note << "\n";
+    }
+    const std::string input_path = in.path;
+
+    EEGRecording rec = read_recording_auto(input_path, args.fs_csv);
 
     // Preprocess (offline, in-place)
     PreprocessOptions popt;
@@ -582,7 +590,7 @@ int main(int argc, char** argv) {
     {
       const std::string meta_path = args.outdir + "/bandpower_run_meta.json";
       outs.push_back("bandpower_run_meta.json");
-      if (!write_run_meta_json(meta_path, "qeeg_bandpower_cli", args.outdir, args.input_path, outs)) {
+      if (!write_run_meta_json(meta_path, "qeeg_bandpower_cli", args.outdir, input_path, outs)) {
         std::cerr << "Warning: failed to write run meta JSON: " << meta_path << "\n";
       }
     }

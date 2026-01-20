@@ -118,7 +118,12 @@ class AdaptiveThresholdController {
 
     while (!hist_.empty()) {
       const double age = t_end_sec - hist_.front().first;
-      if (std::isfinite(age) && age > cfg_.quantile_window_seconds) {
+      // Keep samples strictly within the rolling window.
+      //
+      // If age == window_seconds, the sample is exactly on the boundary and is
+      // considered out-of-window (dropped). This yields the intuitive behavior
+      // that a window of N seconds contains samples with age in [0, N).
+      if (std::isfinite(age) && age >= cfg_.quantile_window_seconds) {
         hist_.pop_front();
         continue;
       }

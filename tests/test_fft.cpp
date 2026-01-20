@@ -1,9 +1,24 @@
 #include "qeeg/fft.hpp"
 
-#include <cassert>
 #include <complex>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
+
+// NOTE:
+//   We intentionally avoid <cassert>'s assert() for test conditions. Many
+//   builds (including CMake Release) compile with -DNDEBUG, which compiles
+//   assert() away entirely. That can lead to tests that do nothing in Release
+//   *and* to "unused variable" warnings that become hard errors under
+//   -Werror.
+static void test_check(bool cond, const char* expr, const char* file, int line) {
+  if (!cond) {
+    std::cerr << "Test failure: " << expr << " (" << file << ":" << line << ")\n";
+    std::exit(1);
+  }
+}
+
+#define TEST_CHECK(expr) test_check(static_cast<bool>(expr), #expr, __FILE__, __LINE__)
 
 static bool approx(double a, double b, double eps=1e-9) {
   return (a > b ? a - b : b - a) <= eps;
@@ -22,15 +37,15 @@ int main() {
 
     fft_inplace(a, false);
     for (auto& x : a) {
-      assert(approx(x.real(), 1.0, 1e-9));
-      assert(approx(x.imag(), 0.0, 1e-9));
+      TEST_CHECK(approx(x.real(), 1.0, 1e-9));
+      TEST_CHECK(approx(x.imag(), 0.0, 1e-9));
     }
 
     fft_inplace(a, true);
-    assert(approx(a[0].real(), 1.0, 1e-9));
-    assert(approx(a[1].real(), 0.0, 1e-9));
-    assert(approx(a[2].real(), 0.0, 1e-9));
-    assert(approx(a[3].real(), 0.0, 1e-9));
+    TEST_CHECK(approx(a[0].real(), 1.0, 1e-9));
+    TEST_CHECK(approx(a[1].real(), 0.0, 1e-9));
+    TEST_CHECK(approx(a[2].real(), 0.0, 1e-9));
+    TEST_CHECK(approx(a[3].real(), 0.0, 1e-9));
   }
 
   // FFT round-trip on random vector
@@ -43,8 +58,8 @@ int main() {
     fft_inplace(a, true);
 
     for (size_t i = 0; i < a.size(); ++i) {
-      assert(approx(a[i].real(), orig[i].real(), 1e-7));
-      assert(approx(a[i].imag(), orig[i].imag(), 1e-7));
+      TEST_CHECK(approx(a[i].real(), orig[i].real(), 1e-7));
+      TEST_CHECK(approx(a[i].imag(), orig[i].imag(), 1e-7));
     }
   }
 

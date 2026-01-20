@@ -21,6 +21,47 @@ struct WindowRaw {
   std::vector<double> kurt;
 };
 
+// Artifact detection needs a robust scale estimate, but the generic robust_scale()
+// helper intentionally falls back to 1.0 for constant-ish data (see tests).
+//
+// For dropout / flatline detection we *want* constant baselines to still yield a
+// meaningful (small) scale so that a near-zero window becomes a strong negative
+// z-score and can be caught by ptp_z_low / rms_z_low.
+static double robust_scale_for_artifacts(const std::vector<double>& values, double med) {
+  if (values.empty()) return 1.0;
+
+  // MAD-based scale (Gaussian-consistent).
+  std::vector<double> absdev;
+  absdev.reserve(values.size());
+  for (double x : values) absdev.push_back(std::fabs(x - med));
+  const double mad = median_inplace(&absdev);
+  double scale = mad * 1.4826;
+
+  // If MAD is ~0, fall back to sample stddev.
+  if (!(scale > 1e-12) && values.size() >= 2) {
+    double sum = 0.0;
+    for (double x : values) sum += x;
+    const double mean = sum / static_cast<double>(values.size());
+    double acc = 0.0;
+    for (double x : values) {
+      const double d = x - mean;
+      acc += d * d;
+    }
+    const double var = acc / static_cast<double>(values.size() - 1);
+    scale = std::sqrt(std::max(0.0, var));
+  }
+
+  // Still constant-ish: choose a small scale relative to the baseline median.
+  // This makes dropouts (values near 0) detectable via negative z-scores.
+  if (!(scale > 1e-12)) {
+    const double rel = 0.05 * std::fabs(med); // 5% of baseline level
+    if (rel > 1e-12) scale = rel;
+  }
+
+  if (!(scale > 1e-12)) scale = 1.0;
+  return scale;
+}
+
 } // namespace
 
 ArtifactDetectionResult detect_artifacts(const EEGRecording& rec, const ArtifactDetectionOptions& opt) {
@@ -145,17 +186,17 @@ ArtifactDetectionResult detect_artifacts(const EEGRecording& rec, const Artifact
     tmp = base_ptp[ch];
     const double ptp_med = median_inplace(&tmp);
     out.baseline_stats[ch].ptp_median = ptp_med;
-    out.baseline_stats[ch].ptp_scale = robust_scale(base_ptp[ch], ptp_med);
+    out.baseline_stats[ch].ptp_scale = robust_scale_for_artifacts(base_ptp[ch], ptp_med);
 
     tmp = base_rms[ch];
     const double rms_med = median_inplace(&tmp);
     out.baseline_stats[ch].rms_median = rms_med;
-    out.baseline_stats[ch].rms_scale = robust_scale(base_rms[ch], rms_med);
+    out.baseline_stats[ch].rms_scale = robust_scale_for_artifacts(base_rms[ch], rms_med);
 
     tmp = base_kurt[ch];
     const double k_med = median_inplace(&tmp);
     out.baseline_stats[ch].kurtosis_median = k_med;
-    out.baseline_stats[ch].kurtosis_scale = robust_scale(base_kurt[ch], k_med);
+    out.baseline_stats[ch].kurtosis_scale = robust_scale_for_artifacts(base_kurt[ch], k_med);
   }
 
   // Second pass: compute z-scores and flags.

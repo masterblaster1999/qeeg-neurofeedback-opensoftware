@@ -40,6 +40,7 @@
   #include <sys/socket.h>
   #include <sys/types.h>
   #include <sys/wait.h>
+  #include <signal.h>
   #include <unistd.h>
 #endif
 
@@ -85,7 +86,7 @@ static void print_help() {
     << "  --bin-dir DIR       Directory containing qeeg_*_cli executables (default: directory containing this executable).\n"
     << "  --toolbox EXE       Optional multicall runner (e.g., qeeg_offline_app_cli). Used when a per-tool exe is not present in --bin-dir.\n"
     << "  --host HOST         Bind address (default: 127.0.0.1).\n"
-    << "  --port N            Port to listen on (default: 8765).\n"
+    << "  --port N            Port to listen on (default: 8765; use 0 for an auto-selected free port).\n"
     << "  --max-parallel N    Max concurrent jobs; extra runs are queued (default: 0 = unlimited).\n"
     << "  --api-token TOKEN   Override the random API token (advanced; useful for curl).\n"
     << "  --no-help           Generate UI without embedding --help outputs.\n"
@@ -129,6 +130,9 @@ static Args parse_args(int argc, char** argv) {
       a.host = argv[++i];
     } else if (arg == "--port" && i + 1 < argc) {
       a.port = qeeg::to_int(argv[++i]);
+      if (a.port < 0 || a.port > 65535) {
+        throw std::runtime_error("--port out of range (0-65535): " + std::to_string(a.port));
+      }
     } else if (arg == "--max-parallel" && i + 1 < argc) {
       a.max_parallel = qeeg::to_int(argv[++i]);
     } else if (arg == "--api-token" && i + 1 < argc) {
@@ -994,7 +998,7 @@ static bool zip_finalize_store(std::string* zip,
 
   return true;
 }
-static std::filesystem::path canonicalize_best_effort(const std::filesystem::path& p, bool is_dashboard = false) {
+static std::filesystem::path canonicalize_best_effort(const std::filesystem::path& p) {
   std::error_code ec;
   std::filesystem::path c = std::filesystem::canonical(p, ec);
   if (!ec) return c;
@@ -1112,9 +1116,7 @@ static int json_find_int_value(const std::string& s, const std::string& key, int
   while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i])) != 0) ++i;
   if (i >= s.size()) return default_value;
 
-  bool quoted = false;
   if (s[i] == '"') {
-    quoted = true;
     ++i;
   }
 
@@ -1302,6 +1304,7 @@ class UiServer {
   void set_port(int p) { port_ = p; }
   void set_api_token(std::string t) { api_token_ = std::move(t); }
   void set_max_parallel(int n) { max_parallel_ = (n < 0) ? 0 : n; }
+  void set_open_after(bool b) { open_after_ = b; }
 
   void run() {
 #ifdef _WIN32
@@ -1311,7 +1314,7 @@ class UiServer {
 #endif
 
     const std::string host = host_;
-    const int port = port_;
+    const int requested_port = port_;
 
     // Create socket.
 #ifdef _WIN32
@@ -1328,24 +1331,77 @@ class UiServer {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_port = htons(static_cast<uint16_t>(requested_port));
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
       socket_close(srv);
       throw std::runtime_error("Invalid host address: " + host);
     }
 
     if (bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+#ifdef _WIN32
+      const int err = WSAGetLastError();
+#else
+      const int err = errno;
+#endif
       socket_close(srv);
-      throw std::runtime_error("bind() failed (is the port in use?)");
+      std::ostringstream oss;
+      oss << "bind() failed on " << host << ":" << requested_port;
+#ifdef _WIN32
+      if (err == WSAEADDRINUSE) {
+        oss << " (address already in use)";
+      } else {
+        oss << " (winsock error " << err << ")";
+      }
+#else
+      if (err == EADDRINUSE) {
+        oss << " (address already in use)";
+      } else {
+        oss << " (errno " << err << ")";
+      }
+#endif
+      if (requested_port != 0) {
+        oss << "; try --port 0 to auto-select a free port";
+      }
+      throw std::runtime_error(oss.str());
     }
     if (listen(srv, 16) != 0) {
       socket_close(srv);
       throw std::runtime_error("listen() failed");
     }
 
+    // Determine the actual bound port (important when requested_port == 0).
+    {
+      sockaddr_in bound{};
+#ifdef _WIN32
+      int blen = sizeof(bound);
+      if (getsockname(srv, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
+        port_ = static_cast<int>(ntohs(bound.sin_port));
+      }
+#else
+      socklen_t blen = sizeof(bound);
+      if (::getsockname(srv, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
+        port_ = static_cast<int>(ntohs(bound.sin_port));
+      }
+#endif
+    }
+    const int port = port_;
+
     std::cout << "Serving: http://" << host << ":" << port << "/\n";
     std::cout << "Root: " << root_.u8string() << "\n";
     std::cout << "Bin:  " << bin_dir_.u8string() << "\n";
+
+    if (!api_token_.empty()) {
+      std::cout << "API token (required for /api/* except /api/status): " << api_token_ << "\n";
+      std::cout << "Example curl: curl -H 'X-QEEG-Token: " << api_token_ << "' "
+                << "http://" << host << ':' << port << "/api/runs\n";
+    }
+
+    if (open_after_) {
+      std::string open_host = host;
+      if (open_host == "0.0.0.0") open_host = "127.0.0.1";
+      const std::string url = std::string("http://") + open_host + ":" + std::to_string(port) + "/";
+      try_open_browser_url(url);
+    }
 
     for (;;) {
       bool is_loopback = false;
@@ -1906,7 +1962,7 @@ class UiServer {
     // IMPORTANT: Windows processes receive a *single* command line string and most C/C++
     // runtimes (including MSVC's) apply special parsing rules for backslashes immediately
     // preceding double quotes. If we naively concatenate raw strings, paths like:
-    //   C:\path with space\
+    //   C:\path with space\ (trailing backslash)
     // can be mis-parsed (trailing backslash escapes the closing quote).
     //
     // To make behavior consistent with the POSIX fork/exec path, we:
@@ -2002,6 +2058,9 @@ class UiServer {
       return false;
     }
     if (pid == 0) {
+      // Put the job into its own process group so /api/kill can terminate the whole tree.
+      (void)setpgid(0, 0);
+
       // Child: redirect stdout/stderr to log file.
       FILE* f = std::fopen(log_path.u8string().c_str(), "wb");
       if (f) {
@@ -2020,6 +2079,9 @@ class UiServer {
     }
 
     // Parent.
+    // Best effort: ensure the child becomes a process group leader (for kill(-pid)).
+    (void)setpgid(pid, pid);
+
     job->pid = pid;
     return true;
 #endif
@@ -4199,6 +4261,13 @@ class UiServer {
       send_json(c, 404, "{\"error\":\"job not found\"}");
       return;
     }
+    if (j->status == "queued") {
+      j->status = "canceled";
+      j->exit_code = 130;
+      finalize_ui_run_meta(j);
+      send_json(c, 200, "{\"ok\":true,\"status\":\"canceled\"}");
+      return;
+    }
     if (j->status != "running" && j->status != "stopping") {
       std::ostringstream oss;
       oss << "{\"ok\":true,\"status\":\"" << qeeg::json_escape(j->status) << "\"}";
@@ -4209,12 +4278,55 @@ class UiServer {
       send_json(c, 500, "{\"error\":\"no pid\"}");
       return;
     }
-    if (kill(j->pid, SIGTERM) != 0) {
-      send_json(c, 500, "{\"error\":\"kill failed\"}");
+
+    // Escalation behavior:
+    // - First request: send SIGTERM and mark job "stopping".
+    // - Second request (while still "stopping"): send SIGKILL.
+    int sig = SIGTERM;
+    const char* sig_name = "SIGTERM";
+    if (j->status == "stopping") {
+      sig = SIGKILL;
+      sig_name = "SIGKILL";
+    }
+
+    // Prefer signaling the job's process group (best effort) so that child processes
+    // spawned by the tool are also terminated.
+    const pid_t pid = j->pid;
+    int rc = -1;
+
+    // If pid is a plausible process id, try process-group kill first.
+    if (pid > 1) {
+      rc = kill(-pid, sig);
+      if (rc != 0 && errno == ESRCH) {
+        // If the group doesn't exist (e.g., older jobs not started in their own group),
+        // fall back to the single pid.
+        rc = kill(pid, sig);
+      }
+    } else {
+      rc = kill(pid, sig);
+    }
+
+    if (rc != 0) {
+      const int err = errno;
+      if (err == ESRCH) {
+        // Race: the process exited after our status refresh. Treat as success.
+        update_jobs();
+        std::ostringstream oss;
+        oss << "{\"ok\":true,\"status\":\"" << qeeg::json_escape(j->status) << "\"}";
+        send_json(c, 200, oss.str());
+        return;
+      }
+      std::ostringstream oss;
+      oss << "{\"error\":\"kill failed\",\"errno\":" << err << "}";
+      send_json(c, 500, oss.str());
       return;
     }
     j->status = "stopping";
-    send_json(c, 200, "{\"ok\":true,\"status\":\"stopping\"}");
+    {
+      std::ostringstream oss;
+      oss << "{\"ok\":true,\"status\":\"stopping\",\"signal\":\"" << sig_name << "\"}";
+      send_json(c, 200, oss.str());
+    }
 #endif
   }
 
@@ -4829,6 +4941,7 @@ class UiServer {
   int port_{8765};
   int max_parallel_{0};
   std::string api_token_;
+  bool open_after_{false};
 
   struct HelpEntry {
     std::string text;
@@ -4900,6 +5013,11 @@ int main(int argc, char** argv) {
       u.root = a.root;
       u.output_html = ui_html.u8string();
       u.bin_dir = a.bin_dir;
+      if (!toolbox_exe.empty()) {
+        // Allow the dashboard generator to embed help output using the
+        // multicall toolbox runner when per-tool exes are not present.
+        u.toolbox = toolbox_exe.u8string();
+      }
       u.embed_help = a.embed_help;
       u.scan_bin_dir = a.scan_bin_dir;
       u.scan_run_meta = a.scan_run_meta;
@@ -4922,14 +5040,7 @@ int main(int argc, char** argv) {
     const std::string token = a.api_token.empty() ? random_hex_token(16) : a.api_token;
     s.set_api_token(token);
 
-    std::cout << "API token (required for /api/* except /api/status): " << token << "\n";
-    std::cout << "Example curl: curl -H 'X-QEEG-Token: " << token << "' "
-              << "http://" << a.host << ':' << a.port << "/api/runs\n";
-
-    const std::string url = std::string("http://") + a.host + ":" + std::to_string(a.port) + "/";
-    if (a.open_after) {
-      try_open_browser_url(url);
-    }
+    s.set_open_after(a.open_after);
 
     s.run();
     return 0;

@@ -989,6 +989,14 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
   out << "  </script>\n";
 
   // JS: render + basic playback.
+  //
+  // NOTE: This script is intentionally written as multiple raw-string literal chunks.
+  // MSVC emits error C2026 ("string too big, trailing characters truncated") if a
+  // single string literal grows beyond its internal limit.
+  //
+  // This file used to be compiled into multiple targets (standalone cli + offline toolbox),
+  // so keeping the JS split into smaller chunks prevents MSVC C2026 regressions if the
+  // embedded UI grows in the future.
   out << R"JS(
   <script>
   const data = JSON.parse(document.getElementById('nfData').textContent);
@@ -1175,6 +1183,9 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
 
   buildSegmentList();
   buildEventList();
+)JS";
+
+  out << R"JS(
 
   let evPtr = 0;
   function currentEventLabel(t) {
@@ -1377,6 +1388,10 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
       ctx.lineWidth = 1;
       ctx.strokeRect(x0, y1 - segH, x1 - x0, segH);
     }
+
+)JS";
+
+  out << R"JS(
 
     // Event markers
     if (pointEventsSorted.length > 0) {
@@ -2200,7 +2215,7 @@ static size_t sec_to_samples(double sec, double fs_hz) {
   return static_cast<size_t>(std::llround(sec * fs_hz));
 }
 
-int main(int argc, char** argv) {
+int qeeg_nf_cli_run(int argc, char** argv) {
   try {
     Args args = parse_args(argc, argv);
 

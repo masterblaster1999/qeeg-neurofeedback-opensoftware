@@ -26,6 +26,16 @@ struct Args {
   BidsEntities ent;
 
   std::string map_outdir;
+
+  // Outputs from qeeg_topomap_cli (topomap_*.bmp, topomap_report.html, ...).
+  std::string topomap_outdir;
+
+  // Outputs from qeeg_region_summary_cli (region_summary.csv, region_report.html, ...).
+  std::string region_summary_outdir;
+
+  // Outputs from qeeg_connectivity_map_cli (connectivity_map.svg, connectivity_report.html, ...).
+  std::string connectivity_map_outdir;
+
   // Outputs from qeeg_bandpower_cli (bandpowers.csv + JSON sidecar)
   std::string bandpower_outdir;
 
@@ -67,6 +77,9 @@ static void print_help() {
       << "Copy qeeg tool outputs into a BIDS Derivatives folder layout.\n\n"
       << "This tool is designed to integrate outputs from:\n"
       << "  - qeeg_map_cli (bandpowers.csv, topomaps, report.html, ...)\n"
+      << "  - qeeg_topomap_cli (topomap_*.bmp, topomap_report.html, ...)\n"
+      << "  - qeeg_region_summary_cli (region_summary.csv, region_report.html, ...)\n"
+      << "  - qeeg_connectivity_map_cli (connectivity_map.svg, connectivity_report.html, ...)\n"
       << "  - qeeg_bandpower_cli (bandpowers.csv, bandpowers.json, ...)\n"
       << "  - qeeg_bandratios_cli (bandratios.csv, bandratios.json, ...)\n"
       << "  - qeeg_spectral_features_cli (spectral_features.csv, spectral_features.json, ...)\n"
@@ -99,6 +112,9 @@ static void print_help() {
       << "  --run <index>               Run index label (alphanumeric; typically digits).\n\n"
       << "Inputs (tool output folders):\n"
       << "  --map-outdir <dir>          Output folder from qeeg_map_cli.\n"
+      << "  --topomap-outdir <dir>      Output folder from qeeg_topomap_cli.\n"
+      << "  --region-summary-outdir <dir> Output folder from qeeg_region_summary_cli.\n"
+      << "  --connectivity-map-outdir <dir> Output folder from qeeg_connectivity_map_cli.\n"
       << "  --bandpower-outdir <dir>    Output folder from qeeg_bandpower_cli.\n"
       << "  --bandratios-outdir <dir>   Output folder from qeeg_bandratios_cli.\n"
       << "  --spectral-features-outdir <dir> Output folder from qeeg_spectral_features_cli.\n"
@@ -226,7 +242,7 @@ static void write_readme_if_missing(const std::filesystem::path& dir,
   f << "# " << pipeline << " derivatives\n\n";
   f << "This folder contains derivative outputs produced by the qeeg-neurofeedback-opensoftware toolkit.\n\n";
   f << "Common contents (per recording):\n";
-  f << "- qEEG map outputs (bandpowers, PSD exports, topomaps, HTML report)\n";
+  f << "- qEEG brain mapping outputs (bandpowers, PSD exports, topomaps, connectivity maps, region summaries, HTML reports)\n";
   f << "- Spectral summary tables (entropy, edge frequency, peak frequency)\n";
   f << "- Channel quality control summaries\n";
   f << "- Individual Alpha Frequency (IAF) estimates and derived band specs\n";
@@ -269,6 +285,12 @@ int main(int argc, char** argv) {
         args.ent.run = require_value(i, argc, argv, a);
       } else if (a == "--map-outdir") {
         args.map_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--topomap-outdir") {
+        args.topomap_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--region-summary-outdir") {
+        args.region_summary_outdir = require_value(i, argc, argv, a);
+      } else if (a == "--connectivity-map-outdir") {
+        args.connectivity_map_outdir = require_value(i, argc, argv, a);
       } else if (a == "--bandpower-outdir") {
         args.bandpower_outdir = require_value(i, argc, argv, a);
       } else if (a == "--bandratios-outdir") {
@@ -446,6 +468,67 @@ int main(int argc, char** argv) {
         convert_csv_file_to_tsv((map / "psd.csv").u8string(), dst.u8string());
       }
 
+    }
+
+    // --- Copy standalone topomap outputs (qeeg_topomap_cli) ---
+    if (!args.topomap_outdir.empty()) {
+      const std::filesystem::path topo = std::filesystem::u8path(args.topomap_outdir);
+      if (!std::filesystem::exists(topo) || !std::filesystem::is_directory(topo)) {
+        throw std::runtime_error("--topomap-outdir is not a directory: " + topo.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(topo, "topomap_run_meta.json", eeg_dir, stem, "qeegtopo", args.overwrite);
+      if (!used_meta) {
+        copy_if_exists(topo / "topomap_report.html", eeg_dir / (stem + "_desc-qeegtopo_topomap_report.html"), args.overwrite);
+        copy_if_exists(topo / "topomap_run_meta.json", eeg_dir / (stem + "_desc-qeegtopo_topomap_run_meta.json"), args.overwrite);
+        for (const auto& p : list_matching_files(topo, "topomap_", ".bmp")) {
+          const std::string fname = p.filename().u8string();
+          copy_file_or_throw(p, eeg_dir / (stem + "_desc-qeegtopo_" + fname), args.overwrite);
+        }
+      }
+    }
+
+    // --- Copy region summaries (qeeg_region_summary_cli) ---
+    if (!args.region_summary_outdir.empty()) {
+      const std::filesystem::path reg = std::filesystem::u8path(args.region_summary_outdir);
+      if (!std::filesystem::exists(reg) || !std::filesystem::is_directory(reg)) {
+        throw std::runtime_error("--region-summary-outdir is not a directory: " + reg.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(reg, "region_summary_run_meta.json", eeg_dir, stem, "qeegregion", args.overwrite);
+      if (!used_meta) {
+        copy_if_exists(reg / "region_summary.csv", eeg_dir / (stem + "_desc-qeegregion_region_summary.csv"), args.overwrite);
+        copy_if_exists(reg / "region_summary_long.csv", eeg_dir / (stem + "_desc-qeegregion_region_summary_long.csv"), args.overwrite);
+        copy_if_exists(reg / "region_report.html", eeg_dir / (stem + "_desc-qeegregion_region_report.html"), args.overwrite);
+        copy_if_exists(reg / "region_summary_run_meta.json", eeg_dir / (stem + "_desc-qeegregion_region_summary_run_meta.json"), args.overwrite);
+      }
+
+      // BIDS-friendly TSV aliases.
+      if (std::filesystem::exists(reg / "region_summary.csv")) {
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegregion_region_summary.tsv");
+        ensure_writable(dst, args.overwrite);
+        convert_csv_file_to_tsv((reg / "region_summary.csv").u8string(), dst.u8string());
+      }
+      if (std::filesystem::exists(reg / "region_summary_long.csv")) {
+        const std::filesystem::path dst = eeg_dir / (stem + "_desc-qeegregion_region_summary_long.tsv");
+        ensure_writable(dst, args.overwrite);
+        convert_csv_file_to_tsv((reg / "region_summary_long.csv").u8string(), dst.u8string());
+      }
+    }
+
+    // --- Copy connectivity map visuals (qeeg_connectivity_map_cli) ---
+    if (!args.connectivity_map_outdir.empty()) {
+      const std::filesystem::path conn = std::filesystem::u8path(args.connectivity_map_outdir);
+      if (!std::filesystem::exists(conn) || !std::filesystem::is_directory(conn)) {
+        throw std::runtime_error("--connectivity-map-outdir is not a directory: " + conn.u8string());
+      }
+
+      const bool used_meta = copy_from_run_meta(conn, "connectivity_run_meta.json", eeg_dir, stem, "qeegconnmap", args.overwrite);
+      if (!used_meta) {
+        copy_if_exists(conn / "connectivity_map.svg", eeg_dir / (stem + "_desc-qeegconnmap_connectivity_map.svg"), args.overwrite);
+        copy_if_exists(conn / "connectivity_report.html", eeg_dir / (stem + "_desc-qeegconnmap_connectivity_report.html"), args.overwrite);
+        copy_if_exists(conn / "connectivity_run_meta.json", eeg_dir / (stem + "_desc-qeegconnmap_connectivity_run_meta.json"), args.overwrite);
+      }
     }
 
     // --- Copy bandpower-only outputs (qeeg_bandpower_cli) ---

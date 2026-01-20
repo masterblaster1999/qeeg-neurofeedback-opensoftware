@@ -64,21 +64,42 @@ int main() {
   };
 
   const AnnotationEvent* e_start = find_event("Start");
-  assert(e_start);
-  assert(std::fabs(e_start->onset_sec - 0.5) < 1e-3);
-  assert(std::fabs(e_start->duration_sec - 0.0) < 1e-3);
+  if (!e_start) {
+    std::cerr << "Missing EDF+ annotation event: Start\n";
+    return 1;
+  }
+  if (std::fabs(e_start->onset_sec - 0.5) >= 1e-3) {
+    std::cerr << "EDF+ Start onset mismatch\n";
+    return 1;
+  }
+  if (std::fabs(e_start->duration_sec - 0.0) >= 1e-3) {
+    std::cerr << "EDF+ Start duration mismatch\n";
+    return 1;
+  }
 
   const AnnotationEvent* e_task = find_event("Task");
-  assert(e_task);
-  assert(std::fabs(e_task->onset_sec - 1.2) < 1e-3);
-  assert(std::fabs(e_task->duration_sec - 0.3) < 1e-3);
+  if (!e_task) {
+    std::cerr << "Missing EDF+ annotation event: Task\n";
+    return 1;
+  }
+  if (std::fabs(e_task->onset_sec - 1.2) >= 1e-3) {
+    std::cerr << "EDF+ Task onset mismatch\n";
+    return 1;
+  }
+  if (std::fabs(e_task->duration_sec - 0.3) >= 1e-3) {
+    std::cerr << "EDF+ Task duration mismatch\n";
+    return 1;
+  }
 
   float max_err = 0.0f;
   for (size_t ch = 0; ch < rec.data.size(); ++ch) {
     for (size_t i = 0; i < n; ++i) {
       const float e = std::fabs(rec2.data[ch][i] - rec.data[ch][i]);
       if (e > max_err) max_err = e;
-      assert(approx(rec2.data[ch][i], rec.data[ch][i], 0.1f));
+      if (!approx(rec2.data[ch][i], rec.data[ch][i], 0.1f)) {
+        std::cerr << "EDF round-trip sample mismatch (ch=" << ch << ", i=" << i << ")\n";
+        return 1;
+      }
     }
   }
 

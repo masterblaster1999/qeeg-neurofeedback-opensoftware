@@ -24,6 +24,21 @@ struct UiDashboardArgs {
   // is true.
   std::string bin_dir;
 
+  // Optional multicall toolbox runner (e.g., qeeg_offline_app_cli).
+  //
+  // If provided, the dashboard generator can:
+  //   - treat tools as runnable even when per-tool qeeg_*_cli executables are
+  //     absent from --bin-dir, and
+  //   - embed each tool's --help output by invoking:
+  //       <toolbox> <tool> --help
+  //
+  // This is especially useful when distributing a single-binary offline app.
+  //
+  // The value may be:
+  //   - an executable name to be resolved within --bin-dir, or
+  //   - a path (absolute, or relative to --bin-dir).
+  std::string toolbox;
+
   // If true, run each executable with --help and embed the output in the UI.
   bool embed_help{true};
 

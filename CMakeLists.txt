@@ -18,6 +18,8 @@ include(GNUInstallDirs)
 add_library(qeeg STATIC
   src/utils.cpp
   src/run_meta.cpp
+  src/subprocess.cpp
+  src/cli_input.cpp
   src/ui_dashboard.cpp
   src/csv_io.cpp
   src/line_noise.cpp
@@ -108,13 +110,38 @@ if (QEEG_BUILD_CLI)
   add_executable(qeeg_map_cli src/main.cpp)
   target_link_libraries(qeeg_map_cli PRIVATE qeeg)
 
+  add_executable(qeeg_topomap_cli src/topomap_cli.cpp)
+  target_link_libraries(qeeg_topomap_cli PRIVATE qeeg)
+
+  add_executable(qeeg_region_summary_cli src/region_summary_cli.cpp)
+  target_link_libraries(qeeg_region_summary_cli PRIVATE qeeg)
+
+  add_executable(qeeg_connectivity_map_cli src/connectivity_map_cli.cpp)
+  target_link_libraries(qeeg_connectivity_map_cli PRIVATE qeeg)
+
   add_executable(qeeg_bandpower_cli src/bandpower_cli.cpp)
   target_link_libraries(qeeg_bandpower_cli PRIVATE qeeg)
 
   add_executable(qeeg_bandratios_cli src/bandratios_cli.cpp)
   target_link_libraries(qeeg_bandratios_cli PRIVATE qeeg)
 
-  add_executable(qeeg_nf_cli src/nf_cli.cpp)
+  # Neurofeedback CLI: build the heavy implementation once and reuse it for
+  # both the standalone executable and the offline multicall toolbox.
+  add_library(qeeg_cli_impl_nf OBJECT src/nf_cli.cpp)
+  target_link_libraries(qeeg_cli_impl_nf PRIVATE qeeg)
+
+  # nf_cli.cpp is mostly orchestration + UI/report generation. The hot DSP paths
+  # live in libqeeg, so compiling this translation unit with full -O3 / /O2 in
+  # Release isn't performance-critical but can noticeably slow down builds.
+  # Keep this TU unoptimized for faster incremental builds (especially helpful
+  # when embedding large HTML/JS strings).
+  if (MSVC)
+    target_compile_options(qeeg_cli_impl_nf PRIVATE /Od)
+  else()
+    target_compile_options(qeeg_cli_impl_nf PRIVATE -O0)
+  endif()
+
+  add_executable(qeeg_nf_cli src/nf_cli_main.cpp $<TARGET_OBJECTS:qeeg_cli_impl_nf>)
   target_link_libraries(qeeg_nf_cli PRIVATE qeeg)
 
   add_executable(qeeg_coherence_cli src/coherence_cli.cpp)
@@ -187,6 +214,9 @@ if (QEEG_BUILD_CLI)
   add_executable(qeeg_bundle_cli src/bundle_cli.cpp)
   target_link_libraries(qeeg_bundle_cli PRIVATE qeeg)
 
+  add_executable(qeeg_pipeline_cli src/pipeline_cli.cpp)
+  target_link_libraries(qeeg_pipeline_cli PRIVATE qeeg)
+
   add_executable(qeeg_clean_cli src/clean_cli.cpp)
   target_link_libraries(qeeg_clean_cli PRIVATE qeeg)
 
@@ -212,9 +242,12 @@ if (QEEG_BUILD_CLI)
   endfunction()
 
   qeeg_add_cli_entry(qeeg_cli_entry_map src/main.cpp qeeg_map_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_topomap src/topomap_cli.cpp qeeg_topomap_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_region_summary src/region_summary_cli.cpp qeeg_region_summary_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_connectivity_map src/connectivity_map_cli.cpp qeeg_connectivity_map_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_bandpower src/bandpower_cli.cpp qeeg_bandpower_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_bandratios src/bandratios_cli.cpp qeeg_bandratios_cli_entry)
-  qeeg_add_cli_entry(qeeg_cli_entry_nf src/nf_cli.cpp qeeg_nf_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_nf src/nf_cli_main.cpp qeeg_nf_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_coherence src/coherence_cli.cpp qeeg_coherence_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_plv src/plv_cli.cpp qeeg_plv_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_epoch src/epoch_cli.cpp qeeg_epoch_cli_entry)
@@ -238,6 +271,7 @@ if (QEEG_BUILD_CLI)
   qeeg_add_cli_entry(qeeg_cli_entry_ui src/ui_cli.cpp qeeg_ui_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_ui_server src/ui_server_cli.cpp qeeg_ui_server_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_bundle src/bundle_cli.cpp qeeg_bundle_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_pipeline src/pipeline_cli.cpp qeeg_pipeline_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_clean src/clean_cli.cpp qeeg_clean_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_quality src/quality_cli.cpp qeeg_quality_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_preprocess src/preprocess_cli.cpp qeeg_preprocess_cli_entry)
@@ -246,9 +280,13 @@ if (QEEG_BUILD_CLI)
   add_executable(qeeg_offline_app_cli
     src/offline_app_cli.cpp
     $<TARGET_OBJECTS:qeeg_cli_entry_map>
+    $<TARGET_OBJECTS:qeeg_cli_entry_topomap>
+    $<TARGET_OBJECTS:qeeg_cli_entry_region_summary>
+    $<TARGET_OBJECTS:qeeg_cli_entry_connectivity_map>
     $<TARGET_OBJECTS:qeeg_cli_entry_bandpower>
     $<TARGET_OBJECTS:qeeg_cli_entry_bandratios>
     $<TARGET_OBJECTS:qeeg_cli_entry_nf>
+    $<TARGET_OBJECTS:qeeg_cli_impl_nf>
     $<TARGET_OBJECTS:qeeg_cli_entry_coherence>
     $<TARGET_OBJECTS:qeeg_cli_entry_plv>
     $<TARGET_OBJECTS:qeeg_cli_entry_epoch>
@@ -272,6 +310,7 @@ if (QEEG_BUILD_CLI)
     $<TARGET_OBJECTS:qeeg_cli_entry_ui>
     $<TARGET_OBJECTS:qeeg_cli_entry_ui_server>
     $<TARGET_OBJECTS:qeeg_cli_entry_bundle>
+    $<TARGET_OBJECTS:qeeg_cli_entry_pipeline>
     $<TARGET_OBJECTS:qeeg_cli_entry_clean>
     $<TARGET_OBJECTS:qeeg_cli_entry_quality>
     $<TARGET_OBJECTS:qeeg_cli_entry_preprocess>
@@ -296,6 +335,9 @@ if (QEEG_BUILD_CLI)
   # Install CLI tools
   install(TARGETS
     qeeg_map_cli
+    qeeg_topomap_cli
+    qeeg_region_summary_cli
+    qeeg_connectivity_map_cli
     qeeg_bandpower_cli
     qeeg_bandratios_cli
     qeeg_nf_cli
@@ -326,6 +368,7 @@ if (QEEG_BUILD_CLI)
     qeeg_ui_cli
     qeeg_ui_server_cli
     qeeg_bundle_cli
+    qeeg_pipeline_cli
     qeeg_offline_app_cli
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   )
@@ -360,10 +403,50 @@ install(EXPORT qeegTargets
 if(QEEG_BUILD_TESTS)
   enable_testing()
 
+  # Guard against MSVC C2026 ("string too big, trailing characters truncated") by
+  # ensuring we never let embedded UI assets grow past the compiler's per-literal
+  # limit. This test scans the source tree for raw string literals that exceed a
+  # conservative threshold.
+  add_executable(qeeg_test_string_literal_limits tests/test_string_literal_limits.cpp)
+  target_compile_definitions(qeeg_test_string_literal_limits PRIVATE QEEG_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\")
+  add_test(NAME qeeg_test_string_literal_limits COMMAND qeeg_test_string_literal_limits)
+
   # Offline app/toolbox sanity checks (only when CLI tools are built).
   if (QEEG_BUILD_CLI)
     add_test(NAME qeeg_test_offline_app_list_tools COMMAND qeeg_offline_app_cli --list-tools)
+    add_test(NAME qeeg_test_offline_app_list_tools_json COMMAND qeeg_offline_app_cli --list-tools --json)
     add_test(NAME qeeg_test_offline_app_dispatch_version_help COMMAND qeeg_offline_app_cli qeeg_version_cli --help)
+    add_test(NAME qeeg_test_offline_app_shims_install_uninstall
+             COMMAND ${CMAKE_COMMAND}
+               -DQEEG_OFFLINE_APP=$<TARGET_FILE:qeeg_offline_app_cli>
+               -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_offline_app_shims.cmake)
+    add_test(NAME qeeg_test_offline_app_shims_dryrun
+             COMMAND ${CMAKE_COMMAND}
+               -DQEEG_OFFLINE_APP=$<TARGET_FILE:qeeg_offline_app_cli>
+               -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_offline_app_shims_dryrun.cmake)
+
+    add_test(NAME qeeg_test_bandratios_input_resolution
+             COMMAND ${CMAKE_COMMAND}
+               -DQEEG_BANDRATIOS=$<TARGET_FILE:qeeg_bandratios_cli>
+               -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_bandratios_input_resolution.cmake)
+
+    add_test(NAME qeeg_test_recording_input_resolution
+             COMMAND ${CMAKE_COMMAND}
+               -DQEEG_BANDPOWER=$<TARGET_FILE:qeeg_bandpower_cli>
+               -DQEEG_PREPROCESS=$<TARGET_FILE:qeeg_preprocess_cli>
+               -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_recording_input_resolution.cmake)
+
+    add_test(NAME qeeg_test_pipeline_basic
+             COMMAND ${CMAKE_COMMAND}
+               -DQEEG_PIPELINE=$<TARGET_FILE:qeeg_pipeline_cli>
+               -DQEEG_BIN_DIR=$<TARGET_FILE_DIR:qeeg_pipeline_cli>
+               -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_pipeline_basic.cmake)
+
+    add_test(NAME qeeg_test_offline_app_pipeline_auto_toolbox
+             COMMAND ${CMAKE_COMMAND}
+               -DQEEG_OFFLINE_APP=$<TARGET_FILE:qeeg_offline_app_cli>
+               -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_offline_app_pipeline_auto_toolbox.cmake)
+
   endif()
 
   add_executable(qeeg_test_fft tests/test_fft.cpp)
@@ -402,6 +485,14 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_cmdline_split tests/test_cmdline_split.cpp)
   target_link_libraries(qeeg_test_cmdline_split PRIVATE qeeg)
   add_test(NAME qeeg_test_cmdline_split COMMAND qeeg_test_cmdline_split)
+
+  add_executable(qeeg_test_cli_input_selectors tests/test_cli_input_selectors.cpp)
+  target_link_libraries(qeeg_test_cli_input_selectors PRIVATE qeeg)
+  add_test(NAME qeeg_test_cli_input_selectors COMMAND qeeg_test_cli_input_selectors)
+
+  add_executable(qeeg_test_cli_input_nested_run_meta tests/test_cli_input_nested_run_meta.cpp)
+  target_link_libraries(qeeg_test_cli_input_nested_run_meta PRIVATE qeeg)
+  add_test(NAME qeeg_test_cli_input_nested_run_meta COMMAND qeeg_test_cli_input_nested_run_meta)
 
   add_executable(qeeg_test_number_parse tests/test_number_parse.cpp)
   target_link_libraries(qeeg_test_number_parse PRIVATE qeeg)
@@ -472,6 +563,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_reader_extensions tests/test_reader_extensions.cpp)
   target_link_libraries(qeeg_test_reader_extensions PRIVATE qeeg)
   add_test(NAME qeeg_test_reader_extensions COMMAND qeeg_test_reader_extensions)
+
+  add_executable(qeeg_test_reader_input_resolution tests/test_read_recording_auto_resolve.cpp)
+  target_link_libraries(qeeg_test_reader_input_resolution PRIVATE qeeg)
+  add_test(NAME qeeg_test_reader_input_resolution COMMAND qeeg_test_reader_input_resolution)
 
   add_executable(qeeg_test_triggers tests/test_triggers.cpp)
   target_link_libraries(qeeg_test_triggers PRIVATE qeeg)
@@ -677,5 +772,20 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_interpolate tests/test_interpolate.cpp)
   target_link_libraries(qeeg_test_interpolate PRIVATE qeeg)
   add_test(NAME qeeg_test_interpolate COMMAND qeeg_test_interpolate)
+
+  # Keep assertions enabled in unit tests even when the overall build type
+  # defines NDEBUG (e.g., Release). This avoids tests silently becoming
+  # no-ops and prevents "unused variable/function" warnings when compiling
+  # tests with -Werror.
+  get_property(qeeg_all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(tgt IN LISTS qeeg_all_targets)
+    if (tgt MATCHES "^qeeg_test_")
+      if (MSVC)
+        target_compile_options(${tgt} PRIVATE /UNDEBUG)
+      else()
+        target_compile_options(${tgt} PRIVATE -UNDEBUG)
+      endif()
+    endif()
+  endforeach()
 
 endif()

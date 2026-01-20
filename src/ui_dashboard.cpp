@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace qeeg {
@@ -96,6 +97,7 @@ static std::string infer_group_from_name(const std::string& tool) {
   if (tool.find("map") != std::string::npos || tool.find("spectrogram") != std::string::npos || tool.find("spectral_features") != std::string::npos || tool.find("epoch") != std::string::npos || tool.find("iaf") != std::string::npos || tool.find("reference") != std::string::npos || tool.find("bandpower") != std::string::npos || tool.find("bandratios") != std::string::npos) {
     return "Spectral & Maps";
   }
+  if (tool.find("region_summary") != std::string::npos) return "Spectral & Maps";
   if (tool.find("channel_qc") != std::string::npos || tool.find("preprocess") != std::string::npos || tool.find("clean") != std::string::npos || tool.find("artifact") != std::string::npos) {
     return "Preprocess & Clean";
   }
@@ -180,8 +182,18 @@ static std::vector<ToolSpec> default_tools() {
 
     {"qeeg_bandratios_cli", "Spectral & Maps",
      "Derive common neurofeedback band ratios from a bandpowers.csv table.",
-     "qeeg_bandratios_cli --bandpowers out_bp/bandpowers.csv --outdir out_ratios --ratio theta/beta",
-     "--bandpowers"},
+     "qeeg_bandratios_cli --bandpowers out_bp --outdir out_ratios --ratio theta/beta",
+     "--bandpowers", "--bandpowers"},
+
+
+    {"qeeg_topomap_cli", "Spectral & Maps",
+     "Render scalp topomaps (BMP) from a per-channel table (bandpowers/ratios/z-scores).",
+     "qeeg_topomap_cli --input out_bp --metric alpha --outdir out_topo --annotate --html-report",
+     "--input", "--input"},
+    {"qeeg_region_summary_cli", "Spectral & Maps",
+     "Summarize per-channel qEEG metrics into coarse brain regions (lobe x hemisphere).",
+     "qeeg_region_summary_cli --input out_map --outdir out_regions --html-report",
+     "--input", "--input"},
 
     {"qeeg_spectral_features_cli", "Spectral & Maps",
      "Spectral summary table per channel (entropy, SEF95, peak frequency, ...).",
@@ -211,6 +223,11 @@ static std::vector<ToolSpec> default_tools() {
      "Phase locking value (PLV) connectivity.",
      "qeeg_plv_cli --input session.edf --outdir out_plv"},
 
+
+    {"qeeg_connectivity_map_cli", "Connectivity",
+     "Render connectivity maps (network diagrams) from coherence/PLV edge lists or matrices.",
+     "qeeg_connectivity_map_cli --input out_coh --metric coherence --min 0.05 --labels --outdir out_conn --html-report",
+     "--input", "--input"},
     {"qeeg_pac_cli", "Connectivity",
      "Phase-amplitude coupling (PAC) metrics.",
      "qeeg_pac_cli --input session.edf --outdir out_pac"},
@@ -544,6 +561,68 @@ static std::filesystem::path resolve_exe_path(const std::filesystem::path& bin_d
   return std::filesystem::path();
 }
 
+static bool looks_like_qeeg_cli_tool_name(const std::string& name) {
+  // Tool name (no extension) like: qeeg_*_cli
+  if (!starts_with(name, "qeeg_")) return false;
+  if (!ends_with(name, "_cli")) return false;
+  if (starts_with(name, "qeeg_test_")) return false;
+  return true;
+}
+
+static std::filesystem::path resolve_toolbox_exe_path(const std::filesystem::path& bin_dir,
+                                                      const std::string& toolbox_arg) {
+  if (toolbox_arg.empty()) return {};
+
+  const std::filesystem::path tb = std::filesystem::u8path(toolbox_arg);
+  auto try_path = [](const std::filesystem::path& p) -> std::filesystem::path {
+    if (p.empty()) return {};
+    if (std::filesystem::exists(p)) return p;
+    std::filesystem::path pe = p;
+    pe += ".exe";
+    if (std::filesystem::exists(pe)) return pe;
+    return {};
+  };
+
+  // Absolute or explicit relative path.
+  if (tb.is_absolute() || tb.has_parent_path()) {
+    auto p = try_path(tb);
+    if (!p.empty()) return p;
+    if (tb.is_relative() && !bin_dir.empty()) {
+      p = try_path(bin_dir / tb);
+      if (!p.empty()) return p;
+    }
+    return {};
+  }
+
+  // Name only: resolve within bin_dir.
+  if (bin_dir.empty()) return {};
+  return resolve_exe_path(bin_dir, toolbox_arg);
+}
+
+static std::vector<std::string> discover_cli_tools_via_toolbox(const std::filesystem::path& toolbox_exe) {
+  std::vector<std::string> out;
+  if (toolbox_exe.empty()) return out;
+
+  // Offline toolbox runner supports machine-readable listing:
+  //   <toolbox> --list-tools
+  const std::string cmd = "\"" + toolbox_exe.u8string() + "\" --list-tools 2>&1";
+  const std::string text = capture_stdout(cmd, 256 * 1024);
+
+  std::istringstream iss(text);
+  std::string line;
+  while (std::getline(iss, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    const std::string t = trim(line);
+    if (t.empty()) continue;
+    if (!looks_like_qeeg_cli_tool_name(t)) continue;
+    out.push_back(t);
+  }
+
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
 struct RunInfo {
   std::filesystem::path meta_path;   // absolute
   std::filesystem::path meta_dir;    // absolute
@@ -606,24 +685,46 @@ static std::string rel_link(const std::filesystem::path& from_dir,
 static void write_html(std::ostream& o, const UiDashboardArgs& args) {
   std::vector<ToolSpec> tools = default_tools();
 
+  // Index tools by name so we can append newly discovered tools without
+  // duplicates.
+  std::unordered_map<std::string, size_t> idx;
+  idx.reserve(tools.size() + 32);
+  for (size_t i = 0; i < tools.size(); ++i) idx[tools[i].name] = i;
+
+  auto add_auto_tool = [&](const std::string& name, const std::string& note) {
+    if (name.empty()) return;
+    if (idx.find(name) != idx.end()) return;
+    ToolSpec t;
+    t.name = name;
+    t.group = infer_group_from_name(name);
+    t.description = note;
+    t.example = name + " --help";
+    tools.push_back(std::move(t));
+    idx[name] = tools.size() - 1;
+  };
+
+  const std::filesystem::path bin_dir = args.bin_dir.empty() ? std::filesystem::path() : std::filesystem::u8path(args.bin_dir);
+
+  // Optional multicall toolbox runner (e.g., qeeg_offline_app_cli).
+  //
+  // This is useful for offline bundles where per-tool executables are not
+  // present, but tools can still be run via:
+  //   <toolbox> <tool> <args...>
+  const std::filesystem::path toolbox_exe = resolve_toolbox_exe_path(bin_dir, args.toolbox);
+  const std::vector<std::string> toolbox_tools = discover_cli_tools_via_toolbox(toolbox_exe);
+  std::unordered_set<std::string> toolbox_set;
+  toolbox_set.reserve(toolbox_tools.size() * 2 + 1);
+  for (const auto& name : toolbox_tools) {
+    toolbox_set.insert(name);
+    add_auto_tool(name, "Built into --toolbox runner.");
+  }
+
   // Auto-discover tools present in the bin directory and add any missing ones
   // to the dashboard.
-  if (args.scan_bin_dir && !args.bin_dir.empty()) {
-    const std::filesystem::path bin_dir = std::filesystem::u8path(args.bin_dir);
+  if (args.scan_bin_dir && !bin_dir.empty()) {
     const std::vector<std::string> discovered = discover_cli_tools_in_bin_dir(bin_dir);
-
-    std::unordered_map<std::string, size_t> idx;
-    idx.reserve(tools.size());
-    for (size_t i = 0; i < tools.size(); ++i) idx[tools[i].name] = i;
-
     for (const auto& name : discovered) {
-      if (idx.find(name) != idx.end()) continue;
-      ToolSpec t;
-      t.name = name;
-      t.group = infer_group_from_name(name);
-      t.description = "Auto-discovered executable in --bin-dir.";
-      t.example = name + " --help";
-      tools.push_back(std::move(t));
+      add_auto_tool(name, "Auto-discovered executable in --bin-dir.");
     }
   }
 
@@ -641,17 +742,46 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
   std::unordered_map<std::string, std::string> help_by_tool;
   std::unordered_map<std::string, bool> exe_found;
 
-  const std::filesystem::path bin_dir = std::filesystem::u8path(args.bin_dir);
-  if (args.embed_help && !args.bin_dir.empty()) {
+  const bool help_runner_available = args.embed_help && (!bin_dir.empty() || !toolbox_exe.empty());
+  if (help_runner_available) {
+    std::string toolbox_base;
+    if (!toolbox_exe.empty()) {
+      toolbox_base = toolbox_exe.filename().u8string();
+      if (ends_with(toolbox_base, ".exe")) {
+        toolbox_base = toolbox_base.substr(0, toolbox_base.size() - 4);
+      }
+    }
+
     for (const auto& t : tools) {
-      const std::filesystem::path exe = resolve_exe_path(bin_dir, t.name);
-      exe_found[t.name] = !exe.empty();
-      if (exe.empty()) {
+      std::filesystem::path exe;
+      if (!bin_dir.empty()) {
+        exe = resolve_exe_path(bin_dir, t.name);
+      }
+
+      bool runnable = false;
+      std::string cmd;
+
+      if (!exe.empty()) {
+        runnable = true;
+        cmd = "\"" + exe.u8string() + "\" --help 2>&1";
+      } else if (!toolbox_exe.empty()) {
+        // Special-case: if the tool is the toolbox itself, run --help directly.
+        if (!toolbox_base.empty() && t.name == toolbox_base) {
+          runnable = true;
+          cmd = "\"" + toolbox_exe.u8string() + "\" --help 2>&1";
+        } else if (toolbox_set.find(t.name) != toolbox_set.end()) {
+          runnable = true;
+          cmd = "\"" + toolbox_exe.u8string() + "\" " + t.name + " --help 2>&1";
+        }
+      }
+
+      exe_found[t.name] = runnable;
+      if (!runnable) {
         help_by_tool[t.name] = std::string();
         continue;
       }
+
       // Capture both stdout and stderr for tools that emit help to stderr.
-      const std::string cmd = "\"" + exe.u8string() + "\" --help 2>&1";
       help_by_tool[t.name] = capture_stdout(cmd, 2 * 1024 * 1024);
     }
   }
@@ -811,7 +941,17 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
   o << "      Tools with discovered runs: <b>" << n_with_runs << "</b> / " << tools.size() << "\n";
   if (args.embed_help) {
     o << "<br>Help embedding: <b>on</b>";
-    if (args.bin_dir.empty()) o << " (no --bin-dir; help sections may be empty)";
+    if (!help_runner_available) {
+      if (!args.toolbox.empty() && toolbox_exe.empty()) {
+        o << " (toolbox not found; help sections may be empty)";
+      } else {
+        o << " (no --bin-dir or --toolbox; help sections may be empty)";
+      }
+    } else if (args.bin_dir.empty()) {
+      o << " (via --toolbox)";
+    } else if (!args.toolbox.empty()) {
+      o << " (bin-dir + toolbox)";
+    }
   } else {
     o << "<br>Help embedding: <b>off</b>";
   }
@@ -826,9 +966,11 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
       const std::string id = safe_id(t.name);
       const std::string nav_badge_id = std::string("nav_") + id + "_live";
       const bool has_run = runs.find(t.name) != runs.end();
-      // If embed_help enabled, we can also mark missing executables.
+      // If help embedding is enabled and we have some way to invoke tools
+      // (either per-tool exe in --bin-dir or a multicall --toolbox), we can
+      // also mark missing tools.
       bool missing = false;
-      if (args.embed_help && !args.bin_dir.empty()) {
+      if (help_runner_available) {
         auto itf = exe_found.find(t.name);
         if (itf != exe_found.end() && !itf->second) missing = true;
       }
@@ -1099,7 +1241,7 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
               << "\" target=\"_blank\" rel=\"noopener\">" << html_escape(href) << "</a>\n";
             o << "          </div>\n";
             const std::string ext = to_lower(p.extension().u8string());
-            if (ext == ".bmp" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp") {
+            if (ext == ".bmp" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".svg") {
               image_paths.push_back(p);
             }
             if (ext == ".csv" || ext == ".tsv" || ext == ".json" || ext == ".txt" || ext == ".log" || ext == ".md") {
@@ -1525,7 +1667,9 @@ function buildCmdItems(){
   if(fsNavPos>=0 && fsNavPos < (fsNavHistory.length-1)){ items.push({title:'Workspace: Forward', subtitle:'Go to next folder', action:()=>{ try{ initFsBrowser(); fsForward(); }catch(e){} }}); }
   items.push({title:'Workspace: ui_runs', subtitle:'Browse UI runs', action:()=>{ try{ fsRuns(); }catch(e){} }});
   items.push({title:'Workspace: Trash', subtitle:'Browse .qeeg_trash', action:()=>{ try{ fsTrashDir(); }catch(e){} }});
-  items.push({title:'Workspace: Upload…', subtitle:'Upload files into current folder', action:()=>{ try{ initFsBrowser(); fsOpenUpload(); }catch(e){} }});
+)JS";
+
+o << R"JS(  items.push({title:'Workspace: Upload…', subtitle:'Upload files into current folder', action:()=>{ try{ initFsBrowser(); fsOpenUpload(); }catch(e){} }});
   items.push({title:'Workspace: New folder…', subtitle:'Create folder in current directory', action:()=>{ try{ initFsBrowser(); fsNewFolder(); }catch(e){} }});
   items.push({title:'Workspace: Refresh', subtitle:'Refresh Workspace listing', action:()=>{ try{ initFsBrowser(); refreshFs(); }catch(e){} }});
   items.push({title:'Workspace: Find…', subtitle:'Focus recursive search in Workspace browser', action:()=>{ try{ initFsBrowser(); const q=document.getElementById('fsFindQ'); if(q){ q.focus(); q.select(); } }catch(e){} }});
@@ -1895,7 +2039,9 @@ class QeegFxEngine{
   initTopo(){
     // Create a small offscreen canvas for fast scalar-field rendering.
     if(!this.topoOff){
-      this.topoOff = document.createElement('canvas');
+)JS";
+
+o << R"JS(      this.topoOff = document.createElement('canvas');
       this.topoOffCtx = this.topoOff.getContext('2d', {alpha:true});
     }
     const base = 160;
@@ -2324,7 +2470,9 @@ o << R"JS(      // Very small velocity wobble to avoid perfect loops.
         data[k++] = rgb.r;
         data[k++] = rgb.g;
         data[k++] = rgb.b;
-        data[k++] = Math.round(255*clamp01(a));
+)JS";
+
+o << R"JS(        data[k++] = Math.round(255*clamp01(a));
       }
     }
 
@@ -2765,7 +2913,9 @@ function initFx(){
   });
 
   // Live update if user toggles OS reduced-motion while the page is open.
-  if(window.matchMedia){
+)JS";
+
+o << R"JS(  if(window.matchMedia){
     try{
       const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
       mq.addEventListener('change', (ev)=>{
@@ -3140,7 +3290,9 @@ function normalizePresetsStore(s){
   const out = emptyPresetsStore();
   out.tools = {};
   for(const t in tools){
-    if(!Object.prototype.hasOwnProperty.call(tools,t)) continue;
+)JS";
+
+o << R"JS(    if(!Object.prototype.hasOwnProperty.call(tools,t)) continue;
     if(t==='version' || t==='updated' || t==='exported') continue;
     const map = tools[t];
     if(!map || typeof map !== 'object') continue;
@@ -3516,7 +3668,9 @@ async function fsRenamePath(path, type){
   path = String(path||'');
   if(!path) return;
   const parts = path.split('/').filter(p=>p);
-  const base = parts.length ? parts[parts.length-1] : path;
+)JS";
+
+o << R"JS(  const base = parts.length ? parts[parts.length-1] : path;
   let newName = prompt('Rename "'+base+'" to:', base);
   if(newName===null) return;
   newName = String(newName||'').trim();
@@ -3878,7 +4032,9 @@ function renderFsCrumbs(){
   c.innerHTML = html;
 }
 
-function fsSetDir(d){
+)JS";
+
+o << R"JS(function fsSetDir(d){
   fsCurrentDir = d || '';
   try{ localStorage.setItem('qeeg_fs_dir', fsCurrentDir); }catch(e){}
 }
@@ -4186,7 +4342,9 @@ function initFsBrowser(){
       if(v) fdepth.value = v;
       else fdepth.value = '6';
     }catch(e){ fdepth.value='6'; }
-    fdepth.onchange = ()=>{ try{ localStorage.setItem('qeeg_fs_find_depth', fdepth.value); }catch(e){} };
+)JS";
+
+o << R"JS(    fdepth.onchange = ()=>{ try{ localStorage.setItem('qeeg_fs_find_depth', fdepth.value); }catch(e){} };
   }
 
   initFsDrop();
@@ -4491,7 +4649,9 @@ async function refreshHistory(force){
   }
   hv.innerHTML = '<span class="small">Loading history…</span>';
   try{
-    const r=await apiFetch('/api/history?limit=50');
+)JS";
+
+o << R"JS(    const r=await apiFetch('/api/history?limit=50');
     const j=await r.json();
     if(!r.ok) throw new Error(j&&j.error?j.error:'history failed');
     runsHistory = (j && j.runs) ? j.runs : [];
@@ -4810,7 +4970,9 @@ async function runTool(btn){
       }
       if(status.dataset) status.dataset.baseHtml = base;
       let q='';
-      if(st==='queued' && j && j.queue_pos && j.queue_len){
+)JS";
+
+o << R"JS(      if(st==='queued' && j && j.queue_pos && j.queue_len){
         q = ' ('+esc(String(j.queue_pos))+'/'+esc(String(j.queue_len))+')';
       }
       status.innerHTML = base + '<br>Status: <b>'+esc(st)+'</b>' + q;
@@ -5160,7 +5322,9 @@ async function refreshOutputs(btn){
 }
 
 function browseRunDirFromStatus(btn){
-  const statusId=btn.getAttribute('data-status-id');
+)JS";
+
+o << R"JS(  const statusId=btn.getAttribute('data-status-id');
   const status=document.getElementById(statusId);
   const runDir = status && status.dataset ? (status.dataset.runDir||'') : '';
   if(!runDir){
@@ -5515,7 +5679,9 @@ async function openFlagHelper(btn){
           helpText = (j && j.help) ? String(j.help) : '';
           if(helpEl && helpText.trim()) helpEl.textContent = helpText;
         } else {
-          list.innerHTML = '<span class="small">Failed to fetch help from server (HTTP '+String(r&&r.status?r.status:'?')+').</span>';
+)JS";
+
+o << R"JS(          list.innerHTML = '<span class="small">Failed to fetch help from server (HTTP '+String(r&&r.status?r.status:'?')+').</span>';
           meta.textContent = '';
           return;
         }
@@ -5945,7 +6111,9 @@ function renderCsvPreview(){
       '<button class=\"btn\" id=\"csvViewTableBtn\" type=\"button\">Table</button>'+
       seriesBtn+
       qeegBtn+
-      heatBtn+
+)JS";
+
+o << R"JS(      heatBtn+
       '<button class=\"btn\" id=\"csvViewRawBtn\" type=\"button\">Raw</button>'+
     '</div>'+
     '<div id=\"csvViewTable\" class=\"csv-viewwrap\"></div>'+
@@ -6315,7 +6483,9 @@ function renderCsvPreviewSeriesOnly(){
   let optsHtml = '';
   for(const c of (s.cols||[])){
     const nm = String(c.name||'');
-    const idx = Number(c.idx);
+)JS";
+
+o << R"JS(    const idx = Number(c.idx);
     optsHtml += '<option value="'+esc(String(idx))+'">'+esc(nm)+'</option>';
   }
 
@@ -6673,7 +6843,9 @@ function qeegDrawTopomap(canvas, topo, opts){
       if(diverge){
         const m = Math.max(Math.abs(vmin), Math.abs(vmax));
         const t = clamp01(Math.abs(v) / (m || 1e-12));
-        rgb = (v >= 0) ? qeegLerpRgb(bg, red, t) : qeegLerpRgb(bg, blue, t);
+)JS";
+
+o << R"JS(        rgb = (v >= 0) ? qeegLerpRgb(bg, red, t) : qeegLerpRgb(bg, blue, t);
       }else{
         const t = clamp01((v - vmin) / (vmax - vmin));
         rgb = qeegLerpRgb(bg, accent, t);
@@ -7057,7 +7229,9 @@ function renderCsvPreviewQeegOnly(){
               '<label class="small">Topomap band</label>'+
               '<select class="input" id="qeegTopoBandSel" style="max-width:180px"></select>'+
               '<label class="small" style="margin-left:8px">|z|≥</label>'+
-              '<input class="input" id="qeegTopoThrInput" type="number" min="0" max="10" step="0.25" style="max-width:92px" value="2">'+
+)JS";
+
+o << R"JS(              '<input class="input" id="qeegTopoThrInput" type="number" min="0" max="10" step="0.25" style="max-width:92px" value="2">'+
               '<span class="small" id="qeegTopoHover"></span>'+
             '</div>'+
             '<canvas id="qeegTopoCanvas" class="qeeg-chart qeeg-topo" width="420" height="420"></canvas>'+
@@ -7352,7 +7526,9 @@ o << R"JS(      const idx = (q.metric==='z' && band.zIdx>=0) ? band.zIdx : band.
   if(vb && vt && v2 && barsWrap && topoWrap){
     vb.classList.toggle('active', q.view==='bars');
     vt.classList.toggle('active', q.view==='topo');
-    v2.classList.toggle('active', q.view==='both');
+)JS";
+
+o << R"JS(    v2.classList.toggle('active', q.view==='both');
     barsWrap.classList.toggle('hidden', q.view==='topo');
     topoWrap.classList.toggle('hidden', q.view==='bars');
     vb.onclick = ()=>{ q.view='bars'; renderCsvPreviewQeegOnly(); };
@@ -7718,7 +7894,9 @@ let batchTool='';
 let batchArgsId='';
 let batchInjectSelId='';
 let batchDir='';
-let batchEntries=[];
+)JS";
+
+o << R"JS(let batchEntries=[];
 let batchSelected=new Set();
 let batchVisible=[];
 let batchSubmitting=false;
@@ -8101,7 +8279,9 @@ async function runBatch(){
 
     if(status) status.textContent = 'Submitting '+(i+1)+'/'+paths.length+'…';
     try{
-      const r = await apiFetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tool:tool, args:args})});
+)JS";
+
+o << R"JS(      const r = await apiFetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tool:tool, args:args})});
       const j = await r.json();
       if(!r.ok) throw new Error(j && j.error ? j.error : 'run failed');
       okCount++;

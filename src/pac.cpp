@@ -12,8 +12,6 @@
 
 namespace qeeg {
 
-static constexpr double kButterworthQ = 0.707106781186547524400844362104849039;
-
 static void validate_band(const BandDefinition& b, double fs_hz, const std::string& label) {
   if (fs_hz <= 0.0) throw std::runtime_error("compute_pac: fs_hz must be > 0");
   if (!(b.fmin_hz > 0.0) || !(b.fmax_hz > 0.0) || !(b.fmin_hz < b.fmax_hz)) {
