@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_version.schema.json",
+  "title": "qeeg_nf_cli --version-json output",
+  "description": "Schema for the JSON emitted by qeeg_nf_cli --version-json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "version",
+    "version_major",
+    "version_minor",
+    "version_patch",
+    "git",
+    "build_type",
+    "compiler",
+    "cpp_standard"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_version.schema.json"
+    },
+    "tool": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "version_major": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "version_minor": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "version_patch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "git": {
+      "type": "string"
+    },
+    "build_type": {
+      "type": "string"
+    },
+    "compiler": {
+      "type": "string"
+    },
+    "cpp_standard": {
+      "type": "string"
+    }
+  }
+}

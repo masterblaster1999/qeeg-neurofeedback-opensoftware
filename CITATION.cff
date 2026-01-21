@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "qeeg-map: First-pass open-source qEEG mapping + topomap renderer in C++"
+type: software
+authors:
+  - name: "qeeg-map contributors"
+repository-code: "https://github.com/masterblaster1999/qeeg-neurofeedback-opensoftware"
+license: MIT
+version: "0.1.0"

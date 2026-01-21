@@ -1,0 +1,31 @@
+#compdef qeeg_offline_app_cli
+
+# Zsh completion for qeeg_offline_app_cli
+#
+# Provides:
+#  - completion for offline-app options
+#  - dynamic completion of tool names via `qeeg_offline_app_cli --list-tools`
+#  - completion of tool names for the first positional argument and after --tool
+
+_qeeg_offline_app_cli_tools() {
+  local -a tools
+  tools=(${(f)"$(qeeg_offline_app_cli --list-tools 2>/dev/null)"})
+  _describe -t tools 'tool' tools
+}
+
+_qeeg_offline_app_cli() {
+  _arguments -s -S \
+    '--help[Show help]' \
+    '--list-tools[List available embedded tools]' \
+    '--json[Output JSON]' \
+    '--pretty[Pretty-print JSON output]' \
+    '--install-shims[Install shim scripts for embedded tools]' \
+    '--uninstall-shims[Uninstall shim scripts for embedded tools]' \
+    '--force[Force install/uninstall of shims]' \
+    '--dry-run[Show what would be done without changing anything]' \
+    '--tool[Filter shim install/uninstall to a single tool]:tool:_qeeg_offline_app_cli_tools' \
+    '1:tool:_qeeg_offline_app_cli_tools' \
+    '*::tool args:->args'
+}
+
+_qeeg_offline_app_cli "$@"

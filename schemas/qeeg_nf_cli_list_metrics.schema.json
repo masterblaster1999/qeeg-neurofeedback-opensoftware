@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_list_metrics.schema.json",
+  "title": "qeeg_nf_cli --list-metrics-json output",
+  "description": "Schema for the JSON emitted by qeeg_nf_cli --list-metrics-json (metric specification examples).",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "kind",
+      "example",
+      "description"
+    ],
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "example": {
+        "type": "string"
+      },
+      "description": {
+        "type": "string"
+      }
+    }
+  }
+}

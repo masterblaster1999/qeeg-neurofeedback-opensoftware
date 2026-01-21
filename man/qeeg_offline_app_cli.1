@@ -1,0 +1,91 @@
+.TH QEEG_OFFLINE_APP_CLI 1 "January 2026" "qeeg_map" "User Commands"
+.SH NAME
+qeeg_offline_app_cli \- single-binary offline toolbox that dispatches to qeeg_*_cli tools
+.SH SYNOPSIS
+.B qeeg_offline_app_cli
+.RI <tool> " [args...]"
+
+.B qeeg_offline_app_cli
+.BR --list-tools " [--json] [--pretty]"
+
+.B qeeg_offline_app_cli
+.BR --install-shims " [DIR] [--force] [--tool TOOL]... [--dry-run]"
+
+.B qeeg_offline_app_cli
+.BR --uninstall-shims " [DIR] [--force] [--tool TOOL]... [--dry-run]"
+
+.B qeeg_offline_app_cli
+.BR --help
+.SH DESCRIPTION
+\fBqeeg_offline_app_cli\fP is a "toolbox" executable that contains multiple qeeg command-line tools.
+It can dispatch to any built-in \fBqeeg_*_cli\fP tool based on the first positional argument.
+
+This is useful when you want to ship a single binary (plus data/output folders), but still be able to run
+individual tools.
+
+The offline app can also install small per-tool shims (links or wrapper scripts) so you can invoke
+\fBqeeg_*_cli\fP commands directly while only distributing one executable.
+.SH MODES
+.TP
+\fB<tool> [args...]\fP
+Dispatch to a built-in tool. The tool name must match a built-in command (see \fB--list-tools\fP).
+
+Example:
+.RS
+.nf
+qeeg_offline_app_cli qeeg_version_cli --full
+qeeg_offline_app_cli qeeg_map_cli --help
+.fi
+.RE
+.TP
+\fB--list-tools\fP
+List built-in tools.
+Use \fB--json\fP for machine-readable output and \fB--pretty\fP for formatted JSON.
+.TP
+\fB--install-shims\fP [\fIDIR\fP]
+Install per-tool shims into \fIDIR\fP (default: current directory).
+Use \fB--tool\fP to restrict which tools get shims.
+Use \fB--force\fP to overwrite existing files.
+Use \fB--dry-run\fP to print what would be done without modifying the filesystem.
+.TP
+\fB--uninstall-shims\fP [\fIDIR\fP]
+Remove shims from \fIDIR\fP (default: current directory).
+Without \fB--force\fP, uninstall only removes shims that appear to point back to the currently-running
+\fBqeeg_offline_app_cli\fP.
+Use \fB--tool\fP to restrict which tools are removed.
+Use \fB--dry-run\fP to print what would be done without modifying the filesystem.
+.SH OPTIONS
+.TP
+\fB--json\fP
+Output JSON (used with \fB--list-tools\fP).
+.TP
+\fB--pretty\fP
+Pretty-print JSON output (used with \fB--list-tools\fP).
+.TP
+\fB--tool\fP \fITOOL\fP
+Restrict shim install/uninstall operations to a specific tool. May be specified multiple times.
+.TP
+\fB--force\fP
+Overwrite existing files when installing shims, or remove shims more aggressively when uninstalling.
+.TP
+\fB--dry-run\fP
+Show actions without making changes.
+.TP
+\fB-h\fP, \fB--help\fP
+Show help.
+.SH ENVIRONMENT
+.TP
+\fBQEEG_TOOLBOX\fP
+When dispatching a tool, \fBqeeg_offline_app_cli\fP sets \fBQEEG_TOOLBOX\fP (unless already set)
+to the path of the toolbox executable.
+This allows workflows (for example \fBqeeg_pipeline_cli\fP) to re-invoke other tools through the same
+single-binary toolbox.
+.SH EXIT STATUS
+.TP
+\fB0\fP
+Success.
+.TP
+\fB>0\fP
+An error occurred. Most tools print a message to standard error.
+.SH SEE ALSO
+\fBqeeg_version_cli\fP(1), \fBqeeg_nf_cli\fP(1)

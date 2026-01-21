@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_list_channels.schema.json",
+  "title": "qeeg_nf_cli --list-channels-json output",
+  "description": "Schema for the JSON emitted by qeeg_nf_cli --list-channels-json.",
+  "type": "object",
+  "required": [
+    "Tool",
+    "Version",
+    "GitDescribe",
+    "BuildType",
+    "Compiler",
+    "CppStandard",
+    "demo",
+    "input",
+    "fs_hz",
+    "n_channels",
+    "n_samples",
+    "duration_seconds",
+    "channels"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_list_channels.schema.json"
+    },
+    "Tool": {
+      "type": "string"
+    },
+    "Version": {
+      "type": "string"
+    },
+    "GitDescribe": {
+      "type": "string"
+    },
+    "BuildType": {
+      "type": "string"
+    },
+    "Compiler": {
+      "type": "string"
+    },
+    "CppStandard": {
+      "type": "string"
+    },
+    "demo": {
+      "type": "boolean"
+    },
+    "input": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fs_hz": {
+      "type": "number"
+    },
+    "n_channels": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "n_samples": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duration_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "channels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "channel_qc": {
+      "type": "string"
+    },
+    "channel_qc_resolved": {
+      "type": "string"
+    },
+    "qc_bad_channel_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "qc_bad_channels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "qc_bad_channel_reasons": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

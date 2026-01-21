@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_list_protocols.schema.json",
+  "title": "qeeg_nf_cli --list-protocols-json output",
+  "description": "Schema for the JSON emitted by qeeg_nf_cli --list-protocols-json (built-in neurofeedback protocol presets).",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "name",
+      "title",
+      "description",
+      "metric_template",
+      "metric_default",
+      "band_spec",
+      "default_channel",
+      "default_channel_a",
+      "default_channel_b",
+      "reward_direction",
+      "target_reward_rate",
+      "baseline_seconds",
+      "window_seconds",
+      "update_seconds",
+      "metric_smooth_seconds"
+    ],
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "title": {
+        "type": "string"
+      },
+      "description": {
+        "type": "string"
+      },
+      "metric_template": {
+        "type": "string"
+      },
+      "metric_default": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "band_spec": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "default_channel": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "default_channel_a": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "default_channel_b": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "reward_direction": {
+        "type": "string",
+        "enum": [
+          "above",
+          "below"
+        ]
+      },
+      "target_reward_rate": {
+        "type": "number"
+      },
+      "baseline_seconds": {
+        "type": "number"
+      },
+      "window_seconds": {
+        "type": "number"
+      },
+      "update_seconds": {
+        "type": "number"
+      },
+      "metric_smooth_seconds": {
+        "type": "number"
+      }
+    }
+  }
+}

@@ -1,0 +1,43 @@
+.TH QEEG_VERSION_CLI 1 "January 2026" "qeeg_map" "User Commands"
+.SH NAME
+qeeg_version_cli \- print qeeg project version and build information
+.SH SYNOPSIS
+.B qeeg_version_cli
+
+.B qeeg_version_cli
+.BR --full
+
+.B qeeg_version_cli
+.BR --json
+
+.B qeeg_version_cli
+.BR -h
+
+.B qeeg_version_cli
+.BR --help
+.SH DESCRIPTION
+\fBqeeg_version_cli\fP prints version information for the qeeg project.
+
+The default output is the project version string (script-friendly).
+Use \fB--full\fP to include additional build metadata.
+Use \fB--json\fP for machine-readable output.
+.SH OPTIONS
+.TP
+\fB--full\fP
+Print additional build details including numeric version components, git describe (best-effort),
+compiler, build type, and C++ standard.
+.TP
+\fB--json\fP
+Output JSON (useful for scripts).
+.TP
+\fB-h\fP, \fB--help\fP
+Show help.
+.SH EXIT STATUS
+.TP
+\fB0\fP
+Success.
+.TP
+\fB1\fP
+An error occurred (for example, an unknown argument).
+.SH SEE ALSO
+\fBqeeg_offline_app_cli\fP(1)

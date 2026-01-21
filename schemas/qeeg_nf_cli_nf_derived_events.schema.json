@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_nf_derived_events.schema.json",
+  "title": "qeeg_nf_cli: nf_derived_events.json",
+  "description": "Schema for the BIDS-style *_events.json sidecar written alongside nf_derived_events.tsv by qeeg_nf_cli when exporting derived events. The sidecar is expected to describe the required BIDS columns onset/duration (seconds) and trial_type.",
+  "type": "object",
+  "required": [
+    "onset",
+    "duration",
+    "trial_type"
+  ],
+  "properties": {
+    "trial_type": {
+      "$ref": "#/$defs/column"
+    },
+    "onset": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/column"
+        },
+        {
+          "properties": {
+            "Units": {
+              "enum": [
+                "s",
+                "sec",
+                "seconds"
+              ]
+            }
+          },
+          "required": [
+            "Units"
+          ]
+        }
+      ]
+    },
+    "duration": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/column"
+        },
+        {
+          "properties": {
+            "Units": {
+              "enum": [
+                "s",
+                "sec",
+                "seconds"
+              ]
+            }
+          },
+          "required": [
+            "Units"
+          ]
+        }
+      ]
+    },
+    "sample": {
+      "$ref": "#/$defs/column"
+    },
+    "value": {
+      "$ref": "#/$defs/column"
+    }
+  },
+  "additionalProperties": {
+    "$ref": "#/$defs/column"
+  },
+  "$defs": {
+    "column": {
+      "type": "object",
+      "required": [
+        "LongName",
+        "Description"
+      ],
+      "properties": {
+        "LongName": {
+          "type": "string"
+        },
+        "Description": {
+          "type": "string"
+        },
+        "Units": {
+          "type": "string"
+        },
+        "Levels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "HED": {
+          "type": [
+            "string",
+            "object"
+          ]
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

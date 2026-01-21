@@ -10,12 +10,151 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(QEEG_BUILD_TESTS "Build tests" ON)
 option(QEEG_BUILD_CLI "Build CLI tools" ON)
+option(QEEG_BUILD_DOCS "Build API documentation with Doxygen" OFF)
 option(QEEG_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(QEEG_ENABLE_SANITIZERS "Enable Address/Undefined sanitizers (best-effort; non-MSVC)" OFF)
 
+
+# Optional: run clang-tidy during compilation (developer convenience)
+#
+# This is OFF by default because it can significantly slow down builds.
+option(QEEG_ENABLE_CLANG_TIDY "Run clang-tidy during compilation (if available)" OFF)
+
+set(QEEG_CLANG_TIDY_EXECUTABLE "")
+if (QEEG_ENABLE_CLANG_TIDY)
+  find_program(QEEG_CLANG_TIDY_EXECUTABLE NAMES clang-tidy)
+  if (QEEG_CLANG_TIDY_EXECUTABLE)
+    message(STATUS "clang-tidy enabled: ${QEEG_CLANG_TIDY_EXECUTABLE}")
+  else()
+    message(WARNING "QEEG_ENABLE_CLANG_TIDY=ON but clang-tidy was not found in PATH")
+  endif()
+
+endif()
+
+# Optional: use ccache if available (developer convenience)
+option(QEEG_ENABLE_CCACHE "Use ccache to speed up rebuilds (if available)" OFF)
+if (QEEG_ENABLE_CCACHE)
+  find_program(QEEG_CCACHE_PROGRAM ccache)
+  if (QEEG_CCACHE_PROGRAM)
+    if (NOT CMAKE_CXX_COMPILER_LAUNCHER)
+      message(STATUS "Using ccache: ${QEEG_CCACHE_PROGRAM}")
+      set(CMAKE_CXX_COMPILER_LAUNCHER "${QEEG_CCACHE_PROGRAM}")
+    else()
+      message(STATUS "CMAKE_CXX_COMPILER_LAUNCHER already set to '${CMAKE_CXX_COMPILER_LAUNCHER}'; not overriding with ccache")
+    endif()
+  else()
+    message(WARNING "QEEG_ENABLE_CCACHE=ON but ccache was not found in PATH")
+  endif()
+endif()
+
+# Position-independent code (PIC)
+#
+# When building a static libqeeg.a, downstream consumers may want to link it
+# into their own shared libraries. Building qeeg with PIC makes that possible
+# on platforms where it matters (e.g., ELF/Mach-O).
+set(_QEEG_DEFAULT_PIC ON)
+if (WIN32)
+  set(_QEEG_DEFAULT_PIC OFF)
+endif()
+option(QEEG_ENABLE_PIC "Build qeeg with position-independent code (-fPIC where relevant)" ${_QEEG_DEFAULT_PIC})
+
+# Interprocedural optimization (LTO / IPO)
+#
+# This is an opt-in, best-effort switch for Release-ish builds.
+# We use CMake's CheckIPOSupported to avoid breaking toolchains that
+# don't support LTO.
+option(QEEG_ENABLE_IPO "Enable interprocedural optimization (LTO) for Release builds where supported" OFF)
+
+if (QEEG_ENABLE_IPO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT _QEEG_IPO_SUPPORTED OUTPUT _QEEG_IPO_ERROR)
+  if (_QEEG_IPO_SUPPORTED)
+    # Enable IPO for optimized configurations. Debug remains unchanged.
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL TRUE)
+  else()
+    message(WARNING "QEEG_ENABLE_IPO was requested but is not supported: ${_QEEG_IPO_ERROR}")
+  endif()
+endif()
+
+# Standard CMake option: allow users to build qeeg as a shared library by
+# configuring with -DBUILD_SHARED_LIBS=ON.
+option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
+
+# Install a pkg-config file (qeeg.pc) for non-CMake consumers.
+#
+# Default: ON for Unix-y platforms, OFF for Windows (where pkg-config is uncommon).
+set(_QEEG_DEFAULT_PKGCONFIG ON)
+if (WIN32)
+  set(_QEEG_DEFAULT_PKGCONFIG OFF)
+endif()
+option(QEEG_INSTALL_PKGCONFIG "Install pkg-config metadata (qeeg.pc)" ${_QEEG_DEFAULT_PKGCONFIG})
+
 include(GNUInstallDirs)
 
-add_library(qeeg STATIC
+# Install common documentation files (LICENSE, README, etc.).
+#
+# Some packagers prefer to manage documentation separately; this can be
+# disabled with -DQEEG_INSTALL_DOCS=OFF.
+option(QEEG_INSTALL_DOCS "Install documentation files (LICENSE, README, etc.)" ON)
+
+
+# Install shell completion scripts for select CLI tools (bash/zsh/fish).
+#
+# Default: ON for Unix-y platforms, OFF for Windows (where shell completion
+# integration varies and is uncommon).
+set(_QEEG_DEFAULT_INSTALL_COMPLETIONS ON)
+if (WIN32)
+  set(_QEEG_DEFAULT_INSTALL_COMPLETIONS OFF)
+endif()
+option(QEEG_INSTALL_COMPLETIONS "Install shell completion scripts (bash/zsh/fish where supported)" ${_QEEG_DEFAULT_INSTALL_COMPLETIONS})
+
+
+# Install man pages for select CLI tools (Unix-y platforms).
+#
+# Default: ON for Unix-y platforms, OFF for Windows.
+set(_QEEG_DEFAULT_INSTALL_MANPAGES ON)
+if (WIN32)
+  set(_QEEG_DEFAULT_INSTALL_MANPAGES OFF)
+endif()
+option(QEEG_INSTALL_MANPAGES "Install man pages for CLI tools (where supported)" ${_QEEG_DEFAULT_INSTALL_MANPAGES})
+
+
+# Install RPATH (shared-library builds)
+#
+# If users build qeeg as a shared library and install the CLI tools, the
+# resulting executables may not find libqeeg at runtime unless the user sets
+# LD_LIBRARY_PATH (Linux) / DYLD_LIBRARY_PATH (macOS) or installs into a system
+# library path.
+#
+# For local installs, it's convenient to bake a *relative* RPATH into installed
+# executables so they can find libqeeg under the same prefix.
+set(_QEEG_DEFAULT_INSTALL_RPATH OFF)
+if (UNIX AND NOT WIN32 AND BUILD_SHARED_LIBS)
+  set(_QEEG_DEFAULT_INSTALL_RPATH ON)
+endif()
+option(QEEG_INSTALL_RPATH "Set an install RPATH on installed executables for shared-library builds" ${_QEEG_DEFAULT_INSTALL_RPATH})
+
+if (QEEG_INSTALL_RPATH AND UNIX AND NOT WIN32 AND BUILD_SHARED_LIBS)
+  if (APPLE)
+    set(CMAKE_INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+  else()
+    set(CMAKE_INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+  endif()
+  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+endif()
+
+
+# Directory for small generated headers (e.g., version metadata) that should be
+# visible to both in-tree builds and installed consumers.
+set(QEEG_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+# Build qeeg as either a static or shared library.
+#
+# Default: static. Users can configure with -DBUILD_SHARED_LIBS=ON to build a
+# shared library instead (CMake controls this when no library type is specified).
+add_library(qeeg
   src/utils.cpp
   src/run_meta.cpp
   src/subprocess.cpp
@@ -72,13 +211,91 @@ add_library(qeeg STATIC
 
 add_library(qeeg::qeeg ALIAS qeeg)
 
+# clang-tidy (optional)
+#
+# When enabled, we attach clang-tidy to the core qeeg library build.
+# This can slow down builds, so it is opt-in.
+if (QEEG_ENABLE_CLANG_TIDY AND QEEG_CLANG_TIDY_EXECUTABLE)
+  set_target_properties(qeeg PROPERTIES CXX_CLANG_TIDY "${QEEG_CLANG_TIDY_EXECUTABLE}")
+endif()
+
+# Build static libraries with position-independent code if requested.
+#
+# This is mainly relevant when BUILD_SHARED_LIBS=OFF but downstream users
+# want to link libqeeg.a into their own shared libraries.
+if (QEEG_ENABLE_PIC)
+  set_target_properties(qeeg PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# Shared library versioning (Unix-like platforms)
+#
+# When building shared libraries, it is conventional to set VERSION/SOVERSION so
+# the resulting SONAME encodes ABI compatibility.
+if (BUILD_SHARED_LIBS)
+  set_target_properties(qeeg PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+  )
+endif()
+
+
+# Shared library builds on Windows usually require explicit symbol export
+# annotations (e.g., __declspec(dllexport)). For this early-stage project, we
+# default to exporting all symbols when BUILD_SHARED_LIBS=ON to keep shared builds
+# usable without intrusive header changes.
+if (WIN32 AND BUILD_SHARED_LIBS)
+  set_target_properties(qeeg PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
+
 target_include_directories(qeeg PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${QEEG_GENERATED_INCLUDE_DIR}>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
+# Ensure downstream consumers (via find_package) build with at least C++17.
+# This is exported as an INTERFACE requirement on qeeg::qeeg.
+target_compile_features(qeeg PUBLIC cxx_std_17)
+
 # Version / build metadata
-target_compile_definitions(qeeg PUBLIC QEEG_VERSION_STRING=\"${PROJECT_VERSION}\")
+#
+# In addition to the project version, we expose a best-effort git describe string.
+# This is helpful when users report issues from a binary build (it answers "which
+# exact commit was this built from?") while remaining safe for non-git source
+# distributions (where it falls back to "unknown").
+set(QEEG_GIT_DESCRIBE "unknown")
+find_package(Git QUIET)
+if (GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" describe --always --dirty --tags
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE QEEG_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+endif()
+if (NOT QEEG_GIT_DESCRIBE)
+  set(QEEG_GIT_DESCRIBE "unknown")
+endif()
+string(REPLACE "\"" "\\\"" QEEG_GIT_DESCRIBE_ESC "${QEEG_GIT_DESCRIBE}")
+
+# Generate a tiny header that defines QEEG_VERSION_STRING and QEEG_GIT_DESCRIBE.
+#
+# Why: when consuming the library via non-CMake systems (e.g., pkg-config),
+# consumers do not get CMake target compile definitions, so <qeeg/version.hpp>
+# would otherwise fall back to its default values. Installing this header keeps
+# version reporting correct across build systems.
+file(MAKE_DIRECTORY "${QEEG_GENERATED_INCLUDE_DIR}/qeeg")
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/version_config.hpp.in"
+  "${QEEG_GENERATED_INCLUDE_DIR}/qeeg/version_config.hpp"
+  @ONLY
+)
+
+target_compile_definitions(qeeg PUBLIC
+  QEEG_VERSION_STRING=\"${PROJECT_VERSION}\"
+  QEEG_GIT_DESCRIBE=\"${QEEG_GIT_DESCRIBE_ESC}\"
+)
 
 # Enable warnings (best-effort, portable)
 if (MSVC)
@@ -331,6 +548,32 @@ install(TARGETS qeeg
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
+# Optional: install top-level documentation files for users of binary packages.
+if (QEEG_INSTALL_DOCS)
+  install(FILES
+    LICENSE
+    README.md
+    CONTRIBUTING.md
+    SECURITY.md
+    CODE_OF_CONDUCT.md
+    CITATION.cff
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+  )
+
+  # Install JSON Schemas for machine-readable CLI outputs (useful for GUI / scripting integrations).
+  # Installed under <prefix>/${CMAKE_INSTALL_DOCDIR}/schemas when docs installation is enabled.
+  install(DIRECTORY schemas/
+    DESTINATION "${CMAKE_INSTALL_DOCDIR}/schemas"
+    FILES_MATCHING PATTERN "*.json"
+  )
+endif()
+
+
+# Install the generated version metadata header.
+install(FILES "${QEEG_GENERATED_INCLUDE_DIR}/qeeg/version_config.hpp"
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/qeeg"
+)
+
 if (QEEG_BUILD_CLI)
   # Install CLI tools
   install(TARGETS
@@ -372,6 +615,81 @@ if (QEEG_BUILD_CLI)
     qeeg_offline_app_cli
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   )
+
+  # Optional: install shell completion scripts for CLI tools.
+  #
+  #  - bash-completion uses an on-demand loader which expects the installed file
+  #    name to match the command name.
+  #  - zsh functions are conventionally installed as files named "_<command>".
+  #  - fish loads vendor completions from share/fish/vendor_completions.d.
+  if (QEEG_INSTALL_COMPLETIONS AND UNIX AND NOT WIN32)
+    # --- qeeg_offline_app_cli ---
+    # Bash
+    install(FILES completions/qeeg_offline_app_cli.bash
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/bash-completion/completions"
+      RENAME qeeg_offline_app_cli
+    )
+
+    # Zsh
+    install(FILES completions/_qeeg_offline_app_cli
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/zsh/site-functions"
+    )
+
+    # Fish
+    install(FILES completions/qeeg_offline_app_cli.fish
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/fish/vendor_completions.d"
+    )
+
+    # --- qeeg_version_cli ---
+    # Bash
+    install(FILES completions/qeeg_version_cli.bash
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/bash-completion/completions"
+      RENAME qeeg_version_cli
+    )
+
+    # Zsh
+    install(FILES completions/_qeeg_version_cli
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/zsh/site-functions"
+    )
+
+    # Fish
+    install(FILES completions/qeeg_version_cli.fish
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/fish/vendor_completions.d"
+    )
+
+
+    # --- qeeg_nf_cli ---
+    # Bash
+    install(FILES completions/qeeg_nf_cli.bash
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/bash-completion/completions"
+      RENAME qeeg_nf_cli
+    )
+
+    # Zsh
+    install(FILES completions/_qeeg_nf_cli
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/zsh/site-functions"
+    )
+
+    # Fish
+    install(FILES completions/qeeg_nf_cli.fish
+      DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/fish/vendor_completions.d"
+    )
+  endif()
+
+  # Optional: install man pages for select CLI tools.
+  #
+  # These are useful for system-wide installs on Unix-y platforms and allow:
+  #   man qeeg_offline_app_cli
+  #   man qeeg_version_cli
+  #   man qeeg_nf_cli
+  if (QEEG_INSTALL_MANPAGES AND UNIX AND NOT WIN32)
+    install(FILES
+      man/qeeg_offline_app_cli.1
+      man/qeeg_version_cli.1
+      man/qeeg_nf_cli.1
+      DESTINATION "${CMAKE_INSTALL_MANDIR}/man1"
+    )
+  endif()
 endif()
 
 include(CMakePackageConfigHelpers)
@@ -400,6 +718,94 @@ install(EXPORT qeegTargets
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/qeeg"
 )
 
+# Optional: pkg-config metadata for non-CMake consumers.
+#
+# This installs a qeeg.pc file under <prefix>/${CMAKE_INSTALL_LIBDIR}/pkgconfig
+# so users can do:
+#   pkg-config --cflags --libs qeeg
+#
+# Package managers for Unix platforms often expect this even when a CMake config
+# is provided.
+if (QEEG_INSTALL_PKGCONFIG)
+  # Generate qeeg.pc for pkg-config.
+  #
+  # We prefer a relocatable .pc file by defining "prefix" relative to the
+  # installed location of qeeg.pc (pkg-config's ${pcfiledir}). This makes the
+  # result robust to `cmake --install --prefix <path>`.
+  #
+  # Note: GNUInstallDirs variables like CMAKE_INSTALL_INCLUDEDIR can be either
+  # relative or absolute depending on the toolchain/packaging system. To avoid
+  # generating broken paths, we compute the final strings here and substitute
+  # them into the template.
+  set(QEEG_PKGCONFIG_PREFIX "\${pcfiledir}/../..")
+  set(QEEG_PKGCONFIG_LIBDIR "\${pcfiledir}/..")
+  if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+    set(QEEG_PKGCONFIG_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+  else()
+    set(QEEG_PKGCONFIG_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+  endif()
+
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/qeeg.pc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/qeeg.pc"
+    @ONLY
+  )
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/qeeg.pc"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+  )
+endif()
+
+# Convenience target: uninstall
+#
+# CMake does not ship an uninstall target by default, but many projects add
+# one as a convenience for local installs. This uses install_manifest.txt
+# generated by `cmake --install`.
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cmake_uninstall.cmake.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake"
+  @ONLY
+)
+
+add_custom_target(uninstall
+  COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake"
+  COMMENT "Uninstall installed qeeg files (uses install_manifest.txt)"
+)
+
+# ------------------------------------------------------------------------------
+# Documentation (Doxygen)
+# ------------------------------------------------------------------------------
+#
+# Optional: generate API documentation.
+#
+# This is opt-in and does not add any build dependencies unless enabled.
+if (QEEG_BUILD_DOCS)
+  find_package(Doxygen QUIET)
+  if (DOXYGEN_FOUND)
+    # Configure common doxygen settings.
+    set(DOXYGEN_PROJECT_NAME "qeeg")
+    set(DOXYGEN_PROJECT_NUMBER "${PROJECT_VERSION}")
+    set(DOXYGEN_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/docs")
+    set(DOXYGEN_GENERATE_HTML YES)
+    set(DOXYGEN_GENERATE_LATEX NO)
+    set(DOXYGEN_QUIET YES)
+
+    # Make the top-level README the landing page (Doxygen supports Markdown).
+    set(DOXYGEN_USE_MDFILE_AS_MAINPAGE "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+
+    # Generate documentation for public headers and (optionally) implementation.
+    doxygen_add_docs(qeeg_docs
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      COMMENT "Generate API documentation with Doxygen"
+    )
+
+    # Convenience alias (common target name)
+    add_custom_target(docs DEPENDS qeeg_docs)
+  else()
+    message(WARNING "QEEG_BUILD_DOCS=ON but doxygen was not found")
+  endif()
+endif()
+
 if(QEEG_BUILD_TESTS)
   enable_testing()
 
@@ -411,11 +817,70 @@ if(QEEG_BUILD_TESTS)
   target_compile_definitions(qeeg_test_string_literal_limits PRIVATE QEEG_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\")
   add_test(NAME qeeg_test_string_literal_limits COMMAND qeeg_test_string_literal_limits)
 
+  # Packaging smoke test: ensure install() exports a working CMake config that
+  # downstream projects can consume via find_package(qeeg CONFIG REQUIRED).
+  add_test(NAME qeeg_test_cmake_package_consume
+           COMMAND ${CMAKE_COMMAND}
+             -DQEEG_CONFIG=$<CONFIG>
+             -DQEEG_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_cmake_package_consume.cmake)
+
   # Offline app/toolbox sanity checks (only when CLI tools are built).
   if (QEEG_BUILD_CLI)
     add_test(NAME qeeg_test_offline_app_list_tools COMMAND qeeg_offline_app_cli --list-tools)
     add_test(NAME qeeg_test_offline_app_list_tools_json COMMAND qeeg_offline_app_cli --list-tools --json)
     add_test(NAME qeeg_test_offline_app_dispatch_version_help COMMAND qeeg_offline_app_cli qeeg_version_cli --help)
+
+    # qeeg_nf_cli machine-readable protocol listings should remain stable
+    add_test(NAME qeeg_test_nf_cli_list_protocols_names COMMAND qeeg_nf_cli --list-protocols-names)
+    add_test(NAME qeeg_test_nf_cli_list_protocols_json COMMAND qeeg_nf_cli --list-protocols-json)
+    add_test(NAME qeeg_test_nf_cli_protocol_help_json COMMAND qeeg_nf_cli --protocol-help-json alpha_up_pz)
+    add_test(NAME qeeg_test_nf_cli_list_bands COMMAND qeeg_nf_cli --list-bands)
+    add_test(NAME qeeg_test_nf_cli_list_bands_json COMMAND qeeg_nf_cli --list-bands-json)
+    add_test(NAME qeeg_test_nf_cli_list_metrics COMMAND qeeg_nf_cli --list-metrics)
+    add_test(NAME qeeg_test_nf_cli_list_metrics_json COMMAND qeeg_nf_cli --list-metrics-json)
+    add_test(NAME qeeg_test_nf_cli_list_channels_demo COMMAND qeeg_nf_cli --demo --fs 250 --seconds 1 --list-channels)
+    add_test(NAME qeeg_test_nf_cli_list_channels_json_demo COMMAND qeeg_nf_cli --demo --fs 250 --seconds 1 --list-channels-json)
+    add_test(NAME qeeg_test_nf_cli_print_config_json_demo COMMAND qeeg_nf_cli --demo --fs 250 --seconds 1 --print-config-json)
+    add_test(NAME qeeg_test_nf_cli_dry_run_demo COMMAND qeeg_nf_cli --demo --fs 250 --seconds 1 --dry-run)
+    add_test(NAME qeeg_test_nf_cli_version COMMAND qeeg_nf_cli --version)
+    add_test(NAME qeeg_test_nf_cli_version_json COMMAND qeeg_nf_cli --version-json)
+
+    # Validate machine-readable qeeg_nf_cli outputs against the JSON Schemas in schemas/.
+    # Prefer full Draft 2020-12 validation via python-jsonschema when available, but fall back
+    # to a minimal required-key check if the dependency isn't installed.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_FOUND)
+      add_test(NAME qeeg_test_nf_cli_json_schema_validation_demo
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/validate_nf_cli_json_outputs.py
+                 --nf-cli $<TARGET_FILE:qeeg_nf_cli>
+                 --schemas-dir ${CMAKE_CURRENT_SOURCE_DIR}/schemas
+                 --fs 250
+                 --seconds 1)
+
+      # Avoid writing .pyc / __pycache__ during CI/CTest runs.
+      set_tests_properties(qeeg_test_nf_cli_json_schema_validation_demo
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+      # Developer convenience: allow running the same JSON output validation from the
+      # build system, e.g. `cmake --build build --target qeeg_validate_nf_cli_json`.
+      add_custom_target(qeeg_validate_nf_cli_json
+                        COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+                          ${Python3_EXECUTABLE} -B
+                          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/validate_nf_cli_json_outputs.py
+                          --nf-cli $<TARGET_FILE:qeeg_nf_cli>
+                          --schemas-dir ${CMAKE_CURRENT_SOURCE_DIR}/schemas
+                          --fs 250
+                          --seconds 1
+                          --verbose
+                        DEPENDS qeeg_nf_cli
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                        COMMENT "Validate qeeg_nf_cli JSON outputs against schemas"
+                        VERBATIM)
+    else()
+      message(STATUS "Python3 interpreter not found; skipping qeeg_nf_cli JSON schema validation test")
+    endif()
     add_test(NAME qeeg_test_offline_app_shims_install_uninstall
              COMMAND ${CMAKE_COMMAND}
                -DQEEG_OFFLINE_APP=$<TARGET_FILE:qeeg_offline_app_cli>
@@ -789,3 +1254,32 @@ if(QEEG_BUILD_TESTS)
   endforeach()
 
 endif()
+
+# ------------------------------------------------------------------------------
+# Packaging (CPack)
+# ------------------------------------------------------------------------------
+#
+# This enables generating simple binary archive packages from the install() rules
+# above:
+#   cpack --config <build>/CPackConfig.cmake
+#
+# We keep the default generators conservative and cross-platform: ZIP everywhere,
+# plus TGZ on Unix-like hosts.
+set(CPACK_PACKAGE_NAME "qeeg")
+set(CPACK_PACKAGE_VENDOR "qeeg-map contributors")
+set(CPACK_PACKAGE_CONTACT "https://github.com/masterblaster1999/qeeg-neurofeedback-opensoftware/issues")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+
+# Give the archive a deterministic, informative name.
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+
+if (WIN32)
+  set(CPACK_GENERATOR "ZIP")
+else()
+  set(CPACK_GENERATOR "TGZ;ZIP")
+endif()
+
+include(CPack)

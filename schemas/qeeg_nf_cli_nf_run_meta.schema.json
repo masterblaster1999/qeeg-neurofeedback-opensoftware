@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_nf_run_meta.schema.json",
+  "title": "qeeg_nf_cli nf_run_meta.json",
+  "description": "Schema for the JSON report written to --outdir/nf_run_meta.json by qeeg_nf_cli.",
+  "type": "object",
+  "required": [
+    "Tool",
+    "Version",
+    "GitDescribe",
+    "BuildType",
+    "Compiler",
+    "CppStandard",
+    "TimestampLocal",
+    "OutputDir",
+    "Outputs",
+    "demo",
+    "input_path",
+    "channel_qc",
+    "channel_qc_resolved",
+    "qc_bad_channel_count",
+    "qc_bad_channels",
+    "allow_bad_metric_channels",
+    "fs_hz",
+    "protocol",
+    "metric_spec",
+    "band_spec",
+    "reward_direction",
+    "threshold_init",
+    "baseline_seconds",
+    "baseline_quantile",
+    "baseline_quantile_used",
+    "target_reward_rate",
+    "adapt_eta",
+    "adapt_mode",
+    "adapt_interval_seconds",
+    "adapt_window_seconds",
+    "adapt_min_samples",
+    "reward_rate_window_seconds",
+    "reward_on_frames",
+    "reward_off_frames",
+    "threshold_hysteresis",
+    "dwell_seconds",
+    "refractory_seconds",
+    "feedback_mode",
+    "feedback_span",
+    "train_block_seconds",
+    "rest_block_seconds",
+    "start_with_rest",
+    "window_seconds",
+    "update_seconds",
+    "metric_smooth_seconds",
+    "playback_speed",
+    "nperseg",
+    "log10_power",
+    "relative_power",
+    "relative_fmin_hz",
+    "relative_fmax_hz",
+    "overlap",
+    "artifact_gate",
+    "artifact_ptp_z",
+    "artifact_rms_z",
+    "artifact_kurtosis_z",
+    "artifact_min_bad_channels",
+    "artifact_ignore_channels",
+    "biotrace_ui",
+    "export_derived_events",
+    "derived_events_written",
+    "derived_events_csv",
+    "derived_events_tsv",
+    "derived_events_json"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_nf_run_meta.schema.json"
+    },
+    "Tool": {
+      "type": "string",
+      "const": "qeeg_nf_cli"
+    },
+    "Version": {
+      "type": "string"
+    },
+    "GitDescribe": {
+      "type": "string"
+    },
+    "BuildType": {
+      "type": "string"
+    },
+    "Compiler": {
+      "type": "string"
+    },
+    "CppStandard": {
+      "type": "string"
+    },
+    "TimestampLocal": {
+      "type": "string"
+    },
+    "OutputDir": {
+      "type": "string"
+    },
+    "Outputs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "demo": {
+      "type": "boolean"
+    },
+    "input_path": {
+      "type": "string"
+    },
+    "channel_qc": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "channel_qc_resolved": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "qc_bad_channel_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "qc_bad_channels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allow_bad_metric_channels": {
+      "type": "boolean"
+    },
+    "fs_hz": {
+      "type": "number",
+      "minimum": 0
+    },
+    "protocol": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metric_spec": {
+      "type": "string"
+    },
+    "band_spec": {
+      "type": "string"
+    },
+    "reward_direction": {
+      "type": "string",
+      "enum": [
+        "above",
+        "below"
+      ]
+    },
+    "threshold_init": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "baseline_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "baseline_quantile": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "baseline_quantile_used": {
+      "type": "number"
+    },
+    "target_reward_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "adapt_eta": {
+      "type": "number",
+      "minimum": 0
+    },
+    "adapt_mode": {
+      "type": "string"
+    },
+    "adapt_interval_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "adapt_window_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "adapt_min_samples": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "reward_rate_window_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "reward_on_frames": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "reward_off_frames": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "threshold_hysteresis": {
+      "type": "number",
+      "minimum": 0
+    },
+    "dwell_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "refractory_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "feedback_mode": {
+      "type": "string"
+    },
+    "feedback_span": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "train_block_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "rest_block_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "start_with_rest": {
+      "type": "boolean"
+    },
+    "window_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "update_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "metric_smooth_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "playback_speed": {
+      "type": "number",
+      "minimum": 0
+    },
+    "nperseg": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "log10_power": {
+      "type": "boolean"
+    },
+    "relative_power": {
+      "type": "boolean"
+    },
+    "relative_fmin_hz": {
+      "type": "number",
+      "minimum": 0
+    },
+    "relative_fmax_hz": {
+      "type": "number",
+      "minimum": 0
+    },
+    "overlap": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "artifact_gate": {
+      "type": "boolean"
+    },
+    "artifact_ptp_z": {
+      "type": "number"
+    },
+    "artifact_rms_z": {
+      "type": "number"
+    },
+    "artifact_kurtosis_z": {
+      "type": "number"
+    },
+    "artifact_min_bad_channels": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "artifact_ignore_channels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "biotrace_ui": {
+      "type": "boolean"
+    },
+    "export_derived_events": {
+      "type": "boolean"
+    },
+    "derived_events_written": {
+      "type": "boolean"
+    },
+    "derived_events_csv": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "derived_events_tsv": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "derived_events_json": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": true
+}

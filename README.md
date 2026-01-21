@@ -1,6 +1,7 @@
 # qeeg-map (first pass)
 
 ![CI](https://github.com/masterblaster1999/qeeg-neurofeedback-opensoftware/actions/workflows/ci.yml/badge.svg)
+![CodeQL](https://github.com/masterblaster1999/qeeg-neurofeedback-opensoftware/actions/workflows/codeql.yml/badge.svg)
 
 A small, dependency-light **C++17** project that:
 - loads EEG recordings from **EDF** (16‑bit EDF/EDF+), **BDF** (24‑bit) or **CSV**
@@ -48,6 +49,139 @@ A small, dependency-light **C++17** project that:
     - `plv_matrix_<band>.csv` (matrix)
     - `plv_pairs.csv` (edge list)
 
+
+## Neurofeedback (qeeg_nf_cli)
+
+This repository includes a first-pass, dependency-light **offline neurofeedback loop** tool: `qeeg_nf_cli`.
+
+It runs a "real-time-ish" feedback loop over an EDF/BDF/CSV recording (or a synthetic `--demo` stream), computing a metric per update window, estimating an initial threshold from a baseline period (unless overridden), then emitting reward state and optional continuous feedback.
+
+Quick start:
+
+```bash
+# List built-in protocol presets
+qeeg_nf_cli --list-protocols
+
+# Inspect channels in a recording (useful for choosing protocol channels)
+qeeg_nf_cli --input recording.edf --list-channels
+qeeg_nf_cli --input recording.edf --list-channels-json > channels.json
+
+# Optional: enrich the JSON channel listing with channel-QC labels (bad channels + reasons)
+qeeg_nf_cli --input recording.edf --channel-qc qc_outdir --list-channels-json > channels_qc.json
+
+# Inspect the fully resolved configuration (after protocol preset defaults and overrides)
+qeeg_nf_cli --demo --fs 250 --seconds 5 --protocol alpha_up_pz --print-config-json > config.json
+
+# Machine-friendly listings (for scripts / GUIs)
+qeeg_nf_cli --list-bands
+qeeg_nf_cli --list-bands-json > bands.json
+qeeg_nf_cli --list-metrics
+qeeg_nf_cli --list-metrics-json > metrics.json
+
+qeeg_nf_cli --list-protocols-names
+qeeg_nf_cli --list-protocols-json > protocols.json
+qeeg_nf_cli --protocol-help-json alpha_up_pz > alpha_up_pz.json
+
+# Version/build metadata (useful for bug reports)
+qeeg_nf_cli --version
+qeeg_nf_cli --version-json
+
+# Run a preset protocol and write a self-contained HTML UI export
+qeeg_nf_cli --input recording.edf --outdir out_nf --protocol alpha_up_pz --biotrace-ui
+
+# Expert mode: specify an explicit metric
+qeeg_nf_cli --input recording.edf --outdir out_nf --metric alpha:Pz --reward-direction above
+```
+
+Common outputs (written under `--outdir`): `nf_feedback.csv`, `nf_run_meta.json`, `nf_summary.json`.
+Optionally: `biotrace_ui.html`, `nf_derived_events.*`, and timeseries exports (bandpowers/coherence/artifacts).
+
+### JSON Schemas for qeeg_nf_cli JSON outputs
+
+To help build GUIs/analysis pipelines, this repo includes JSON Schema (Draft 2020-12) documents under `schemas/` that describe the structure of key machine-readable outputs from `qeeg_nf_cli`.
+
+STDOUT JSON (printed by flags):
+
+- `--list-channels-json`
+- `--print-config-json`
+- `--list-bands-json`
+- `--list-metrics-json`
+- `--list-protocols-json`
+- `--version-json`
+
+On-disk JSON (written under `--outdir`):
+
+- `nf_run_meta.json`
+- `nf_summary.json`
+- `nf_derived_events.json` (when exporting derived events; BIDS-style sidecar describing the `onset`/`duration` (seconds) and `trial_type` columns in `nf_derived_events.tsv`)
+
+For the object-shaped outputs above, `qeeg_nf_cli` also emits a top-level `$schema` field pointing at the schema document’s `$id`.
+This makes it easier for some editors/validators to automatically associate a JSON document with the right schema.
+
+These schema files are installed alongside the other documentation when `QEEG_INSTALL_DOCS=ON` (for example: `<prefix>/share/doc/qeeg/schemas/`).
+
+To validate the current `qeeg_nf_cli` JSON outputs against these schemas, you can run:
+
+```bash
+python3 scripts/validate_nf_cli_json_outputs.py \
+  --nf-cli ./build/qeeg_nf_cli \
+  --schemas-dir ./schemas
+
+# Validate an existing neurofeedback output directory (no demo run, no STDOUT checks)
+python3 scripts/validate_nf_cli_json_outputs.py \
+  --schemas-dir ./schemas \
+  --validate-outdir ./out_nf \
+  --skip-stdout \
+  --skip-demo
+```
+
+If you are building with CMake and a Python interpreter is available, the build
+also provides a convenience target that runs the same validation against the
+in-tree schemas and the built `qeeg_nf_cli`:
+
+```bash
+cmake --build ./build --target qeeg_validate_nf_cli_json
+```
+
+The validator will:
+
+- validate the STDOUT JSON outputs directly
+- run a short `--demo` session into a temporary `--outdir` and validate `nf_run_meta.json` / `nf_summary.json` / `nf_derived_events.json`
+- when exporting derived events, also sanity-check `nf_derived_events.tsv` and `nf_derived_events.csv` (required columns, numeric onset/duration, and basic consistency with the JSON sidecar)
+
+If `--validate-outdir` is provided, the validator will also validate any matching
+JSON outputs found there (derived-events outputs are treated as optional unless present).
+
+The validator will use full Draft 2020-12 JSON Schema validation when the `jsonschema` Python package is available:
+
+```bash
+python3 -m pip install --user jsonschema
+```
+
+When `jsonschema` is available, the validator also checks that the schema documents
+themselves are valid Draft 2020-12 schemas.
+
+If the dependency is not installed, it falls back to a lightweight, best-effort structural check
+(including arrays and nested required keys) for the subset of schema keywords used in this repo.
+
+The fallback validator also resolves local and cross-document `$ref` (by schema `$id` or filename),
+so it stays useful even if the JSON Schemas are refactored into multiple documents.
+
+> ⚠️ Neurofeedback is included here for **research/educational prototyping**.
+>
+> - This software is **not** a medical device and this documentation is **not** medical advice.
+> - Neurofeedback protocols can have **unintended effects** (for example, changes in arousal/sleep, headache, irritability, anxiety, or fatigue).
+> - If you have a neurological/psychiatric condition, are on medication, have an implanted medical device, or are unsure, consult a qualified clinician and stop if symptoms worsen.
+>
+> When in doubt, start with conservative parameters, short sessions, and careful monitoring/logging.
+
+Further reading / practice standards (background only):
+
+- Hammond & Kirk (2008) *First, do no harm: Adverse effects and the need for practice standards in neurofeedback* (Journal of Neurotherapy / ISNR-JNT open-access): https://www.isnr-jnt.org/article/view/16682
+- Rogel et al. (2015) *Transient adverse side effects during neurofeedback training: a randomized, sham-controlled, double blind study* (PubMed): https://pubmed.ncbi.nlm.nih.gov/26008757/
+- BCIA Professional Standards/Ethical Principles: https://www.bcia.org/bcia-professional-standards-ethical-principles
+- ISNR Neurofeedback FAQ (includes discussion of possible side effects): https://isnr.org/neurofeedback-faq
+
 ## Build
 
 ### Linux/macOS
@@ -70,9 +204,23 @@ cmake --build build --config Release
 If you have **CMake >= 3.19**, you can use the included `CMakePresets.json`:
 
 ```bash
+# Standard release build
 cmake --preset release
 cmake --build --preset release
 ctest --preset release
+
+# Release build with LTO/IPO (best-effort; toolchain-dependent)
+cmake --preset lto-release
+cmake --build --preset lto-release
+ctest --preset lto-release
+
+# Generate local HTML docs with Doxygen (requires doxygen)
+cmake --preset docs
+cmake --build --preset docs
+
+# clang-tidy analysis build (requires clang-tidy; can be slow)
+cmake --preset tidy
+cmake --build --preset tidy
 ```
 
 ### Useful build options
@@ -83,6 +231,48 @@ cmake -S . -B build -DQEEG_BUILD_CLI=OFF
 
 # Enable AddressSanitizer + UndefinedBehaviorSanitizer (best-effort; non-MSVC)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DQEEG_ENABLE_SANITIZERS=ON
+
+# Enable ccache (if installed) for faster rebuilds (developer convenience)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DQEEG_ENABLE_CCACHE=ON
+
+# Enable clang-tidy during compilation (requires clang-tidy; can slow builds)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DQEEG_ENABLE_CLANG_TIDY=ON
+
+# Build static libqeeg with position-independent code (-fPIC where relevant)
+# (useful if you link libqeeg.a into your own shared library)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQEEG_ENABLE_PIC=ON
+
+# Enable interprocedural optimization (LTO/IPO) in Release-ish builds (best-effort)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQEEG_ENABLE_IPO=ON
+
+# Build qeeg as a shared library (.so/.dylib) instead of a static library (.a)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+
+# Generate local HTML docs with Doxygen (requires doxygen)
+cmake -S . -B build-docs -DCMAKE_BUILD_TYPE=Release -DQEEG_BUILD_DOCS=ON -DQEEG_BUILD_TESTS=OFF -DQEEG_BUILD_CLI=OFF
+cmake --build build-docs --target docs
+
+# For shared builds, you can disable the (relative) install RPATH if you are
+# packaging for a distribution that prefers to manage runtime search paths
+# externally.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DQEEG_INSTALL_RPATH=OFF
+```
+
+
+### Formatting (clang-format)
+
+The repo includes a `.clang-format` file, and CI checks formatting on changed C/C++ files.
+
+* Check formatting (no changes):
+
+```bash
+clang-format --style=file --dry-run --Werror path/to/file.cpp
+```
+
+* Apply formatting in-place:
+
+```bash
+clang-format --style=file -i path/to/file.cpp
 ```
 
 ## Install (optional)
@@ -95,11 +285,145 @@ cmake --build build --config Release
 cmake --install build --prefix <install-prefix>
 ```
 
+To uninstall (from the same build directory you installed from):
+
+```bash
+cmake --build build --target uninstall
+```
+
+Note: the uninstall target uses the build directory's `install_manifest.txt`, which is written by the most recent `cmake --install` run from that build tree.
+
+
+### Shell completions (optional)
+
+If you install the CLI tools, the build can also install shell completion scripts for:
+
+- `qeeg_offline_app_cli` (the single-binary toolbox)
+  - completes offline-app flags (`--list-tools`, `--install-shims`, ...)
+  - completes tool names for the first positional argument
+  - completes tool names after `--tool`
+- `qeeg_version_cli`
+  - completes `--full`, `--json`, and `--help`
+- `qeeg_nf_cli`
+  - completes common neurofeedback flags
+  - completes protocol preset names for `--protocol` / `--protocol-help`
+  - completes enumerated values for select flags (for example `above|below`, `exp|quantile`, `state|split|bundle`)
+
+On Unix-y platforms this is enabled by default and can be toggled with:
+
+```bash
+cmake -S . -B build -DQEEG_INSTALL_COMPLETIONS=ON   # enable
+cmake -S . -B build -DQEEG_INSTALL_COMPLETIONS=OFF  # disable
+```
+
+Installed locations (relative to `<prefix>`):
+
+- **Bash** (bash-completion):
+  - `<prefix>/share/bash-completion/completions/qeeg_offline_app_cli`
+  - `<prefix>/share/bash-completion/completions/qeeg_version_cli`
+  - `<prefix>/share/bash-completion/completions/qeeg_nf_cli`
+  - Note: the installed file name must match the command for bash-completion's on-demand loader.
+- **Zsh**:
+  - `<prefix>/share/zsh/site-functions/_qeeg_offline_app_cli`
+  - `<prefix>/share/zsh/site-functions/_qeeg_version_cli`
+  - `<prefix>/share/zsh/site-functions/_qeeg_nf_cli`
+- **Fish**:
+  - `<prefix>/share/fish/vendor_completions.d/qeeg_offline_app_cli.fish`
+  - `<prefix>/share/fish/vendor_completions.d/qeeg_version_cli.fish`
+  - `<prefix>/share/fish/vendor_completions.d/qeeg_nf_cli.fish`
+
+Per-user install (no root) examples:
+
+- Bash: copy the completion file(s) to:
+  - `~/.local/share/bash-completion/completions/qeeg_offline_app_cli`
+  - `~/.local/share/bash-completion/completions/qeeg_version_cli`
+  - `~/.local/share/bash-completion/completions/qeeg_nf_cli`
+  (or `$XDG_DATA_HOME/bash-completion/completions/<command>`)
+- Zsh: copy `_qeeg_offline_app_cli`, `_qeeg_version_cli`, and `_qeeg_nf_cli` into a directory on your `$fpath` (for example `~/.zsh/completions/`) and ensure `compinit` is enabled.
+- Fish:
+  - `~/.config/fish/completions/qeeg_offline_app_cli.fish`
+  - `~/.config/fish/completions/qeeg_version_cli.fish`
+  - `~/.config/fish/completions/qeeg_nf_cli.fish`
+
+Then restart your shell.
+
+### Man pages (optional)
+
+If you install the CLI tools, the build can also install **man pages** for:
+
+- `qeeg_offline_app_cli`
+- `qeeg_version_cli`
+- `qeeg_nf_cli`
+
+On Unix-y platforms this is enabled by default and can be toggled with:
+
+```bash
+cmake -S . -B build -DQEEG_INSTALL_MANPAGES=ON   # enable
+cmake -S . -B build -DQEEG_INSTALL_MANPAGES=OFF  # disable
+```
+
+Installed locations (relative to `<prefix>`):
+
+- `<prefix>/share/man/man1/qeeg_offline_app_cli.1`
+- `<prefix>/share/man/man1/qeeg_version_cli.1`
+- `<prefix>/share/man/man1/qeeg_nf_cli.1`
+
+Usage:
+
+```bash
+man qeeg_offline_app_cli
+man qeeg_version_cli
+man qeeg_nf_cli
+```
+
+If you installed into a non-system prefix, you may need to extend `MANPATH`:
+
+```bash
+export MANPATH="<prefix>/share/man:${MANPATH}"
+man qeeg_offline_app_cli
+```
+
+
 To consume the library from another CMake project:
 
 ```cmake
 find_package(qeeg CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE qeeg::qeeg)
+```
+
+To consume via **pkg-config** (non-Windows):
+
+```bash
+# libdir is usually 'lib' or 'lib64' depending on your platform/toolchain
+export PKG_CONFIG_PATH="<install-prefix>/<libdir>/pkgconfig:${PKG_CONFIG_PATH}"
+pkg-config --cflags --libs qeeg
+
+# Example: compile+link a tiny consumer (replace main.cpp with your source file):
+#   c++ $(pkg-config --cflags qeeg) main.cpp -o main $(pkg-config --libs qeeg)
+```
+
+
+## Package (optional)
+
+If you want a simple portable archive of the install tree (useful for sharing binaries without running an installer), you can use **CPack**:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQEEG_BUILD_TESTS=OFF -DQEEG_BUILD_CLI=ON
+cmake --build build --config Release
+cpack --config build/CPackConfig.cmake -C Release
+```
+
+The resulting `.zip` / `.tar.gz` files will be written to the build directory and contain the files from the project's `install()` rules (so the contents depend on options like `QEEG_BUILD_CLI`, `QEEG_INSTALL_DOCS`, etc.).
+
+## Docs (optional)
+
+If you have **Doxygen** installed, you can generate local HTML documentation:
+
+```bash
+cmake -S . -B build-docs -DCMAKE_BUILD_TYPE=Release -DQEEG_BUILD_DOCS=ON -DQEEG_BUILD_TESTS=OFF -DQEEG_BUILD_CLI=OFF
+cmake --build build-docs --target docs
+
+# Open build-docs/docs/html/index.html in your browser
 ```
 
 ## Usage
@@ -110,7 +434,7 @@ target_link_libraries(my_app PRIVATE qeeg::qeeg)
 # From your build directory (where the executables live):
 ./build/qeeg_version_cli
 ./build/qeeg_version_cli --full
-./build/qeeg_version_cli --json
+./build/qeeg_version_cli --json  # includes version_major/minor/patch for scripts
 ```
 
 ### QEEG Tools UI (dashboard)
@@ -1280,6 +1604,10 @@ By default, maps are rendered using **IDW** (fast, simple). You can enable **sph
 - `src/` — implementation + CLI
 - `examples/` — sample montage + sample data
 - `tests/` — a couple of basic sanity tests
+
+## Citation
+
+If you use this software in academic work, you can cite it using the metadata in `CITATION.cff` (supported by GitHub and many reference managers).
 
 ## License
 

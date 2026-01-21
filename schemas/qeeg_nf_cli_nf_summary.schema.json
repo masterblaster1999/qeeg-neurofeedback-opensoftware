@@ -1,0 +1,335 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_nf_summary.schema.json",
+  "title": "qeeg_nf_cli nf_summary.json",
+  "description": "Schema for the JSON summary report written to --outdir/nf_summary.json by qeeg_nf_cli.",
+  "type": "object",
+  "required": [
+    "Tool",
+    "Version",
+    "GitDescribe",
+    "BuildType",
+    "Compiler",
+    "CppStandard",
+    "TimestampLocal",
+    "OutputDir",
+    "protocol",
+    "input_path",
+    "fs_hz",
+    "file_duration_sec",
+    "wall_elapsed_sec",
+    "playback_speed_arg",
+    "achieved_speed_x",
+    "pacer_enabled",
+    "pacer_max_lag_sec",
+    "pacer_total_sleep_sec",
+    "metric_spec",
+    "metric_smooth_seconds",
+    "threshold_hysteresis",
+    "dwell_seconds",
+    "refractory_seconds",
+    "feedback_mode",
+    "feedback_span_used",
+    "train_block_seconds",
+    "rest_block_seconds",
+    "start_with_rest",
+    "baseline_seconds",
+    "target_reward_rate",
+    "adapt_mode",
+    "adapt_eta",
+    "adapt_interval_seconds",
+    "adapt_window_seconds",
+    "adapt_min_samples",
+    "no_adaptation",
+    "adapt_updates",
+    "adapt_target_quantile",
+    "adapt_last_desired_threshold",
+    "adapt_history_size_final",
+    "threshold_init",
+    "threshold_final",
+    "frames",
+    "valid_training_frames",
+    "overall_reward_rate",
+    "reward_value_mean",
+    "reward_value_max",
+    "metric_training"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_nf_summary.schema.json"
+    },
+    "Tool": {
+      "type": "string",
+      "const": "qeeg_nf_cli"
+    },
+    "Version": {
+      "type": "string"
+    },
+    "GitDescribe": {
+      "type": "string"
+    },
+    "BuildType": {
+      "type": "string"
+    },
+    "Compiler": {
+      "type": "string"
+    },
+    "CppStandard": {
+      "type": "string"
+    },
+    "TimestampLocal": {
+      "type": "string"
+    },
+    "OutputDir": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "input_path": {
+      "type": "string"
+    },
+    "fs_hz": {
+      "type": "number",
+      "minimum": 0
+    },
+    "file_duration_sec": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "wall_elapsed_sec": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "playback_speed_arg": {
+      "type": "number",
+      "minimum": 0
+    },
+    "achieved_speed_x": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "pacer_enabled": {
+      "type": "boolean"
+    },
+    "pacer_max_lag_sec": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "pacer_total_sleep_sec": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "metric_spec": {
+      "type": "string"
+    },
+    "metric_smooth_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "threshold_hysteresis": {
+      "type": "number",
+      "minimum": 0
+    },
+    "dwell_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "refractory_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "feedback_mode": {
+      "type": "string"
+    },
+    "feedback_span_used": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "train_block_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "rest_block_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "start_with_rest": {
+      "type": "boolean"
+    },
+    "baseline_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "target_reward_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "adapt_mode": {
+      "type": "string"
+    },
+    "adapt_eta": {
+      "type": "number",
+      "minimum": 0
+    },
+    "adapt_interval_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "adapt_window_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "adapt_min_samples": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "no_adaptation": {
+      "type": "boolean"
+    },
+    "adapt_updates": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "adapt_target_quantile": {
+      "type": "number"
+    },
+    "adapt_last_desired_threshold": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "adapt_history_size_final": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "threshold_init": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "threshold_final": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "frames": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline",
+        "training",
+        "rest",
+        "artifact",
+        "reward"
+      ],
+      "properties": {
+        "baseline": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "training": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rest": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifact": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reward": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "valid_training_frames": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "overall_reward_rate": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "reward_value_mean": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "reward_value_max": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "metric_training": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "n",
+        "mean",
+        "stddev",
+        "min",
+        "max"
+      ],
+      "properties": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mean": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "stddev": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "min": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,127 @@
+#compdef qeeg_nf_cli
+
+# Zsh completion for qeeg_nf_cli
+#
+# Provides completion for common options and dynamic completion of built-in
+# protocol preset names via `qeeg_nf_cli --list-protocols`.
+
+_qeeg_nf_cli_protocols() {
+  local -a protocols
+  # Only capture lines that start with exactly two spaces followed by a token.
+  protocols=(${(f)"$(qeeg_nf_cli --list-protocols-names 2>/dev/null || qeeg_nf_cli --list-protocols 2>/dev/null | sed -n 's/^  \([^ ][^ ]*\).*/\1/p')"})
+  _describe -t protocols 'protocol' protocols
+}
+
+_qeeg_nf_cli() {
+  _arguments -s -S \
+    '--help[Show help]' \
+    '-h[Show help]' \
+    '--version[Print version and exit]' \
+    '--version-json[Print version/build metadata as JSON and exit]' \
+    '--input[Input EDF/BDF/CSV file]:file:_files' \
+    '--fs[Sampling rate for CSV/demo]:Hz:' \
+    '--outdir[Output directory]:dir:_directories' \
+    '--list-channels[Print input channel names (one per line) and exit]' \
+    '--list-channels-json[Print input channel info as JSON and exit]' \
+    '--list-bands[Print default EEG bands (name:lo-hi) and exit]' \
+    '--list-bands-json[Print default EEG bands as JSON and exit]' \
+    '--list-metrics[Print metric spec examples and exit]' \
+    '--list-metrics-json[Print metric spec examples as JSON and exit]' \
+    '--print-config-json[Print resolved configuration as JSON and exit]' \
+    '--dry-run[Validate args/inputs and exit (no outputs written)]' \
+    '' \
+    '--list-protocols[List built-in NF protocol presets and exit]' \
+    '--list-protocols-names[List preset names (one per line) and exit]' \
+    '--list-protocols-json[List presets as JSON and exit]' \
+    '--protocol[Apply built-in protocol preset]:protocol:_qeeg_nf_cli_protocols' \
+    '--protocol-help[Show details for one preset and exit]:protocol:_qeeg_nf_cli_protocols' \
+    '--protocol-help-json[Show details for one preset as JSON and exit]:protocol:_qeeg_nf_cli_protocols' \
+    '--protocol-ch[Override {ch} for single-channel presets]:channel:' \
+    '--protocol-a[Override {a} for pair presets]:channel:' \
+    '--protocol-b[Override {b} for pair presets]:channel:' \
+    '' \
+    '--bands[Band specification string]:spec:' \
+    '--metric[Metric specification string]:spec:' \
+    '--window[Sliding window seconds]:seconds:' \
+    '--update[Update interval seconds]:seconds:' \
+    '--metric-smooth[EMA smoothing time-constant seconds]:seconds:' \
+    '--nperseg[Welch segment length]:samples:' \
+    '--overlap[Welch overlap fraction]:frac:' \
+    '--log10[Use log10(power) (bandpower-like metrics)]' \
+    '--relative[Use relative power normalization (bandpower-like metrics)]' \
+    '--relative-range[Relative power range LO HI]:lo (Hz): :hi (Hz):' \
+    '' \
+    '--baseline[Baseline seconds for initial threshold]:seconds:' \
+    '--baseline-quantile[Baseline quantile in [0,1] for initial threshold]:q:' \
+    '--threshold[Explicit initial threshold]:value:' \
+    '--reward-direction[Reward direction]:direction:(above below)' \
+    '--reward-above[Alias for --reward-direction above]' \
+    '--reward-below[Alias for --reward-direction below]' \
+    '--target-rate[Target reward rate]:rate:' \
+    '--eta[Adaptive threshold gain]:eta:' \
+    '--adapt-mode[Adaptive threshold mode]:mode:(exp quantile)' \
+    '--adapt-interval[Update threshold every S seconds (0=every frame)]:seconds:' \
+    '--adapt-window[Quantile mode: rolling window seconds]:seconds:' \
+    '--adapt-min-samples[Quantile mode: minimum samples]:n:' \
+    '--rate-window[Reward-rate window seconds]:seconds:' \
+    '--reward-on-frames[Debounce ON frames]:n:' \
+    '--reward-off-frames[Debounce OFF frames]:n:' \
+    '--threshold-hysteresis[Numeric hysteresis band around threshold]:value:' \
+    '--hysteresis[Alias for --threshold-hysteresis]:value:' \
+    '--dwell[Reward shaping: dwell seconds]:seconds:' \
+    '--refractory[Reward shaping: refractory seconds]:seconds:' \
+    '--feedback-mode[Feedback value mode]:mode:(binary continuous)' \
+    '--feedback-span[Continuous mode: metric span for full-scale feedback]:value:' \
+    '' \
+    '--train-block[Training block seconds]:seconds:' \
+    '--rest-block[Rest block seconds]:seconds:' \
+    '--start-rest[Start the schedule with a rest block]' \
+    '--no-adaptation[Disable adaptive thresholding]' \
+    '' \
+    '--average-reference[Apply common average reference]' \
+    '--notch[Notch frequency (Hz)]:Hz:' \
+    '--notch-q[Notch Q factor]:Q:' \
+    '--bandpass[Bandpass LO HI (Hz)]:lo (Hz): :hi (Hz):' \
+    '' \
+    '--chunk[Playback chunk seconds]:seconds:' \
+    '--realtime[Pace playback at 1x real-time]' \
+    '--speed[Playback speed multiplier (X>0)]:x:' \
+    '' \
+    '--export-bandpowers[Export bandpower_timeseries.csv (bandpower/ratio)]' \
+    '--export-coherence[Export coherence timeseries (coherence mode)]' \
+    '' \
+    '--artifact-gate[Enable artifact gating]' \
+    '--artifact-ptp-z[Artifact threshold: peak-to-peak robust z]:z:' \
+    '--artifact-rms-z[Artifact threshold: RMS robust z]:z:' \
+    '--artifact-kurtosis-z[Artifact threshold: excess kurtosis robust z]:z:' \
+    '--artifact-min-bad-ch[Artifact bad if >=N channels flagged]:n:' \
+    '--artifact-ignore[Comma-separated channel names to ignore]:list:' \
+    '--channel-qc[Optional channel QC input (file or outdir)]:file:_files' \
+    '--allow-bad-metric-channels[Allow metric channels marked bad by --channel-qc]' \
+    '--export-artifacts[Export artifact_gate_timeseries.csv]' \
+    '' \
+    '--biotrace-ui[Write BioTrace+ style HTML UI export]' \
+    '--export-derived-events[Write nf_derived_events.csv/.tsv/.json even if --biotrace-ui is off]' \
+    '' \
+    '--audio-wav[Write reward-tone WAV (mono PCM16)]:file:_files' \
+    '--audio-rate[Audio sample rate]:Hz:' \
+    '--audio-tone[Reward tone frequency]:Hz:' \
+    '--audio-gain[Reward tone gain in [0,1]]:gain:' \
+    '--audio-attack[Tone attack seconds]:seconds:' \
+    '--audio-release[Tone release seconds]:seconds:' \
+    '' \
+    '--osc-host[OSC destination host]:host:' \
+    '--osc-port[OSC destination port (0 disables)]:port:' \
+    '--osc-prefix[OSC address prefix]:prefix:' \
+    '--osc-mode[OSC output mode]:mode:(state split bundle)' \
+    '' \
+    '--pac-bins[PAC: number of phase bins]:n:' \
+    '--pac-trim[PAC: trim fraction per window]:frac:' \
+    '--pac-zero-phase[PAC: use zero-phase bandpass filters]' \
+    '' \
+    '--demo[Generate synthetic recording instead of reading file]' \
+    '--seconds[Duration for --demo]:seconds:' \
+    '*::args:->args'
+}
+
+_qeeg_nf_cli "$@"

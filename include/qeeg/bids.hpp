@@ -242,7 +242,9 @@ inline void write_bids_events_tsv(const std::string& path, const std::vector<Ann
 }
 
 // Write a minimal events.json describing the columns in events.tsv.
-// By default describes `trial_type` only.
+//
+// BIDS requires `onset` and `duration` columns (seconds) in events.tsv; these are always
+// described for better interoperability. Additional columns are described based on opts.
 void write_bids_events_json(const std::string& path, const BidsEventsTsvOptions& opts);
 
 // Write events.json and optionally include a `Levels` mapping for trial_type.

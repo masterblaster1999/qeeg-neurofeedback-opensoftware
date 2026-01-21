@@ -1,0 +1,18 @@
+# pkg-config metadata.
+#
+# We try to keep this file relocatable (so `cmake --install --prefix ...` works
+# and install trees can be moved) by using pkg-config's built-in "pcfiledir"
+# variable. See `pkg-config(1)` for details.
+#
+# These values are computed in CMake to handle toolchains/packaging systems
+# where GNUInstallDirs variables can be absolute.
+prefix=@QEEG_PKGCONFIG_PREFIX@
+exec_prefix=${prefix}
+libdir=@QEEG_PKGCONFIG_LIBDIR@
+includedir=@QEEG_PKGCONFIG_INCLUDEDIR@
+
+Name: qeeg
+Description: @PROJECT_DESCRIPTION@
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lqeeg
+Cflags: -I${includedir}

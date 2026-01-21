@@ -24,6 +24,7 @@
 #include "qeeg/utils.hpp"
 #include "qeeg/wav_writer.hpp"
 #include "qeeg/osc.hpp"
+#include "qeeg/version.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -39,10 +40,21 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_set>
 
 using namespace qeeg;
+
+// Canonical JSON Schema locations for qeeg_nf_cli machine-readable outputs.
+//
+// These URLs match the $id fields in the corresponding schema documents under /schemas.
+static constexpr const char* k_schema_base_url =
+  "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/";
+
+static std::string schema_url(const char* schema_file) {
+  return std::string(k_schema_base_url) + schema_file;
+}
 
 struct Args {
   std::string input_path;
@@ -57,6 +69,13 @@ struct Args {
   std::string protocol_ch;
   std::string protocol_a;
   std::string protocol_b;
+
+  // Input inspection helpers (for scripts / GUIs).
+  bool list_channels{false};
+  bool list_channels_json{false};
+
+  bool print_config_json{false};
+  bool dry_run{false};
 
   struct ExplicitFlags {
     bool bands{false};
@@ -242,6 +261,149 @@ static void print_protocol_list() {
   }
 }
 
+
+static void print_protocol_list_names() {
+  const auto presets = qeeg::built_in_nf_protocols();
+  for (const auto& p : presets) {
+    std::cout << p.name << "\n";
+  }
+}
+
+
+
+static void print_default_bands() {
+  const auto bands = default_eeg_bands();
+  for (const auto& b : bands) {
+    std::cout << b.name << ":" << b.fmin_hz << "-" << b.fmax_hz << "\n";
+  }
+}
+
+static void print_default_bands_json() {
+  const auto bands = default_eeg_bands();
+  std::cout << "[\n";
+  for (size_t i = 0; i < bands.size(); ++i) {
+    const auto& b = bands[i];
+    std::cout << "  {\"name\":\"" << json_escape(b.name) << "\",\"fmin_hz\":" << b.fmin_hz
+              << ",\"fmax_hz\":" << b.fmax_hz << "}";
+    if (i + 1 < bands.size()) std::cout << ",\n";
+    else std::cout << "\n";
+  }
+  std::cout << "]\n";
+}
+
+struct MetricExample {
+  const char* kind;
+  const char* example;
+  const char* description;
+};
+
+static std::vector<MetricExample> nf_metric_examples() {
+  return {
+      {"bandpower", "alpha:Pz", "Bandpower in a named band at a channel"},
+      {"bandpower", "band:alpha:Pz", "Explicit bandpower form (alias for alpha:Pz)"},
+      {"ratio", "alpha/beta:Pz", "Ratio of two bands at a channel"},
+      {"ratio", "ratio:alpha:beta:Pz", "Explicit ratio form (alias for alpha/beta:Pz)"},
+      {"asymmetry", "asym:alpha:F4:F3", "Asymmetry/log power ratio between two channels"},
+      {"coherence", "coh:alpha:F3:F4", "Magnitude-squared coherence between two channels"},
+      {"coherence", "imcoh:alpha:F3:F4", "Imaginary coherency proxy between two channels"},
+      {"coherence", "coh:imcoh:alpha:F3:F4", "Explicit coherence measure form"},
+      {"pac", "pac:theta:gamma:Cz", "PAC (Tort MI): phase band, amp band, channel"},
+      {"pac", "mvl:theta:gamma:Cz", "PAC (mean vector length): phase band, amp band, channel"},
+  };
+}
+
+static void print_metric_examples() {
+  const auto ex = nf_metric_examples();
+  std::cout << "Metric specification examples (use with --metric):\n";
+  for (const auto& e : ex) {
+    std::cout << "  " << e.example << "\n";
+    std::cout << "      " << e.description << "\n";
+  }
+}
+
+static void print_metric_examples_json() {
+  const auto ex = nf_metric_examples();
+  std::cout << "[\n";
+  for (size_t i = 0; i < ex.size(); ++i) {
+    const auto& e = ex[i];
+    std::cout << "  {\"kind\":\"" << json_escape(e.kind) << "\",\"example\":\"" << json_escape(e.example)
+              << "\",\"description\":\"" << json_escape(e.description) << "\"}";
+    if (i + 1 < ex.size()) std::cout << ",\n";
+    else std::cout << "\n";
+  }
+  std::cout << "]\n";
+}
+
+static void emit_protocol_json(std::ostream& out,
+                               const qeeg::NfProtocolPreset& p,
+                               const std::string& indent) {
+  const std::string i0 = indent;
+  const std::string i1 = indent + "  ";
+
+  out << i0 << "{\n";
+  out << i1 << "\"name\": \"" << json_escape(p.name) << "\",\n";
+  out << i1 << "\"title\": \"" << json_escape(p.title) << "\",\n";
+  out << i1 << "\"description\": \"" << json_escape(p.description) << "\",\n";
+  out << i1 << "\"metric_template\": \"" << json_escape(p.metric_template) << "\",\n";
+
+  out << i1 << "\"metric_default\": ";
+  try {
+    const std::string metric = qeeg::nf_render_protocol_metric(p);
+    out << "\"" << json_escape(metric) << "\"";
+  } catch (const std::exception&) {
+    out << "null";
+  }
+  out << ",\n";
+
+  out << i1 << "\"band_spec\": ";
+  if (!p.band_spec.empty()) out << "\"" << json_escape(p.band_spec) << "\"";
+  else out << "null";
+  out << ",\n";
+
+  out << i1 << "\"default_channel\": ";
+  if (!p.default_channel.empty()) out << "\"" << json_escape(p.default_channel) << "\"";
+  else out << "null";
+  out << ",\n";
+
+  out << i1 << "\"default_channel_a\": ";
+  if (!p.default_channel_a.empty()) out << "\"" << json_escape(p.default_channel_a) << "\"";
+  else out << "null";
+  out << ",\n";
+
+  out << i1 << "\"default_channel_b\": ";
+  if (!p.default_channel_b.empty()) out << "\"" << json_escape(p.default_channel_b) << "\"";
+  else out << "null";
+  out << ",\n";
+
+  out << i1 << "\"reward_direction\": \"" << reward_direction_name(p.reward_direction) << "\",\n";
+  out << i1 << "\"target_reward_rate\": " << p.target_reward_rate << ",\n";
+  out << i1 << "\"baseline_seconds\": " << p.baseline_seconds << ",\n";
+  out << i1 << "\"window_seconds\": " << p.window_seconds << ",\n";
+  out << i1 << "\"update_seconds\": " << p.update_seconds << ",\n";
+  out << i1 << "\"metric_smooth_seconds\": " << p.metric_smooth_seconds << "\n";
+  out << i0 << "}";
+}
+
+static void print_protocol_list_json() {
+  const auto presets = qeeg::built_in_nf_protocols();
+  std::cout << "[\n";
+  for (size_t i = 0; i < presets.size(); ++i) {
+    emit_protocol_json(std::cout, presets[i], "  ");
+    if (i + 1 < presets.size()) std::cout << ",\n";
+    else std::cout << "\n";
+  }
+  std::cout << "]\n";
+}
+
+static void print_protocol_help_json(const std::string& name) {
+  const auto p = qeeg::find_nf_protocol_preset(name);
+  if (!p.has_value()) {
+    throw std::runtime_error("Unknown protocol preset: " + name);
+  }
+  emit_protocol_json(std::cout, *p, "");
+  std::cout << "\n";
+}
+
 static void print_protocol_help(const std::string& name) {
   const auto p = qeeg::find_nf_protocol_preset(name);
   if (!p.has_value()) {
@@ -323,6 +485,429 @@ static void apply_protocol_preset(Args* a) {
   }
 }
 
+
+static void print_channel_list(const EEGRecording& rec) {
+  for (const auto& ch : rec.channel_names) {
+    std::cout << ch << "\n";
+  }
+}
+
+static void print_channel_list_json(const EEGRecording& rec, const Args& args) {
+  const double dur_sec = (rec.fs_hz > 0.0)
+                           ? (static_cast<double>(rec.n_samples()) / rec.fs_hz)
+                           : 0.0;
+
+  // Optional: enrich the channel listing with channel-QC labels.
+  bool have_qc = false;
+  std::string qc_resolved_path;
+  std::vector<std::string> qc_bad_names;
+  std::vector<std::pair<std::string, std::string>> qc_bad_reasons;
+
+  if (!args.channel_qc.empty()) {
+    ChannelQcMap qc = load_channel_qc_any(args.channel_qc, &qc_resolved_path);
+    have_qc = true;
+    qc_bad_names.reserve(rec.n_channels());
+    qc_bad_reasons.reserve(rec.n_channels());
+
+    for (size_t c = 0; c < rec.n_channels(); ++c) {
+      const std::string key = normalize_channel_name(rec.channel_names[c]);
+      const auto it = qc.find(key);
+      if (it != qc.end() && it->second.bad) {
+        qc_bad_names.push_back(rec.channel_names[c]);
+        qc_bad_reasons.emplace_back(rec.channel_names[c], it->second.reasons);
+      }
+    }
+  }
+
+  std::cout << "{\n";
+  std::cout << "  \"$schema\": \"" << json_escape(schema_url("qeeg_nf_cli_list_channels.schema.json")) << "\",\n";
+  std::cout << "  \"Tool\": \"qeeg_nf_cli\",\n";
+  std::cout << "  \"Version\": \"" << json_escape(qeeg::version_string()) << "\",\n";
+  std::cout << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
+  std::cout << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
+  std::cout << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
+  std::cout << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
+  std::cout << "  \"demo\": " << (args.demo ? "true" : "false") << ",\n";
+  std::cout << "  \"input\": ";
+  if (args.demo) std::cout << "null";
+  else std::cout << "\""
+                << json_escape(args.input_path)
+                << "\"";
+  std::cout << ",\n";
+  std::cout << "  \"fs_hz\": " << rec.fs_hz << ",\n";
+  std::cout << "  \"n_channels\": " << rec.n_channels() << ",\n";
+  std::cout << "  \"n_samples\": " << rec.n_samples() << ",\n";
+  std::cout << "  \"duration_seconds\": " << dur_sec << ",\n";
+  std::cout << "  \"channels\": [\n";
+  for (size_t i = 0; i < rec.channel_names.size(); ++i) {
+    std::cout << "    \"" << json_escape(rec.channel_names[i]) << "\"";
+    if (i + 1 < rec.channel_names.size()) std::cout << ",";
+    std::cout << "\n";
+  }
+  std::cout << "  ]";
+
+  if (have_qc) {
+    std::cout << ",\n";
+    std::cout << "  \"channel_qc\": \"" << json_escape(args.channel_qc) << "\",\n";
+    std::cout << "  \"channel_qc_resolved\": \"" << json_escape(qc_resolved_path) << "\",\n";
+    std::cout << "  \"qc_bad_channel_count\": " << qc_bad_names.size() << ",\n";
+
+    std::cout << "  \"qc_bad_channels\": [";
+    for (size_t i = 0; i < qc_bad_names.size(); ++i) {
+      if (i) std::cout << ", ";
+      std::cout << "\"" << json_escape(qc_bad_names[i]) << "\"";
+    }
+    std::cout << "],\n";
+
+    std::cout << "  \"qc_bad_channel_reasons\": {\n";
+    for (size_t i = 0; i < qc_bad_reasons.size(); ++i) {
+      const auto& kv = qc_bad_reasons[i];
+      std::cout << "    \"" << json_escape(kv.first) << "\": \"" << json_escape(kv.second) << "\"";
+      if (i + 1 < qc_bad_reasons.size()) std::cout << ",";
+      std::cout << "\n";
+    }
+    std::cout << "  }\n";
+  } else {
+    std::cout << "\n";
+  }
+
+  std::cout << "}\n";
+}
+static int find_channel_index(const std::vector<std::string>& channels, const std::string& name);
+static double baseline_quantile_used(const Args& args);
+
+static const char* nf_metric_type_name(qeeg::NfMetricSpec::Type t) {
+  switch (t) {
+    case qeeg::NfMetricSpec::Type::Band: return "band";
+    case qeeg::NfMetricSpec::Type::Ratio: return "ratio";
+    case qeeg::NfMetricSpec::Type::Asymmetry: return "asymmetry";
+    case qeeg::NfMetricSpec::Type::Coherence: return "coherence";
+    case qeeg::NfMetricSpec::Type::Pac: return "pac";
+    default: return "unknown";
+  }
+}
+
+static const char* pac_method_name(qeeg::PacMethod m) {
+  switch (m) {
+    case qeeg::PacMethod::ModulationIndex: return "mi";
+    case qeeg::PacMethod::MeanVectorLength: return "mvl";
+    default: return "mi";
+  }
+}
+
+static void emit_nf_metric_json(std::ostream& out, const qeeg::NfMetricSpec& m, const std::string& indent) {
+  const std::string i0 = indent;
+  const std::string i1 = indent + "  ";
+
+  out << i0 << "{\n";
+  out << i1 << "\"type\": \"" << nf_metric_type_name(m.type) << "\"";
+
+  switch (m.type) {
+    case qeeg::NfMetricSpec::Type::Band: {
+      out << ",\n" << i1 << "\"band\": \"" << json_escape(m.band) << "\",\n";
+      out << i1 << "\"channel\": \"" << json_escape(m.channel) << "\"\n";
+      break;
+    }
+    case qeeg::NfMetricSpec::Type::Ratio: {
+      out << ",\n" << i1 << "\"band_num\": \"" << json_escape(m.band_num) << "\",\n";
+      out << i1 << "\"band_den\": \"" << json_escape(m.band_den) << "\",\n";
+      out << i1 << "\"channel\": \"" << json_escape(m.channel) << "\"\n";
+      break;
+    }
+    case qeeg::NfMetricSpec::Type::Asymmetry: {
+      out << ",\n" << i1 << "\"band\": \"" << json_escape(m.band) << "\",\n";
+      out << i1 << "\"channel_a\": \"" << json_escape(m.channel_a) << "\",\n";
+      out << i1 << "\"channel_b\": \"" << json_escape(m.channel_b) << "\"\n";
+      break;
+    }
+    case qeeg::NfMetricSpec::Type::Coherence: {
+      out << ",\n" << i1 << "\"band\": \"" << json_escape(m.band) << "\",\n";
+      out << i1 << "\"channel_a\": \"" << json_escape(m.channel_a) << "\",\n";
+      out << i1 << "\"channel_b\": \"" << json_escape(m.channel_b) << "\",\n";
+      out << i1 << "\"measure\": \"" << json_escape(qeeg::coherence_measure_name(m.coherence_measure)) << "\"\n";
+      break;
+    }
+    case qeeg::NfMetricSpec::Type::Pac: {
+      out << ",\n" << i1 << "\"phase_band\": \"" << json_escape(m.phase_band) << "\",\n";
+      out << i1 << "\"amp_band\": \"" << json_escape(m.amp_band) << "\",\n";
+      out << i1 << "\"channel\": \"" << json_escape(m.channel) << "\",\n";
+      out << i1 << "\"pac_method\": \"" << pac_method_name(m.pac_method) << "\"\n";
+      break;
+    }
+    default: {
+      out << "\n";
+      break;
+    }
+  }
+
+  out << i0 << "}";
+}
+
+static void emit_bands_json(std::ostream& out, const std::vector<qeeg::BandDefinition>& bands, const std::string& indent) {
+  const std::string i0 = indent;
+  const std::string i1 = indent + "  ";
+  out << i0 << "[\n";
+  for (size_t i = 0; i < bands.size(); ++i) {
+    const auto& b = bands[i];
+    out << i1 << "{ \"name\": \"" << json_escape(b.name) << "\", \"fmin_hz\": " << b.fmin_hz
+        << ", \"fmax_hz\": " << b.fmax_hz << " }";
+    if (i + 1 < bands.size()) out << ",";
+    out << "\n";
+  }
+  out << i0 << "]";
+}
+
+static void print_nf_config_json(const Args& args,
+                                 const qeeg::EEGRecording& rec,
+                                 const qeeg::NfMetricSpec& metric,
+                                 const std::vector<qeeg::BandDefinition>& bands,
+                                 bool have_qc,
+                                 const std::string& qc_resolved_path,
+                                 const std::vector<std::string>& qc_bad_names,
+                                 const std::vector<std::string>& artifact_ignore_effective,
+                                 const std::vector<std::string>& metric_bad_channels) {
+  const double dur_sec = (rec.fs_hz > 0.0)
+                           ? (static_cast<double>(rec.n_samples()) / rec.fs_hz)
+                           : 0.0;
+
+  std::vector<std::string> metric_channels;
+  if (metric.type == qeeg::NfMetricSpec::Type::Coherence ||
+      metric.type == qeeg::NfMetricSpec::Type::Asymmetry) {
+    metric_channels.push_back(metric.channel_a);
+    metric_channels.push_back(metric.channel_b);
+  } else {
+    metric_channels.push_back(metric.channel);
+  }
+
+  std::vector<int> metric_channel_indices;
+  metric_channel_indices.reserve(metric_channels.size());
+  for (const auto& ch : metric_channels) {
+    metric_channel_indices.push_back(find_channel_index(rec.channel_names, ch));
+  }
+
+  std::cout << "{\n";
+  std::cout << "  \"$schema\": \"" << json_escape(schema_url("qeeg_nf_cli_print_config.schema.json")) << "\",\n";
+  std::cout << "  \"Tool\": \"qeeg_nf_cli\",\n";
+  std::cout << "  \"Version\": \"" << json_escape(qeeg::version_string()) << "\",\n";
+  std::cout << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
+  std::cout << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
+  std::cout << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
+  std::cout << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
+
+  std::cout << "  \"demo\": " << (args.demo ? "true" : "false") << ",\n";
+  std::cout << "  \"input_path\": ";
+  if (args.demo) std::cout << "null";
+  else std::cout << "\"" << json_escape(args.input_path) << "\"";
+  std::cout << ",\n";
+
+  std::cout << "  \"fs_hz\": " << rec.fs_hz << ",\n";
+  std::cout << "  \"n_channels\": " << rec.n_channels() << ",\n";
+  std::cout << "  \"n_samples\": " << rec.n_samples() << ",\n";
+  std::cout << "  \"duration_seconds\": " << dur_sec << ",\n";
+
+  std::cout << "  \"channels\": [\n";
+  for (size_t i = 0; i < rec.channel_names.size(); ++i) {
+    std::cout << "    \"" << json_escape(rec.channel_names[i]) << "\"";
+    if (i + 1 < rec.channel_names.size()) std::cout << ",";
+    std::cout << "\n";
+  }
+  std::cout << "  ],\n";
+
+  // Core run configuration.
+  std::cout << "  \"outdir\": \"" << json_escape(args.outdir) << "\",\n";
+  std::cout << "  \"protocol\": ";
+  if (!args.protocol.empty()) std::cout << "\"" << json_escape(args.protocol) << "\"";
+  else std::cout << "null";
+  std::cout << ",\n";
+
+  std::cout << "  \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
+  std::cout << "  \"metric\": ";
+  emit_nf_metric_json(std::cout, metric, "");
+  std::cout << ",\n";
+
+  std::cout << "  \"band_spec_raw\": \"" << json_escape(args.band_spec) << "\",\n";
+  std::cout << "  \"bands\": ";
+  emit_bands_json(std::cout, bands, "");
+  std::cout << ",\n";
+
+  std::cout << "  \"metric_channels\": [";
+  for (size_t i = 0; i < metric_channels.size(); ++i) {
+    if (i) std::cout << ", ";
+    std::cout << "\"" << json_escape(metric_channels[i]) << "\"";
+  }
+  std::cout << "],\n";
+
+  std::cout << "  \"metric_channel_indices\": [";
+  for (size_t i = 0; i < metric_channel_indices.size(); ++i) {
+    if (i) std::cout << ", ";
+    std::cout << metric_channel_indices[i];
+  }
+  std::cout << "],\n";
+
+  // Channel QC inputs (optional).
+  std::cout << "  \"channel_qc\": ";
+  if (!args.channel_qc.empty()) std::cout << "\"" << json_escape(args.channel_qc) << "\"";
+  else std::cout << "null";
+  std::cout << ",\n";
+  std::cout << "  \"channel_qc_resolved\": ";
+  if (have_qc) std::cout << "\"" << json_escape(qc_resolved_path) << "\"";
+  else std::cout << "null";
+  std::cout << ",\n";
+  std::cout << "  \"qc_bad_channel_count\": " << qc_bad_names.size() << ",\n";
+  std::cout << "  \"qc_bad_channels\": [";
+  for (size_t i = 0; i < qc_bad_names.size(); ++i) {
+    if (i) std::cout << ", ";
+    std::cout << "\"" << json_escape(qc_bad_names[i]) << "\"";
+  }
+  std::cout << "],\n";
+  std::cout << "  \"metric_bad_channels\": [";
+  for (size_t i = 0; i < metric_bad_channels.size(); ++i) {
+    if (i) std::cout << ", ";
+    std::cout << "\"" << json_escape(metric_bad_channels[i]) << "\"";
+  }
+  std::cout << "],\n";
+  std::cout << "  \"allow_bad_metric_channels\": " << (args.allow_bad_metric_channels ? "true" : "false") << ",\n";
+
+  // Artifact gate configuration.
+  std::cout << "  \"artifact_gate\": " << (args.artifact_gate ? "true" : "false") << ",\n";
+  std::cout << "  \"artifact_ptp_z\": " << args.artifact_ptp_z << ",\n";
+  std::cout << "  \"artifact_rms_z\": " << args.artifact_rms_z << ",\n";
+  std::cout << "  \"artifact_kurtosis_z\": " << args.artifact_kurtosis_z << ",\n";
+  std::cout << "  \"artifact_min_bad_channels\": " << args.artifact_min_bad_channels << ",\n";
+
+  std::cout << "  \"artifact_ignore_channels_user\": [";
+  for (size_t i = 0; i < args.artifact_ignore_channels.size(); ++i) {
+    if (i) std::cout << ", ";
+    std::cout << "\"" << json_escape(args.artifact_ignore_channels[i]) << "\"";
+  }
+  std::cout << "],\n";
+
+  std::cout << "  \"artifact_ignore_channels_effective\": [";
+  for (size_t i = 0; i < artifact_ignore_effective.size(); ++i) {
+    if (i) std::cout << ", ";
+    std::cout << "\"" << json_escape(artifact_ignore_effective[i]) << "\"";
+  }
+  std::cout << "],\n";
+
+  // Thresholding / adaptation.
+  std::cout << "  \"reward_direction\": \"" << reward_direction_name(args.reward_direction) << "\",\n";
+  std::cout << "  \"target_reward_rate\": " << args.target_reward_rate << ",\n";
+  std::cout << "  \"threshold_init\": ";
+  if (std::isfinite(args.initial_threshold)) std::cout << args.initial_threshold;
+  else std::cout << "null";
+  std::cout << ",\n";
+  std::cout << "  \"baseline_seconds\": " << args.baseline_seconds << ",\n";
+  std::cout << "  \"baseline_quantile\": ";
+  if (std::isfinite(args.baseline_quantile)) std::cout << args.baseline_quantile;
+  else std::cout << "null";
+  std::cout << ",\n";
+  std::cout << "  \"baseline_quantile_used\": " << baseline_quantile_used(args) << ",\n";
+  std::cout << "  \"no_adaptation\": " << (args.no_adaptation ? "true" : "false") << ",\n";
+  std::cout << "  \"adapt_eta\": " << args.adapt_eta << ",\n";
+  std::cout << "  \"adapt_mode\": \"" << json_escape(args.adapt_mode) << "\",\n";
+  std::cout << "  \"adapt_interval_seconds\": " << args.adapt_interval_seconds << ",\n";
+  std::cout << "  \"adapt_window_seconds\": " << args.adapt_window_seconds << ",\n";
+  std::cout << "  \"adapt_min_samples\": " << args.adapt_min_samples << ",\n";
+
+  // Timing / smoothing.
+  std::cout << "  \"window_seconds\": " << args.window_seconds << ",\n";
+  std::cout << "  \"update_seconds\": " << args.update_seconds << ",\n";
+  std::cout << "  \"metric_smooth_seconds\": " << args.metric_smooth_seconds << ",\n";
+
+  // Feedback mapping.
+  std::cout << "  \"feedback_mode\": \"" << json_escape(args.feedback_mode) << "\",\n";
+  std::cout << "  \"feedback_span\": ";
+  if (std::isfinite(args.feedback_span)) std::cout << args.feedback_span;
+  else std::cout << "null";
+  std::cout << ",\n";
+
+  // Playback pacing.
+  std::cout << "  \"chunk_seconds\": " << args.chunk_seconds << ",\n";
+  std::cout << "  \"playback_speed\": " << args.playback_speed << ",\n";
+
+  // Preprocessing.
+  std::cout << "  \"average_reference\": " << (args.average_reference ? "true" : "false") << ",\n";
+  std::cout << "  \"notch_hz\": " << args.notch_hz << ",\n";
+  std::cout << "  \"notch_q\": " << args.notch_q << ",\n";
+  std::cout << "  \"bandpass_low_hz\": " << args.bandpass_low_hz << ",\n";
+  std::cout << "  \"bandpass_high_hz\": " << args.bandpass_high_hz << ",\n";
+
+  // PSD options.
+  std::cout << "  \"nperseg\": " << args.nperseg << ",\n";
+  std::cout << "  \"overlap\": " << args.overlap << ",\n";
+
+  // Bandpower scaling (bandpower/ratio/asymmetry only).
+  std::cout << "  \"log10_power\": " << (args.log10_power ? "true" : "false") << ",\n";
+  std::cout << "  \"relative_power\": " << (args.relative_power ? "true" : "false") << ",\n";
+  std::cout << "  \"relative_fmin_hz\": " << args.relative_fmin_hz << ",\n";
+  std::cout << "  \"relative_fmax_hz\": " << args.relative_fmax_hz << ",\n";
+
+  // Reward stability / shaping.
+  std::cout << "  \"reward_on_frames\": " << args.reward_on_frames << ",\n";
+  std::cout << "  \"reward_off_frames\": " << args.reward_off_frames << ",\n";
+  std::cout << "  \"threshold_hysteresis\": " << args.threshold_hysteresis << ",\n";
+  std::cout << "  \"dwell_seconds\": " << args.dwell_seconds << ",\n";
+  std::cout << "  \"refractory_seconds\": " << args.refractory_seconds << ",\n";
+
+  // Offline training schedule.
+  std::cout << "  \"train_block_seconds\": " << args.train_block_seconds << ",\n";
+  std::cout << "  \"rest_block_seconds\": " << args.rest_block_seconds << ",\n";
+  std::cout << "  \"start_with_rest\": " << (args.start_with_rest ? "true" : "false") << ",\n";
+
+  // Exports.
+  std::cout << "  \"export_bandpowers\": " << (args.export_bandpowers ? "true" : "false") << ",\n";
+  std::cout << "  \"export_coherence\": " << (args.export_coherence ? "true" : "false") << ",\n";
+  std::cout << "  \"export_artifacts\": " << (args.export_artifacts ? "true" : "false") << ",\n";
+  std::cout << "  \"biotrace_ui\": " << (args.biotrace_ui ? "true" : "false") << ",\n";
+  std::cout << "  \"export_derived_events\": " << (args.export_derived_events ? "true" : "false") << ",\n";
+
+  // Audio feedback.
+  std::cout << "  \"audio_enabled\": " << (!args.audio_wav.empty() ? "true" : "false") << ",\n";
+  std::cout << "  \"audio_wav\": ";
+  if (!args.audio_wav.empty()) std::cout << "\"" << json_escape(args.audio_wav) << "\"";
+  else std::cout << "null";
+  std::cout << ",\n";
+  std::cout << "  \"audio_rate\": " << args.audio_rate << ",\n";
+  std::cout << "  \"audio_tone_hz\": " << args.audio_tone_hz << ",\n";
+  std::cout << "  \"audio_gain\": " << args.audio_gain << ",\n";
+  std::cout << "  \"audio_attack_sec\": " << args.audio_attack_sec << ",\n";
+  std::cout << "  \"audio_release_sec\": " << args.audio_release_sec << ",\n";
+
+  // OSC output.
+  std::cout << "  \"osc_enabled\": " << (args.osc_port > 0 ? "true" : "false") << ",\n";
+  std::cout << "  \"osc_host\": \"" << json_escape(args.osc_host) << "\",\n";
+  std::cout << "  \"osc_port\": " << args.osc_port << ",\n";
+  std::cout << "  \"osc_prefix\": \"" << json_escape(args.osc_prefix) << "\",\n";
+  std::cout << "  \"osc_mode\": \"" << json_escape(args.osc_mode) << "\",\n";
+
+  // PAC options (PAC metrics only).
+  std::cout << "  \"pac_bins\": " << args.pac_bins << ",\n";
+  std::cout << "  \"pac_trim\": " << args.pac_trim << ",\n";
+  std::cout << "  \"pac_zero_phase\": " << (args.pac_zero_phase ? "true" : "false") << "\n";
+
+  std::cout << "}\n";
+}
+
+static void print_version() {
+  std::cout << "qeeg_nf_cli " << version_string() << " (" << git_describe_string() << ")\n";
+}
+
+static void print_version_json() {
+  const std::string schema = schema_url("qeeg_nf_cli_version.schema.json");
+  std::cout
+    << "{\"$schema\":\"" << json_escape(schema) << "\""
+    << ",\"tool\":\"qeeg_nf_cli\""
+    << ",\"version\":\"" << json_escape(version_string()) << "\""
+    << ",\"version_major\":" << version_major()
+    << ",\"version_minor\":" << version_minor()
+    << ",\"version_patch\":" << version_patch()
+    << ",\"git\":\"" << json_escape(git_describe_string()) << "\""
+    << ",\"build_type\":\"" << json_escape(build_type_string()) << "\""
+    << ",\"compiler\":\"" << json_escape(compiler_string()) << "\""
+    << ",\"cpp_standard\":\"" << json_escape(cpp_standard_string()) << "\"}"
+    << "\n";
+}
+
 static void print_help() {
   std::cout
     << "qeeg_nf_cli (first pass neurofeedback engine)\n\n"
@@ -338,10 +923,21 @@ static void print_help() {
     << "  --input PATH              Input EDF/BDF/CSV (CSV requires --fs)\n"
     << "  --fs HZ                   Sampling rate for CSV (optional if first column is time); also used for --demo\n"
     << "  --outdir DIR              Output directory (default: out_nf)\n"
+    << "  --list-channels          Print input channel names (one per line) and exit\n"
+    << "  --list-channels-json     Print input channel info as JSON and exit\n"
+    << "  --list-bands             Print default EEG bands (name:lo-hi) and exit\n"
+    << "  --list-bands-json        Print default EEG bands as JSON and exit\n"
+    << "  --list-metrics           Print metric spec examples and exit\n"
+    << "  --list-metrics-json      Print metric spec examples as JSON and exit\n"
+    << "  --print-config-json     Print resolved configuration as JSON and exit\n"
+    << "  --dry-run               Validate args/inputs and exit (no outputs written)\n"
     << "\nProtocol presets (optional):\n"
     << "  --list-protocols          List built-in NF protocol presets and exit\n"
+    << "  --list-protocols-names    List preset names (one per line) and exit\n"
+    << "  --list-protocols-json     List presets as JSON and exit\n"
     << "  --protocol NAME           Apply a built-in protocol preset (defaults for --metric/--bands/etc unless overridden)\n"
     << "  --protocol-help NAME      Show details for one preset and exit\n"
+    << "  --protocol-help-json NAME Show details for one preset as JSON and exit\n"
     << "  --protocol-ch CH          Override {ch} for single-channel presets\n"
     << "  --protocol-a CH_A         Override {a} for pair presets (coherence/asymmetry)\n"
     << "  --protocol-b CH_B         Override {b} for pair presets (coherence/asymmetry)\n\n"
@@ -426,6 +1022,8 @@ static void print_help() {
     << "  --pac-zero-phase          PAC: use zero-phase bandpass filters (default: off)\n"
     << "  --demo                    Generate synthetic recording instead of reading file\n"
     << "  --seconds S               Duration for --demo (default: 60)\n"
+    << "  --version                 Print tool version and exit\n"
+    << "  --version-json            Print version/build metadata as JSON and exit\n"
     << "  -h, --help                Show this help\n";
 }
 
@@ -436,15 +1034,50 @@ static Args parse_args(int argc, char** argv) {
     if (arg == "-h" || arg == "--help") {
       print_help();
       std::exit(0);
+    } else if (arg == "--version") {
+      print_version();
+      std::exit(0);
+    } else if (arg == "--version-json") {
+      print_version_json();
+      std::exit(0);
     } else if (arg == "--input" && i + 1 < argc) {
       a.input_path = argv[++i];
     } else if (arg == "--outdir" && i + 1 < argc) {
       a.outdir = argv[++i];
+    } else if (arg == "--list-channels") {
+      a.list_channels = true;
+    } else if (arg == "--list-channels-json") {
+      a.list_channels_json = true;
+    } else if (arg == "--print-config-json") {
+      a.print_config_json = true;
+    } else if (arg == "--dry-run") {
+      a.dry_run = true;
+    } else if (arg == "--list-bands") {
+      print_default_bands();
+      std::exit(0);
+    } else if (arg == "--list-bands-json") {
+      print_default_bands_json();
+      std::exit(0);
+    } else if (arg == "--list-metrics") {
+      print_metric_examples();
+      std::exit(0);
+    } else if (arg == "--list-metrics-json") {
+      print_metric_examples_json();
+      std::exit(0);
     } else if (arg == "--list-protocols") {
       print_protocol_list();
       std::exit(0);
+    } else if (arg == "--list-protocols-names") {
+      print_protocol_list_names();
+      std::exit(0);
+    } else if (arg == "--list-protocols-json") {
+      print_protocol_list_json();
+      std::exit(0);
     } else if (arg == "--protocol-help" && i + 1 < argc) {
       print_protocol_help(argv[++i]);
+      std::exit(0);
+    } else if (arg == "--protocol-help-json" && i + 1 < argc) {
+      print_protocol_help_json(argv[++i]);
       std::exit(0);
     } else if (arg == "--protocol" && i + 1 < argc) {
       a.protocol = argv[++i];
@@ -911,6 +1544,7 @@ static void write_biotrace_ui_html_if_requested(const Args& args,
 
   out << std::setprecision(10);
   out << "{\n";
+  out << "  \"$schema\": \"" << json_escape(schema_url("qeeg_nf_cli_nf_summary.schema.json")) << "\",\n";
   out << "  \"meta\": {\n";
   out << "    \"protocol\": ";
   if (!args.protocol.empty()) out << "\"" << json_escape(args.protocol) << "\"";
@@ -1700,7 +2334,13 @@ static void write_nf_summary_json(const Args& args,
 
   out << std::setprecision(10);
   out << "{\n";
+  out << "  \"$schema\": \"" << json_escape(schema_url("qeeg_nf_cli_nf_summary.schema.json")) << "\",\n";
   out << "  \"Tool\": \"qeeg_nf_cli\",\n";
+  out << "  \"Version\": \"" << json_escape(qeeg::version_string()) << "\",\n";
+  out << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
+  out << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
+  out << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
+  out << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
   out << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
   out << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
   out << "  \"protocol\": ";
@@ -2226,6 +2866,27 @@ int qeeg_nf_cli_run(int argc, char** argv) {
       print_help();
       throw std::runtime_error("--input is required (or use --demo)");
     }
+
+if (args.list_channels || args.list_channels_json) {
+  EEGRecording rec;
+  if (args.demo) {
+    Montage montage = Montage::builtin_standard_1020_19();
+    rec = make_demo_recording(montage, args.fs_csv, args.demo_seconds);
+  } else {
+    rec = read_recording_auto(args.input_path, args.fs_csv);
+  }
+
+  if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels");
+  if (rec.fs_hz <= 0.0) throw std::runtime_error("Invalid sampling rate");
+
+  if (args.list_channels_json) {
+    print_channel_list_json(rec, args);
+  } else {
+    print_channel_list(rec);
+  }
+  return 0;
+}
+
     if (args.target_reward_rate <= 0.0 || args.target_reward_rate >= 1.0) {
       throw std::runtime_error("--target-rate must be in (0,1)");
     }
@@ -2308,6 +2969,91 @@ int qeeg_nf_cli_run(int argc, char** argv) {
       if (!std::isfinite(args.playback_speed) || args.playback_speed <= 0.0) {
         throw std::runtime_error("--speed must be a finite value > 0");
       }
+    }
+
+
+    if (args.print_config_json || args.dry_run) {
+      EEGRecording rec;
+      if (args.demo) {
+        Montage montage = Montage::builtin_standard_1020_19();
+        rec = make_demo_recording(montage, args.fs_csv, args.demo_seconds);
+      } else {
+        rec = read_recording_auto(args.input_path, args.fs_csv);
+      }
+
+      if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels");
+      if (rec.fs_hz <= 0.0) throw std::runtime_error("Invalid sampling rate");
+
+      // Optional: load channel QC labels (no output files are written in config/dry-run mode).
+      bool have_qc = false;
+      std::string qc_resolved_path;
+      std::vector<char> qc_bad(rec.n_channels(), 0);
+      std::vector<std::string> qc_bad_names;
+      qc_bad_names.reserve(rec.n_channels());
+
+      if (!args.channel_qc.empty()) {
+        ChannelQcMap qc = load_channel_qc_any(args.channel_qc, &qc_resolved_path);
+        have_qc = true;
+        for (size_t c = 0; c < rec.n_channels(); ++c) {
+          const std::string key = normalize_channel_name(rec.channel_names[c]);
+          const auto it = qc.find(key);
+          if (it != qc.end() && it->second.bad) {
+            qc_bad[c] = 1;
+            qc_bad_names.push_back(rec.channel_names[c]);
+          }
+        }
+      }
+
+      // Merge artifact-ignore list with QC bad channels (deduplicated by normalized name).
+      std::vector<std::string> artifact_ignore = args.artifact_ignore_channels;
+      if (have_qc && !qc_bad_names.empty()) {
+        artifact_ignore.insert(artifact_ignore.end(), qc_bad_names.begin(), qc_bad_names.end());
+        std::unordered_set<std::string> seen;
+        seen.reserve(artifact_ignore.size());
+        std::vector<std::string> uniq;
+        uniq.reserve(artifact_ignore.size());
+        for (const auto& nm : artifact_ignore) {
+          const std::string key = normalize_channel_name(nm);
+          if (key.empty()) continue;
+          if (seen.insert(key).second) uniq.push_back(nm);
+        }
+        artifact_ignore.swap(uniq);
+      }
+
+      const std::vector<BandDefinition> bands = parse_band_spec(args.band_spec);
+      const NfMetricSpec metric = parse_nf_metric_spec(args.metric_spec);
+
+      // Validate that selected metric channels exist, and optionally check QC flags.
+      std::vector<std::string> bad_metric_channels;
+      if (metric.type == NfMetricSpec::Type::Coherence || metric.type == NfMetricSpec::Type::Asymmetry) {
+        const int ia = find_channel_index(rec.channel_names, metric.channel_a);
+        const int ib = find_channel_index(rec.channel_names, metric.channel_b);
+        if (ia < 0) throw std::runtime_error("Unknown metric channel: " + metric.channel_a);
+        if (ib < 0) throw std::runtime_error("Unknown metric channel: " + metric.channel_b);
+
+        if (have_qc) {
+          if (qc_bad[static_cast<size_t>(ia)]) bad_metric_channels.push_back(rec.channel_names[static_cast<size_t>(ia)]);
+          if (qc_bad[static_cast<size_t>(ib)]) bad_metric_channels.push_back(rec.channel_names[static_cast<size_t>(ib)]);
+        }
+      } else {
+        const int ich = find_channel_index(rec.channel_names, metric.channel);
+        if (ich < 0) throw std::runtime_error("Unknown metric channel: " + metric.channel);
+        if (have_qc && qc_bad[static_cast<size_t>(ich)]) bad_metric_channels.push_back(rec.channel_names[static_cast<size_t>(ich)]);
+      }
+
+      if (!bad_metric_channels.empty() && !args.allow_bad_metric_channels) {
+        std::string msg = "NF metric uses channel(s) marked bad by channel QC:";
+        for (const auto& nm : bad_metric_channels) msg += " " + nm;
+        msg += ". Use --allow-bad-metric-channels to proceed anyway.";
+        throw std::runtime_error(msg);
+      }
+
+      if (args.print_config_json) {
+        print_nf_config_json(args, rec, metric, bands, have_qc, qc_resolved_path, qc_bad_names, artifact_ignore, bad_metric_channels);
+      } else {
+        std::cout << "Dry-run OK\n";
+      }
+      return 0;
     }
 
     ensure_directory(args.outdir);
@@ -2395,8 +3141,14 @@ int qeeg_nf_cli_run(int argc, char** argv) {
         std::cerr << "Warning: failed to write " << meta_path << "\n";
       } else {
         meta << "{\n";
+        meta << "  \"$schema\": \"" << json_escape(schema_url("qeeg_nf_cli_nf_run_meta.schema.json")) << "\",\n";
         const bool derived_events_written = (args.biotrace_ui || args.export_derived_events);
         meta << "  \"Tool\": \"qeeg_nf_cli\",\n";
+        meta << "  \"Version\": \"" << json_escape(qeeg::version_string()) << "\",\n";
+        meta << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
+        meta << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
+        meta << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
+        meta << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
         meta << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
         meta << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
         meta << "  \"Outputs\": [\n";

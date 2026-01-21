@@ -1,0 +1,279 @@
+.TH QEEG_NF_CLI 1 "January 2026" "qeeg_map" "User Commands"
+.SH NAME
+qeeg_nf_cli \- first-pass neurofeedback engine (offline playback) for qEEG metrics
+.SH SYNOPSIS
+.B qeeg_nf_cli
+.BR --input " " FILE
+.RI [ options ... ]
+
+.B qeeg_nf_cli
+.BR --demo " [--fs HZ] [--seconds S]"
+.RI [ options ... ]
+
+.B qeeg_nf_cli
+.BR --list-channels
+
+.B qeeg_nf_cli
+.BR --list-channels-json
+
+.B qeeg_nf_cli
+.BR --list-bands
+
+.B qeeg_nf_cli
+.BR --list-bands-json
+
+.B qeeg_nf_cli
+.BR --list-metrics
+
+.B qeeg_nf_cli
+.BR --list-metrics-json
+
+.B qeeg_nf_cli
+.BR --print-config-json
+
+.B qeeg_nf_cli
+.BR --dry-run
+
+.B qeeg_nf_cli
+.BR --version
+
+.B qeeg_nf_cli
+.BR --version-json
+
+.B qeeg_nf_cli
+.BR --list-protocols
+
+.B qeeg_nf_cli
+.BR --list-protocols-names
+
+.B qeeg_nf_cli
+.BR --list-protocols-json
+
+.B qeeg_nf_cli
+.BR --protocol-help " " NAME
+
+.B qeeg_nf_cli
+.BR --protocol-help-json " " NAME
+.SH DESCRIPTION
+\fBqeeg_nf_cli\fP runs a simple offline "real-time-ish" neurofeedback loop over an EEG recording.
+It computes an online metric (bandpower/ratio/asymmetry, coherence, or PAC), estimates an initial
+threshold from a baseline window (unless overridden), then emits reward state and optional continuous
+feedback values at a fixed update interval.
+
+The tool is intended for research/education and offline prototyping.
+It is \fBnot\fP a medical device.
+.SH METRIC SPEC
+The \fB--metric\fP option specifies what is trained:
+.TP
+\fBalpha:Pz\fP
+Bandpower metric (band name then channel).
+.TP
+\fBalpha/beta:Pz\fP
+Ratio metric (numerator/denominator bands at a channel).
+.TP
+\fBasym:alpha:F4:F3\fP
+Asymmetry metric between two channels for a band.
+.TP
+\fBcoh:alpha:F3:F4\fP
+Magnitude-squared coherence between two channels in a band.
+.TP
+\fBimcoh:alpha:F3:F4\fP
+Imaginary coherency proxy between two channels in a band.
+.TP
+\fBpac:theta:gamma:Cz\fP
+Phase-amplitude coupling (Tort MI): phase band, amplitude band, channel.
+.TP
+\fBmvl:theta:gamma:Cz\fP
+Alternative PAC metric: mean vector length.
+.SH PROTOCOL PRESETS
+\fBqeeg_nf_cli\fP ships with built-in example protocol presets.
+Use \fB--list-protocols\fP to view them and \fB--protocol NAME\fP to apply one.
+
+For machine-readable integrations, use \fB--list-protocols-names\fP (one name per line), \fB--list-protocols-json\fP (JSON array), and \fB--protocol-help-json NAME\fP for one preset.
+
+Presets provide defaults for \fB--metric\fP, \fB--bands\fP and select loop parameters unless you
+explicitly override them on the command line.
+Use \fB--protocol-ch\fP (single-channel presets) or \fB--protocol-a\fP/\fB--protocol-b\fP (pair presets)
+when a preset uses placeholders.
+.SH OUTPUTS
+Outputs are written into \fB--outdir\fP (default: \fBout_nf\fP).
+Common files include:
+.TP
+\fBnf_feedback.csv\fP
+Per-update timeline: metric value, threshold, reward state, reward rate, and optional artifact fields.
+.TP
+\fBnf_run_meta.json\fP
+Run provenance and settings snapshot. Includes a top-level '$schema' hint pointing at the corresponding JSON Schema under schemas/ (qeeg_nf_cli_nf_run_meta.schema.json).
+.TP
+\fBnf_summary.json\fP
+Compact run summary (reward rate, metric stats, threshold info, pacing stats when enabled). Includes a top-level '$schema' hint pointing at the corresponding JSON Schema under schemas/ (qeeg_nf_cli_nf_summary.schema.json).
+.TP
+\fBnf_derived_events.csv\fP / \fBnf_derived_events.tsv\fP / \fBnf_derived_events.json\fP
+Derived duration events (baseline/reward/artifact segments) when \fB--export-derived-events\fP or
+\fB--biotrace-ui\fP is used.
+.TP
+\fBbiotrace_ui.html\fP
+Self-contained HTML UI export when \fB--biotrace-ui\fP is enabled.
+.TP
+\fBbandpower_timeseries.csv\fP
+Optional bandpower timeseries export (\fB--export-bandpowers\fP).
+.TP
+\fBcoherence_timeseries.csv\fP / \fBimcoh_timeseries.csv\fP
+Optional coherence timeseries export (\fB--export-coherence\fP).
+.TP
+\fBartifact_gate_timeseries.csv\fP
+Optional artifact gate export aligned to NF updates (\fB--export-artifacts\fP).
+.SH OPTIONS
+.TP
+\fB--input\fP \fIPATH\fP
+Input EDF/BDF/CSV (CSV typically requires \fB--fs\fP).
+.TP
+\fB--fs\fP \fIHZ\fP
+Sampling rate for CSV (or \fB--demo\fP).
+.TP
+\fB--outdir\fP \fIDIR\fP
+Output directory.
+.TP
+\fB--list-channels\fP
+Print input channel names (one per line) and exit.
+.TP
+\fB--list-channels-json\fP
+Print input channel info as JSON and exit.
+The JSON object includes a top-level \fB$schema\fP field pointing at the corresponding JSON Schema document's \fB$id\fP.
+If \fB--channel-qc\fP is provided, the JSON also includes the list of bad channels and their reasons.
+.TP
+\fB--list-bands\fP
+Print the default EEG band list (name:lo-hi) and exit.
+.TP
+\fB--list-bands-json\fP
+Print the default EEG band list as JSON and exit.
+.TP
+\fB--list-metrics\fP
+Print common metric specification examples and exit.
+.TP
+\fB--list-metrics-json\fP
+Print common metric specification examples as JSON and exit.
+.TP
+\fB--print-config-json\fP
+Print the resolved configuration as JSON and exit (requires \fB--input\fP or \fB--demo\fP).
+The JSON object includes a top-level \fB$schema\fP field pointing at the corresponding JSON Schema document's \fB$id\fP.
+.TP
+\fB--dry-run\fP
+Validate args and inputs and exit without writing output files.
+.TP
+\fB--version\fP
+Print version and exit.
+.TP
+\fB--version-json\fP
+Print version/build metadata as JSON and exit.
+The JSON object includes a top-level \fB$schema\fP field pointing at the corresponding JSON Schema document's \fB$id\fP.
+.TP
+\fB--bands\fP \fISPEC\fP
+Band definition string (e.g. \fBdelta:0.5-4,theta:4-8,alpha:8-12\fP).
+.TP
+\fB--metric\fP \fISPEC\fP
+Metric specification (see \fBMETRIC SPEC\fP).
+.TP
+\fB--window\fP \fISECONDS\fP
+Sliding analysis window seconds.
+.TP
+\fB--update\fP \fISECONDS\fP
+Update interval seconds.
+.TP
+\fB--baseline\fP \fISECONDS\fP
+Baseline seconds used to estimate initial threshold.
+.TP
+\fB--threshold\fP \fIVALUE\fP
+Set an explicit initial threshold (skips baseline threshold estimation).
+.TP
+\fB--reward-direction\fP \fIabove|below\fP
+Reward when metric is above or below threshold.
+.TP
+\fB--target-rate\fP \fIR\fP
+Target reward rate in (0,1).
+.TP
+\fB--no-adaptation\fP
+Disable adaptive thresholding (fixed threshold from baseline).
+.TP
+\fB--artifact-gate\fP
+Suppress reward/adaptation during detected artifacts.
+.TP
+\fB--channel-qc\fP \fIPATH\fP
+Optional channel quality control input (qeeg_channel_qc_cli output).
+.TP
+\fB--export-bandpowers\fP
+Export bandpower_timeseries.csv (bandpower/ratio modes).
+.TP
+\fB--export-coherence\fP
+Export coherence timeseries (coherence mode).
+.TP
+\fB--export-artifacts\fP
+Export artifact gate timeline (artifact_gate_timeseries.csv).
+.TP
+\fB--biotrace-ui\fP
+Write a self-contained BioTrace+ style HTML UI (biotrace_ui.html).
+.TP
+\fB--osc-host\fP \fIHOST\fP
+OSC/UDP destination host (default: 127.0.0.1).
+.TP
+\fB--osc-port\fP \fIPORT\fP
+OSC/UDP destination port (0 disables).
+.TP
+\fB--audio-wav\fP \fIPATH\fP
+Optional reward-tone WAV output.
+.TP
+\fB--demo\fP
+Generate a synthetic recording instead of reading a file.
+.TP
+\fB--seconds\fP \fISECONDS\fP
+Duration for \fB--demo\fP.
+.TP
+\fB-h\fP, \fB--help\fP
+Show help.
+.SH EXAMPLES
+List channel names from an input file:
+.RS
+.nf
+qeeg_nf_cli --input recording.edf --list-channels
+qeeg_nf_cli --input recording.edf --list-channels-json > channels.json
+qeeg_nf_cli --input recording.edf --channel-qc qc_outdir --list-channels-json > channels_qc.json
+.fi
+.RE
+
+Inspect the resolved configuration for a preset (demo mode):
+.RS
+.nf
+qeeg_nf_cli --demo --fs 250 --seconds 5 --protocol alpha_up_pz --print-config-json
+.fi
+.RE
+
+List built-in protocol presets:
+.RS
+.nf
+qeeg_nf_cli --list-protocols
+.fi
+.RE
+
+Run a preset (explicit flags override preset defaults):
+.RS
+.nf
+qeeg_nf_cli --input recording.edf --outdir out_nf --protocol alpha_up_pz
+qeeg_nf_cli --input recording.edf --outdir out_nf --protocol alpha_up_pz --protocol-ch Oz
+.fi
+.RE
+
+Run a coherence metric and export timeseries:
+.RS
+.nf
+qeeg_nf_cli --input recording.edf --outdir out_nf --metric coh:alpha:F3:F4 --export-coherence
+.fi
+.RE
+
+Generate a static HTML UI export:
+.RS
+.nf
+qeeg_nf_cli --input recording.edf --outdir out_nf --protocol alpha_up_pz --biotrace-ui
+.fi
+.RE
+.SH SEE ALSO
+\fBqeeg_offline_app_cli\fP(1), \fBqeeg_version_cli\fP(1)

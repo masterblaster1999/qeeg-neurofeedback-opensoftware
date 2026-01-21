@@ -1,0 +1,398 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_print_config.schema.json",
+  "title": "qeeg_nf_cli --print-config-json output",
+  "description": "Schema for the JSON emitted by qeeg_nf_cli --print-config-json (resolved neurofeedback run configuration).",
+  "type": "object",
+  "required": [
+    "Tool",
+    "Version",
+    "GitDescribe",
+    "BuildType",
+    "Compiler",
+    "CppStandard",
+    "demo",
+    "input_path",
+    "fs_hz",
+    "n_channels",
+    "n_samples",
+    "duration_seconds",
+    "channels",
+    "outdir",
+    "protocol",
+    "metric_spec",
+    "metric",
+    "band_spec_raw",
+    "bands"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_print_config.schema.json"
+    },
+    "Tool": {
+      "type": "string"
+    },
+    "Version": {
+      "type": "string"
+    },
+    "GitDescribe": {
+      "type": "string"
+    },
+    "BuildType": {
+      "type": "string"
+    },
+    "Compiler": {
+      "type": "string"
+    },
+    "CppStandard": {
+      "type": "string"
+    },
+    "demo": {
+      "type": "boolean"
+    },
+    "input_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fs_hz": {
+      "type": "number"
+    },
+    "n_channels": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "n_samples": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duration_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "channels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "outdir": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metric_spec": {
+      "type": "string"
+    },
+    "metric": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "band_spec_raw": {
+      "type": "string"
+    },
+    "bands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "fmin_hz",
+          "fmax_hz"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "fmin_hz": {
+            "type": "number"
+          },
+          "fmax_hz": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "metric_channels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "metric_channel_indices": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      }
+    },
+    "channel_qc": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "channel_qc_resolved": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "qc_bad_channel_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "qc_bad_channels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "metric_bad_channels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allow_bad_metric_channels": {
+      "type": "boolean"
+    },
+    "artifact_gate": {
+      "type": "boolean"
+    },
+    "artifact_ptp_z": {
+      "type": "number"
+    },
+    "artifact_rms_z": {
+      "type": "number"
+    },
+    "artifact_kurtosis_z": {
+      "type": "number"
+    },
+    "artifact_min_bad_channels": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "artifact_ignore_channels_user": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "artifact_ignore_channels_effective": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reward_direction": {
+      "type": "string"
+    },
+    "target_reward_rate": {
+      "type": "number"
+    },
+    "threshold_init": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "baseline_seconds": {
+      "type": "number"
+    },
+    "baseline_quantile": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "baseline_quantile_used": {
+      "type": "number"
+    },
+    "no_adaptation": {
+      "type": "boolean"
+    },
+    "adapt_eta": {
+      "type": "number"
+    },
+    "adapt_mode": {
+      "type": "string"
+    },
+    "adapt_interval_seconds": {
+      "type": "number"
+    },
+    "adapt_window_seconds": {
+      "type": "number"
+    },
+    "adapt_min_samples": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "window_seconds": {
+      "type": "number"
+    },
+    "update_seconds": {
+      "type": "number"
+    },
+    "metric_smooth_seconds": {
+      "type": "number"
+    },
+    "feedback_mode": {
+      "type": "string"
+    },
+    "feedback_span": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "chunk_seconds": {
+      "type": "number"
+    },
+    "playback_speed": {
+      "type": "number"
+    },
+    "average_reference": {
+      "type": "boolean"
+    },
+    "notch_hz": {
+      "type": "number"
+    },
+    "notch_q": {
+      "type": "number"
+    },
+    "bandpass_low_hz": {
+      "type": "number"
+    },
+    "bandpass_high_hz": {
+      "type": "number"
+    },
+    "nperseg": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "overlap": {
+      "type": "number"
+    },
+    "log10_power": {
+      "type": "boolean"
+    },
+    "relative_power": {
+      "type": "boolean"
+    },
+    "relative_fmin_hz": {
+      "type": "number"
+    },
+    "relative_fmax_hz": {
+      "type": "number"
+    },
+    "reward_on_frames": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "reward_off_frames": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "threshold_hysteresis": {
+      "type": "number"
+    },
+    "dwell_seconds": {
+      "type": "number"
+    },
+    "refractory_seconds": {
+      "type": "number"
+    },
+    "train_block_seconds": {
+      "type": "number"
+    },
+    "rest_block_seconds": {
+      "type": "number"
+    },
+    "start_with_rest": {
+      "type": "boolean"
+    },
+    "export_bandpowers": {
+      "type": "boolean"
+    },
+    "export_coherence": {
+      "type": "boolean"
+    },
+    "export_artifacts": {
+      "type": "boolean"
+    },
+    "biotrace_ui": {
+      "type": "boolean"
+    },
+    "export_derived_events": {
+      "type": "boolean"
+    },
+    "audio_enabled": {
+      "type": "boolean"
+    },
+    "audio_wav": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "audio_rate": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "audio_tone_hz": {
+      "type": "number"
+    },
+    "audio_gain": {
+      "type": "number"
+    },
+    "audio_attack_sec": {
+      "type": "number"
+    },
+    "audio_release_sec": {
+      "type": "number"
+    },
+    "osc_enabled": {
+      "type": "boolean"
+    },
+    "osc_host": {
+      "type": "string"
+    },
+    "osc_port": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "osc_prefix": {
+      "type": "string"
+    },
+    "osc_mode": {
+      "type": "string"
+    },
+    "pac_bins": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "pac_trim": {
+      "type": "number"
+    },
+    "pac_zero_phase": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": true
+}

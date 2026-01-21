@@ -893,6 +893,20 @@ void write_bids_events_json(const std::string& path, const BidsEventsTsvOptions&
   f << "{\n";
   bool wrote_any = false;
 
+  // BIDS requires onset and duration columns (in seconds) in events.tsv.
+  // Describe them here for improved interoperability, even when the caller disables
+  // trial_type/sample/value.
+  write_entry("onset",
+              "Event onset",
+              "Event onset time, in seconds relative to the start of the recording.",
+              "s",
+              wrote_any);
+  write_entry("duration",
+              "Event duration",
+              "Event duration, in seconds measured from onset.",
+              "s",
+              wrote_any);
+
   if (opts.include_trial_type) {
     write_entry("trial_type",
                 "Event label",
@@ -1001,6 +1015,20 @@ void write_bids_events_json(const std::string& path,
 
   f << "{\n";
   bool wrote_any = false;
+
+  // BIDS requires onset and duration columns (in seconds) in events.tsv.
+  // Describe them here for improved interoperability, even when the caller disables
+  // trial_type/sample/value.
+  write_entry("onset",
+              "Event onset",
+              "Event onset time, in seconds relative to the start of the recording.",
+              "s",
+              wrote_any);
+  write_entry("duration",
+              "Event duration",
+              "Event duration, in seconds measured from onset.",
+              "s",
+              wrote_any);
 
   if (opts.include_trial_type) {
     if (wrote_any) f << ",\n";

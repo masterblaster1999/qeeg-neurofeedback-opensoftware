@@ -1,0 +1,12 @@
+#compdef qeeg_version_cli
+
+# Zsh completion for qeeg_version_cli
+
+_qeeg_version_cli() {
+  _arguments -s -S \
+    '--full[Print additional build details]' \
+    '--json[Output JSON (useful for scripts)]' \
+    '(-h --help)'{-h,--help}'[Show help]'
+}
+
+_qeeg_version_cli "$@"

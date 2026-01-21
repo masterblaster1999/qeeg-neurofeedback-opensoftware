@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_cli_list_bands.schema.json",
+  "title": "qeeg_nf_cli --list-bands-json output",
+  "description": "Schema for the JSON emitted by qeeg_nf_cli --list-bands-json (default EEG band definitions).",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "name",
+      "fmin_hz",
+      "fmax_hz"
+    ],
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "fmin_hz": {
+        "type": "number"
+      },
+      "fmax_hz": {
+        "type": "number"
+      }
+    }
+  }
+}
