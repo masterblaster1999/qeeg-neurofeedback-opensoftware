@@ -863,6 +863,14 @@ if(QEEG_BUILD_TESTS)
       set_tests_properties(qeeg_test_nf_cli_json_schema_validation_demo
                            PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
+      # Smoke test the dependency-free HTML report renderers.
+      add_test(NAME qeeg_test_report_renderers_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_reports.py)
+
+      set_tests_properties(qeeg_test_report_renderers_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
       # Developer convenience: allow running the same JSON output validation from the
       # build system, e.g. `cmake --build build --target qeeg_validate_nf_cli_json`.
       add_custom_target(qeeg_validate_nf_cli_json

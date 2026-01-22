@@ -94,6 +94,77 @@ qeeg_nf_cli --input recording.edf --outdir out_nf --metric alpha:Pz --reward-dir
 ```
 
 Common outputs (written under `--outdir`): `nf_feedback.csv`, `nf_run_meta.json`, `nf_summary.json`.
+
+### Quick HTML reports (no dependencies)
+
+After running tools like `qeeg_iaf_cli`, `qeeg_bandpower_cli`, `qeeg_bandratios_cli`, `qeeg_spectral_features_cli`, `qeeg_nf_cli`, `qeeg_pac_cli`, `qeeg_channel_qc_cli`, `qeeg_artifacts_cli`, or connectivity tools like `qeeg_coherence_cli` / `qeeg_plv_cli`, you can generate a self-contained HTML summary (inline CSS/SVG; no network requests):
+
+```bash
+# From an output directory produced by qeeg_bandpower_cli
+python3 scripts/render_bandpowers_report.py --input out_bp
+
+# From an output directory produced by qeeg_bandratios_cli
+python3 scripts/render_bandratios_report.py --input out_ratios
+
+# From an output directory produced by qeeg_spectral_features_cli
+python3 scripts/render_spectral_features_report.py --input out_sf
+
+# From an output directory produced by qeeg_nf_cli
+python3 scripts/render_nf_feedback_report.py --input out_nf
+
+# From an output directory produced by qeeg_pac_cli
+python3 scripts/render_pac_report.py --input out_pac
+
+# From an output directory produced by qeeg_coherence_cli / qeeg_plv_cli (matrix mode)
+python3 scripts/render_connectivity_report.py --input out_conn
+
+# From an output directory produced by qeeg_microstates_cli
+python3 scripts/render_microstates_report.py --input out_ms
+
+# From an output directory produced by qeeg_iaf_cli
+python3 scripts/render_iaf_report.py --input out_iaf
+
+# From an output directory produced by qeeg_bids_scan_cli
+python3 scripts/render_bids_scan_report.py --input out_bids_scan
+
+# From an output directory produced by qeeg_channel_qc_cli
+python3 scripts/render_channel_qc_report.py --input out_qc
+
+# From an output directory produced by qeeg_artifacts_cli
+python3 scripts/render_artifacts_report.py --input out_art
+
+# From an output directory produced by qeeg_quality_cli
+python3 scripts/render_quality_report.py --input out_quality
+
+# From an output directory produced by qeeg_trace_plot_cli
+python3 scripts/render_trace_plot_report.py --input out_traces
+
+# From an output directory produced by qeeg_epoch_cli
+python3 scripts/render_epoch_report.py --input out_epochs
+
+# Build a dashboard that links to all available reports (and renders any missing ones)
+python3 scripts/render_reports_dashboard.py out_quality out_traces out_bids_scan out_epochs out_iaf out_bp out_ratios out_sf out_nf out_pac out_conn out_ms out_qc out_art --out qeeg_reports_dashboard.html
+```
+
+The generated dashboard tables are sortable (click headers), include a **global filter** that applies to all sections, and provide **Download CSV** buttons to export the currently visible rows.
+
+
+**Convenience flags:** All `render_*_report.py` scripts support `--open` to open the generated HTML in your default browser.
+
+Most reports also include a small **filter/search box** above large tables (type to quickly narrow to channels/edges/rows), in addition to sortable headers. If a table is shown, you can also click **Download CSV** to export the *currently visible* (filtered) rows.
+
+Newer reports also add a **Columns** dropdown (show/hide columns for wide tables), a compact **Filter help** dropdown that summarizes the supported query syntax, and a **Clear** button. Column visibility + filter query are remembered per report in browser storage when possible (behavior depends on browser, especially when opening local `file://` HTML).
+
+If you want a quick smoke test of the report generators (stdlib only), run:
+
+```bash
+python3 scripts/selftest_reports.py
+```
+
+This writes `iaf_report.html` / `bids_scan_report.html` / `bandpowers_report.html` / `bandratios_report.html` / `spectral_features_report.html` / `nf_feedback_report.html` / `pac_report.html` / `connectivity_report.html` / `microstates_report.html` / `channel_qc_report.html` / `artifacts_report.html` / `quality_report.html` / `trace_plot_report.html` in the respective output directory.
+Tip: if your bandpower outdir includes `topomap_*.bmp` images, they will be embedded in `bandpowers_report.html` (use `--link-topomaps` to keep the HTML smaller).
+As with the rest of this repo, these reports are for research/educational inspection only.
+
 Optionally: `biotrace_ui.html`, `nf_derived_events.*`, and timeseries exports (bandpowers/coherence/artifacts).
 
 ### JSON Schemas for qeeg_nf_cli JSON outputs
