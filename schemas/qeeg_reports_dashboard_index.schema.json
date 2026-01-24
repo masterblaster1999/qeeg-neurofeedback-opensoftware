@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_reports_dashboard_index.schema.json",
+  "title": "scripts/render_reports_dashboard.py --json-index output",
+  "description": "Schema for the machine-readable JSON index emitted by scripts/render_reports_dashboard.py when --json-index is provided. This file is intended for downstream tools (GUIs, offline bundles, analysis pipelines) to discover and link to available HTML reports without parsing the dashboard HTML.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_utc",
+    "roots",
+    "dashboard_html",
+    "reports"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_reports_dashboard_index.schema.json"
+    },
+    "schema_version": {
+      "type": "integer",
+      "description": "Version of the JSON index payload structure.",
+      "const": 1
+    },
+    "generated_utc": {
+      "type": "string",
+      "description": "UTC timestamp (ISO-8601 with trailing 'Z') when the index was generated.",
+      "format": "date-time"
+    },
+    "roots": {
+      "type": "array",
+      "description": "Original scan roots (typically absolute paths).",
+      "items": {
+        "type": "string"
+      }
+    },
+    "roots_rel": {
+      "type": "array",
+      "description": "Scan roots as POSIX-style relative paths from the JSON file's directory (portable when moving the report folder).",
+      "items": {
+        "type": "string"
+      }
+    },
+    "dashboard_html": {
+      "type": "string",
+      "description": "POSIX-style relative path to the generated dashboard HTML, relative to the JSON index file."
+    },
+    "reports_summary": {
+      "type": "object",
+      "description": "Convenience counts of report statuses.",
+      "additionalProperties": false,
+      "required": [
+        "total",
+        "ok",
+        "skipped",
+        "error"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ok": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "reports": {
+      "type": "array",
+      "description": "List of detected report HTML outputs.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "outdir",
+          "report_html",
+          "status"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Report kind identifier (e.g. quality, bandpowers, connectivity, ...)."
+          },
+          "outdir": {
+            "type": "string",
+            "description": "POSIX-style relative path to the run/output directory containing the report, relative to the JSON index file."
+          },
+          "report_html": {
+            "type": "string",
+            "description": "POSIX-style relative path to the report HTML file, relative to the JSON index file."
+          },
+          "status": {
+            "type": "string",
+            "description": "Whether the report is available/linked, skipped, or failed to render.",
+            "enum": [
+              "ok",
+              "skipped",
+              "error"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "description": "Optional extra context for skipped/error statuses (best-effort)."
+          },
+          "report_exists": {
+            "type": "boolean",
+            "description": "Whether report_html existed at generation time (best-effort)."
+          },
+          "report_mtime_utc": {
+            "type": "string",
+            "description": "UTC mtime of report_html at generation time (ISO-8601 with trailing Z).",
+            "format": "date-time"
+          },
+          "report_size_bytes": {
+            "type": "integer",
+            "description": "Size of report_html in bytes at generation time (best-effort).",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "dashboard_exists": {
+      "type": "boolean",
+      "description": "Whether the dashboard_html file existed at generation time (best-effort)."
+    },
+    "dashboard_mtime_utc": {
+      "type": "string",
+      "description": "UTC mtime of dashboard_html at generation time (ISO-8601 with trailing Z).",
+      "format": "date-time"
+    },
+    "dashboard_size_bytes": {
+      "type": "integer",
+      "description": "Size of dashboard_html in bytes at generation time (best-effort).",
+      "minimum": 0
+    }
+  }
+}

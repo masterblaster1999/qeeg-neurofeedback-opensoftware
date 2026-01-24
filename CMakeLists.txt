@@ -47,6 +47,14 @@ if (QEEG_ENABLE_CCACHE)
   endif()
 endif()
 
+# Optional: precompiled headers (best-effort)
+#
+# This is OFF by default because PCH behavior can be toolchain-specific.
+# When enabled, it can significantly speed up local builds for this large
+# translation-unit-heavy project.
+option(QEEG_ENABLE_PCH "Enable precompiled headers to speed up builds (best-effort)" OFF)
+
+
 # Position-independent code (PIC)
 #
 # When building a static libqeeg.a, downstream consumers may want to link it
@@ -256,6 +264,15 @@ target_include_directories(qeeg PUBLIC
 # Ensure downstream consumers (via find_package) build with at least C++17.
 # This is exported as an INTERFACE requirement on qeeg::qeeg.
 target_compile_features(qeeg PUBLIC cxx_std_17)
+
+# Precompiled headers (optional)
+#
+# When enabled, this can significantly reduce compile times for local builds.
+# It is a best-effort developer convenience: disable it if your toolchain
+# has issues with PCH.
+if (QEEG_ENABLE_PCH)
+  target_precompile_headers(qeeg PRIVATE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/pch.hpp>")
+endif()
 
 # Version / build metadata
 #

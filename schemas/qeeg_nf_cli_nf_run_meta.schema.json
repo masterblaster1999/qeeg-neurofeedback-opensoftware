@@ -16,6 +16,8 @@
     "Outputs",
     "demo",
     "input_path",
+    "channel_map_out",
+    "channel_map",
     "channel_qc",
     "channel_qc_resolved",
     "qc_bad_channel_count",
@@ -331,6 +333,20 @@
       ]
     },
     "derived_events_json": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "channel_map": {
+      "description": "Optional channel-map CSV path used to rename/drop channels (or null).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "channel_map_out": {
+      "description": "If a channel map was applied, a copy written inside OutputDir (or null).",
       "type": [
         "string",
         "null"

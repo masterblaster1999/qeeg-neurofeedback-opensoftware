@@ -17,6 +17,13 @@ live here:
 
 from __future__ import annotations
 
+import sys
+
+# Avoid polluting the source tree with __pycache__ when these scripts are run
+# directly or via CTest/CI. This is a developer convenience only; it does not
+# change the outputs of the report renderers.
+sys.dont_write_bytecode = True
+
 import csv
 import datetime as _dt
 import html
@@ -24,6 +31,43 @@ import json
 import math
 import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+def _cleanup_stale_pycache() -> None:
+    """Best-effort cleanup of stale scripts/__pycache__.
+
+    Compiled Python bytecode is harmless, but it creates noisy diffs and can
+    confuse users when it shows up in patch zips or bundles.
+    """
+
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        pycache = os.path.join(here, '__pycache__')
+        if not os.path.isdir(pycache):
+            return
+
+        removed_any = False
+        for fn in os.listdir(pycache):
+            # Typical filename: report_common.cpython-311.pyc
+            if not fn.endswith('.pyc'):
+                continue
+            try:
+                os.remove(os.path.join(pycache, fn))
+                removed_any = True
+            except Exception:
+                pass
+
+        if removed_any:
+            try:
+                if not os.listdir(pycache):
+                    os.rmdir(pycache)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_cleanup_stale_pycache()
 
 
 def e(x: Any) -> str:

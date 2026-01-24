@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>qEEG Kiosk</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="kiosk">
+<div id="wrap">
+  <div class="mid">qEEG Neurofeedback</div>
+  <div id="metric" class="big">—</div>
+  <div id="thr" class="mid">threshold: —</div>
+  <div class="row">
+    <span id="state" class="badge">connecting…</span>
+    <span id="age" class="badge">age: —</span>
+  </div>
+  <div class="row" style="margin-top:20px">
+    <button id="fsBtn" type="button">Fullscreen</button>
+    <button id="pauseBtn" type="button">Pause</button>
+  </div>
+  <div class="small">
+    Lightweight view for tablets / second screens. Requires the <code>?token=…</code> in the URL.
+    (If you run the server with <code>--host 0.0.0.0 --allow-remote</code>, you can open the LAN URL on a Nexus/Android tablet.)
+  </div>
+</div>
+<script src="/kiosk.js" defer></script>
+</body>
+</html>

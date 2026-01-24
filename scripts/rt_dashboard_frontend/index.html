@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>qEEG Real-time Dashboard</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header>
+  <h1>qEEG Real-time Dashboard</h1>
+  <div class="sub">Token-protected dashboard for <code>qeeg_nf_cli</code> outputs (SSE streaming).</div>
+</header>
+<main>
+  <div id="status" class="warnbox" style="display:none"></div>
+  <div class="grid">
+    <section class="panel">
+      <h2>Neurofeedback</h2>
+      <div class="content">
+        <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+          <div class="row" style="gap:8px">
+            <span id="nfConn" class="badge">nf: …</span>
+            <span id="bpConn" class="badge">bandpower: …</span>
+            <span id="artConn" class="badge">artifact: …</span>
+            <span id="metaConn" class="badge">meta: …</span>
+            <span id="stateConn" class="badge">state: …</span>
+          </div>
+          <div class="row">
+            <span class="ctrl">Window</span>
+            <select id="winSel">
+              <option value="30">30s</option>
+              <option value="60" selected>60s</option>
+              <option value="120">120s</option>
+              <option value="300">300s</option>
+            </select>
+            <button id="pauseBtn" type="button">Pause</button>
+          </div>
+        </div>
+        <div class="kv" id="nfStats"></div>
+        <div style="height:10px"></div>
+        <canvas id="nfChart" width="900" height="260"></canvas>
+        <div class="small" style="margin-top:8px">Plot: metric (line) + threshold (dashed). Reward frames shaded. Artifacts (if present) shown in red.</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Bandpower</h2>
+      <div class="content">
+        <div class="split">
+          <div>
+            <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+              <div class="row">
+                <span class="ctrl">Band</span>
+                <select id="bandSel"></select>
+                <span class="ctrl">Channel</span>
+                <select id="chSel"></select>
+              </div>
+              <div class="row">
+                <span class="ctrl">Transform</span>
+                <select id="xformSel">
+                  <option value="linear" selected>linear</option>
+                  <option value="log10">log10</option>
+                  <option value="db">dB (10·log10)</option>
+                </select>
+                <span class="ctrl">Scale</span>
+                <select id="scaleSel">
+                  <option value="auto" selected>auto</option>
+                  <option value="fixed">fixed (rolling)</option>
+                </select>
+                <span class="ctrl">Labels</span>
+                <select id="lblSel">
+                  <option value="on" selected>on</option>
+                  <option value="off">off</option>
+                </select>
+              </div>
+            </div>
+            <div class="topoWrap">
+              <canvas id="topoCanvas" width="900" height="320" aria-label="scalp topography"></canvas>
+            </div>
+            <div class="legend"><span id="vmin">min: —</span><span id="vmax">max: —</span></div>
+            <div class="small" style="margin-top:8px">
+              Topography uses a simple inverse-distance interpolation of electrode values (approx 10-10 positions) from <code>bandpower_timeseries.csv</code>.
+              If channels are not standard electrode labels, a fallback ring layout is used; for accurate placement, drop a <code>montage.csv</code> (name,x,y) into the output directory.
+              Tip: click an electrode to select that channel.
+            </div>
+          </div>
+
+          <div>
+            <canvas id="bpChart" width="900" height="240" aria-label="bandpower time series"></canvas>
+            <div class="small" style="margin-top:8px">Time-series plot of selected band/channel (from <code>bandpower_timeseries.csv</code>).</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel span2">
+      <h2>Session</h2>
+      <div class="content">
+        <div class="row">
+          <div class="label">Run meta</div>
+          <div id="runMetaStatus" class="value muted">—</div>
+        </div>
+        <div class="row">
+          <div class="label">Server</div>
+          <div id="serverStats" class="value muted">—</div>
+        </div>
+
+        <details id="runMetaDetails" class="details">
+          <summary>Run metadata (nf_run_meta.json)</summary>
+          <div class="detailsBody">
+            <div id="runMetaKv" class="kv"></div>
+            <div class="detailsActions">
+              <a id="runMetaDownload" href="#" target="_blank" rel="noopener">Download JSON</a>
+              <button id="runMetaRefresh" class="btn" type="button">Refresh</button>
+            </div>
+            <pre id="runMetaRaw" class="codebox"></pre>
+          </div>
+        </details>
+
+        <details id="statsDetails" class="details">
+          <summary>Server stats</summary>
+          <div class="detailsBody">
+            <div id="statsKv" class="kv"></div>
+          </div>
+        </details>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<script type="module" src="/app.js"></script>
+<script nomodule src="/app_legacy.js" defer></script>
+</body>
+</html>

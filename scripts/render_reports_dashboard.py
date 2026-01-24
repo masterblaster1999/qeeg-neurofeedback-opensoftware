@@ -51,17 +51,22 @@ Examples:
 
   # Only link to reports if they already exist (do not render).
   python3 scripts/render_reports_dashboard.py . --no-render
+
+  # Write a machine-readable JSON index for downstream tooling.
+  python3 scripts/render_reports_dashboard.py . --json-index qeeg_reports_dashboard_index.json
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import re
 import sys
 import webbrowser
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from report_common import BASE_CSS, JS_SORT_TABLE, e as _e, posix_relpath as _posix_relpath, utc_now_iso
@@ -632,6 +637,87 @@ document.addEventListener('DOMContentLoaded', () => {
 """
 
 
+def _write_json_index(items: Sequence[ReportItem], roots: Sequence[str], *, out_path: str, json_index_path: str) -> None:
+    """Write a machine-readable JSON index for the generated dashboard.
+
+    The HTML dashboard is convenient for humans, but downstream tools (and
+    offline-bundle UIs) often want a lightweight structured index. This file
+    mirrors what the dashboard links to, without requiring HTML parsing.
+
+    Paths in the JSON are written as POSIX-style relative paths from the JSON
+    file's directory so the entire report folder can be moved/copied.
+
+    The index also includes best-effort file metadata for the dashboard and
+    each report (exists/mtime/size). These fields are optional in the schema
+    and intended as convenience hints for tools (they should not be treated as
+    an integrity guarantee, since files may change after the index is written).
+    """
+
+    json_index_path = os.path.abspath(json_index_path)
+    out_dir = os.path.dirname(json_index_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _rel(p: str) -> str:
+        try:
+            return _posix_relpath(os.path.abspath(p), out_dir)
+        except Exception:
+            return p
+
+    schema_id = "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_reports_dashboard_index.schema.json"
+
+    ok_n = sum(1 for it in items if it.status == "ok")
+    skipped_n = sum(1 for it in items if it.status == "skipped")
+    error_n = sum(1 for it in items if it.status == "error")
+
+    dash_exists = bool(out_path and os.path.exists(out_path))
+    dash_mtime = _file_mtime_iso(out_path) if dash_exists else ""
+    dash_size = int(os.path.getsize(out_path)) if dash_exists else 0
+
+    reports: List[Dict[str, object]] = []
+    for it in items:
+        rep_exists = bool(it.report_path and os.path.exists(it.report_path))
+        rep_mtime = _file_mtime_iso(it.report_path) if rep_exists else ""
+        rep_size = int(os.path.getsize(it.report_path)) if rep_exists else 0
+
+        obj: Dict[str, object] = {
+            "kind": it.kind,
+            "outdir": _rel(it.outdir),
+            "report_html": _rel(it.report_path),
+            "status": it.status,
+            "message": it.message,
+            "report_exists": rep_exists,
+        }
+        if rep_exists:
+            obj["report_mtime_utc"] = rep_mtime
+            obj["report_size_bytes"] = rep_size
+        reports.append(obj)
+
+    payload: Dict[str, object] = {
+        "$schema": schema_id,
+        "schema_version": 1,
+        "generated_utc": utc_now_iso(),
+        "roots": [os.path.abspath(r) for r in roots],
+        "roots_rel": [_rel(os.path.abspath(r)) for r in roots],
+        "dashboard_html": _rel(out_path),
+        "dashboard_exists": dash_exists,
+        "reports_summary": {
+            "total": len(items),
+            "ok": ok_n,
+            "skipped": skipped_n,
+            "error": error_n,
+        },
+        "reports": reports,
+    }
+
+    if dash_exists:
+        payload["dashboard_mtime_utc"] = dash_mtime
+        payload["dashboard_size_bytes"] = dash_size
+
+    with open(json_index_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
 # ---- CLI ------------------------------------------------------------------
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -645,6 +731,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--out",
         default=None,
         help="Output HTML path (default: <first-root>/qeeg_reports_dashboard.html)",
+    )
+    ap.add_argument(
+        "--json-index",
+        default=None,
+        help=(
+            "Optional JSON index output path (machine-readable summary of detected reports; "
+            "includes $schema hint + schema_version)."
+        ),
+    )
+
+    # Convenience: build a portable ZIP bundle in the same pass.
+    ap.add_argument(
+        "--bundle",
+        nargs="?",
+        const="__DEFAULT__",
+        default=None,
+        help=(
+            "If provided, also create a portable ZIP bundle containing the dashboard HTML, "
+            "the JSON index, and all referenced report HTML files (plus best-effort local assets). "
+            "If you pass --bundle with no value, it defaults to <out-dir>/qeeg_reports_bundle.zip."
+        ),
+    )
+    ap.add_argument(
+        "--bundle-no-assets",
+        action="store_true",
+        help="When bundling, do not include local assets referenced by HTML (bundle only HTML + index).",
+    )
+    ap.add_argument(
+        "--bundle-no-manifest",
+        action="store_true",
+        help="When bundling, do not include qeeg_reports_bundle_manifest.json (SHA-256 checksums).",
+    )
+    ap.add_argument(
+        "--bundle-no-schema",
+        action="store_true",
+        help="When bundling, do not embed schemas/qeeg_reports_dashboard_index.schema.json.",
+    )
+    ap.add_argument(
+        "--bundle-manifest-name",
+        default=None,
+        help="When bundling, override the manifest filename inside the ZIP (default: qeeg_reports_bundle_manifest.json).",
+    )
+    ap.add_argument(
+        "--verify-bundle",
+        action="store_true",
+        help="After bundling, verify the ZIP (manifest hashes + index cross-check).",
+    )
+    ap.add_argument(
+        "--bundle-verbose",
+        action="store_true",
+        help="When bundling/verifying, print verbose file-level details.",
     )
     ap.add_argument(
         "--force",
@@ -801,6 +938,87 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f.write(html_doc)
 
     print(f"Wrote: {out_path}")
+
+    if args.verify_bundle and args.bundle is None:
+        print("ERROR: --verify-bundle requires --bundle", file=sys.stderr)
+        return 1
+
+    # If bundling is requested but the user did not specify --json-index, write
+    # one alongside the dashboard so package_reports_dashboard can discover all
+    # report_html files without parsing HTML.
+    json_index_path: Optional[str] = str(args.json_index) if args.json_index else None
+    if args.bundle is not None and not json_index_path:
+        json_index_path = os.path.join(out_dir, "qeeg_reports_dashboard_index.json")
+
+    if json_index_path:
+        _write_json_index(items, roots, out_path=out_path, json_index_path=str(json_index_path))
+        print(f"Wrote: {os.path.abspath(str(json_index_path))}")
+
+    # Optional: bundle + verify (stdlib only; uses scripts/package_reports_dashboard.py).
+    if args.bundle is not None:
+        bundle_out = str(args.bundle)
+        if bundle_out == "__DEFAULT__":
+            bundle_out = os.path.join(out_dir, "qeeg_reports_bundle.zip")
+        bundle_out = os.path.abspath(bundle_out)
+
+        # Import lazily to keep the dashboard generator usable as a standalone
+        # script even if these helpers are removed/renamed downstream.
+        try:
+            import package_reports_dashboard as _pkg  # type: ignore
+        except Exception as e:
+            print(f"ERROR: bundling requested but package_reports_dashboard.py could not be imported: {e}", file=sys.stderr)
+            return 1
+
+        manifest_name = (
+            str(args.bundle_manifest_name)
+            if args.bundle_manifest_name
+            else getattr(_pkg, "DEFAULT_MANIFEST_NAME", "qeeg_reports_bundle_manifest.json")
+        )
+
+        try:
+            assert json_index_path is not None
+            _n, blog = _pkg.create_bundle(
+                Path(str(json_index_path)).resolve(),
+                out_zip=Path(bundle_out).resolve(),
+                include_assets=not bool(args.bundle_no_assets),
+                include_manifest=not bool(args.bundle_no_manifest),
+                include_schema=not bool(args.bundle_no_schema),
+                manifest_name=str(manifest_name),
+                verbose=bool(args.bundle_verbose),
+            )
+            for ln in blog:
+                print(ln)
+        except Exception as e:
+            print(f"ERROR: bundling failed: {e}", file=sys.stderr)
+            return 1
+
+        print(f"Wrote bundle: {bundle_out}")
+
+        if args.verify_bundle:
+            try:
+                import verify_reports_bundle as _vb  # type: ignore
+            except Exception as e:
+                print(f"ERROR: verify requested but verify_reports_bundle.py could not be imported: {e}", file=sys.stderr)
+                return 1
+
+            # If the user chose not to include a manifest, still verify index
+            # references (but skip hash checks, because the manifest is absent).
+            check_hashes = not bool(args.bundle_no_manifest)
+            ok, vlog = _vb.verify_bundle(
+                Path(bundle_out).resolve(),
+                manifest_name=str(manifest_name),
+                index_name=None,
+                check_hashes=check_hashes,
+                check_index=True,
+                verbose=bool(args.bundle_verbose),
+            )
+            for ln in vlog:
+                if ln.startswith("ERROR"):
+                    print(ln, file=sys.stderr)
+                else:
+                    print(ln)
+            if not ok:
+                return 1
 
     if args.open:
         try:

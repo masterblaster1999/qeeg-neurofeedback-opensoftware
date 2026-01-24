@@ -57,9 +57,12 @@ EEGRecording read_recording_auto(const std::string& path, double fs_hz_for_csv) 
   // to open formats (EDF/ASCII) from within BioTrace+.
   if (ends_with(low, ".bcd") || ends_with(low, ".mbd")) {
     throw std::runtime_error(
-        "Unsupported input file extension (.bcd/.mbd). These are BioTrace+/NeXus session files "
-        "and are not supported here. Export to EDF or ASCII (CSV/TXT) from BioTrace+ and try again: " +
-        resolved_path);
+        "Unsupported input file extension (.bcd/.mbd). These are BioTrace+/NeXus session containers and "
+        "are not directly supported here.\n\n"
+        "Recommended: export to EDF/BDF or ASCII (CSV/TXT) from BioTrace+ and use that file instead.\n"
+        "Best-effort: some .bcd/.mbd files are ZIP containers that include an embedded EDF/BDF/ASCII export. "
+        "If so, try: python3 scripts/biotrace_extract_container.py --input session.bcd --outdir extracted --print\n\n"
+        "Input: " + resolved_path);
   }
 
   if (ends_with(low, ".edf") || ends_with(low, ".edf+") || ends_with(low, ".rec")) {

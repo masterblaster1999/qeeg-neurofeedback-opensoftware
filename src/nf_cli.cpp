@@ -20,6 +20,7 @@
 #include "qeeg/csv_io.hpp"
 #include "qeeg/bids.hpp"
 #include "qeeg/channel_qc_io.hpp"
+#include "qeeg/channel_map.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/utils.hpp"
 #include "qeeg/wav_writer.hpp"
@@ -33,6 +34,7 @@
 #include <deque>
 #include <iomanip>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -94,6 +96,13 @@ struct Args {
   //  - bad channels are ignored by the artifact gate (to avoid "always bad" sessions due to a known dead channel)
   //  - bandpower_timeseries.csv masks bad channels as NaN for easier downstream analysis
   //  - by default, using a bad channel for the NF metric is treated as an error (override with --allow-bad-metric-channels)
+
+  // Optional: channel name mapping (rename/drop) via CSV. This is useful when your
+  // acquisition software uses non-standard channel labels (e.g., BioTrace+/NeXus ExG1..ExG4).
+  // Use --channel-map-template to generate a template for your input.
+  std::string channel_map_path;
+  std::string channel_map_template_out;
+
   std::string channel_qc;
   bool allow_bad_metric_channels{false};
 
@@ -203,6 +212,9 @@ struct Args {
   // Debug exports
   bool export_bandpowers{false};   // bandpower mode only
   bool export_coherence{false};    // coherence mode only
+
+  // Optional: flush CSV outputs after each row (useful for real-time dashboards that tail files).
+  bool flush_csv{false};
 
   // Optional artifact gating (time-domain robust outlier detection)
   bool artifact_gate{false};
@@ -857,6 +869,7 @@ static void print_nf_config_json(const Args& args,
   // Exports.
   std::cout << "  \"export_bandpowers\": " << (args.export_bandpowers ? "true" : "false") << ",\n";
   std::cout << "  \"export_coherence\": " << (args.export_coherence ? "true" : "false") << ",\n";
+  std::cout << "  \"flush_csv\": " << (args.flush_csv ? "true" : "false") << ",\n";
   std::cout << "  \"export_artifacts\": " << (args.export_artifacts ? "true" : "false") << ",\n";
   std::cout << "  \"biotrace_ui\": " << (args.biotrace_ui ? "true" : "false") << ",\n";
   std::cout << "  \"export_derived_events\": " << (args.export_derived_events ? "true" : "false") << ",\n";
@@ -923,6 +936,8 @@ static void print_help() {
     << "  --input PATH              Input EDF/BDF/CSV (CSV requires --fs)\n"
     << "  --fs HZ                   Sampling rate for CSV (optional if first column is time); also used for --demo\n"
     << "  --outdir DIR              Output directory (default: out_nf)\n"
+    << "  --channel-map PATH        Apply channel map CSV (rename/drop channels)\n"
+    << "  --channel-map-template PATH  Write channel map template for input and exit\n"
     << "  --list-channels          Print input channel names (one per line) and exit\n"
     << "  --list-channels-json     Print input channel info as JSON and exit\n"
     << "  --list-bands             Print default EEG bands (name:lo-hi) and exit\n"
@@ -993,6 +1008,7 @@ static void print_help() {
     << "  --speed X                  Pace offline playback at X times real-time (X>0; e.g. 2.0 is 2x speed)\n"
     << "  --export-bandpowers        Write bandpower_timeseries.csv (bandpower/ratio modes)\n"
     << "  --export-coherence         Write coherence_timeseries.csv or imcoh_timeseries.csv (coherence mode)\n"
+    << "  --flush-csv               Flush CSV outputs after each row (useful for real-time dashboards / tail -f)\n"
     << "  --artifact-gate            Suppress reward/adaptation during detected artifacts\n"
     << "  --artifact-ptp-z Z         Artifact threshold: peak-to-peak robust z (<=0 disables; default: 6)\n"
     << "  --artifact-rms-z Z         Artifact threshold: RMS robust z (<=0 disables; default: 6)\n"
@@ -1044,6 +1060,10 @@ static Args parse_args(int argc, char** argv) {
       a.input_path = argv[++i];
     } else if (arg == "--outdir" && i + 1 < argc) {
       a.outdir = argv[++i];
+    } else if (arg == "--channel-map" && i + 1 < argc) {
+      a.channel_map_path = argv[++i];
+    } else if (arg == "--channel-map-template" && i + 1 < argc) {
+      a.channel_map_template_out = argv[++i];
     } else if (arg == "--list-channels") {
       a.list_channels = true;
     } else if (arg == "--list-channels-json") {
@@ -1192,6 +1212,8 @@ static Args parse_args(int argc, char** argv) {
       a.export_bandpowers = true;
     } else if (arg == "--export-coherence") {
       a.export_coherence = true;
+    } else if (arg == "--flush-csv") {
+      a.flush_csv = true;
     } else if (arg == "--artifact-gate") {
       a.artifact_gate = true;
     } else if (arg == "--artifact-ptp-z" && i + 1 < argc) {
@@ -2867,6 +2889,29 @@ int qeeg_nf_cli_run(int argc, char** argv) {
       throw std::runtime_error("--input is required (or use --demo)");
     }
 
+    // Optional: write a channel-map template for non-standard channel labels and exit.
+    // This is handy for BioTrace+/NeXus exports where channels might be labeled ExG1..ExG4.
+    if (!args.channel_map_template_out.empty()) {
+      EEGRecording rec;
+      if (args.demo) {
+        Montage montage = Montage::builtin_standard_1020_19();
+        rec = make_demo_recording(montage, args.fs_csv, args.demo_seconds);
+      } else {
+        rec = read_recording_auto(args.input_path, args.fs_csv);
+      }
+
+      if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels");
+      if (rec.fs_hz <= 0.0) throw std::runtime_error("Invalid sampling rate");
+
+      std::filesystem::path out_path(args.channel_map_template_out);
+      if (out_path.has_parent_path()) {
+        ensure_directory(out_path.parent_path().string());
+      }
+      write_channel_map_template(args.channel_map_template_out, rec);
+      std::cout << "Wrote channel map template: " << args.channel_map_template_out << "\n";
+      return 0;
+    }
+
 if (args.list_channels || args.list_channels_json) {
   EEGRecording rec;
   if (args.demo) {
@@ -2878,6 +2923,12 @@ if (args.list_channels || args.list_channels_json) {
 
   if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels");
   if (rec.fs_hz <= 0.0) throw std::runtime_error("Invalid sampling rate");
+
+  if (!args.channel_map_path.empty()) {
+    const ChannelMap cmap = load_channel_map_file(args.channel_map_path);
+    apply_channel_map(&rec, cmap);
+    if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels after --channel-map");
+  }
 
   if (args.list_channels_json) {
     print_channel_list_json(rec, args);
@@ -2984,6 +3035,12 @@ if (args.list_channels || args.list_channels_json) {
       if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels");
       if (rec.fs_hz <= 0.0) throw std::runtime_error("Invalid sampling rate");
 
+      if (!args.channel_map_path.empty()) {
+        const ChannelMap cmap = load_channel_map_file(args.channel_map_path);
+        apply_channel_map(&rec, cmap);
+        if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels after --channel-map");
+      }
+
       // Optional: load channel QC labels (no output files are written in config/dry-run mode).
       bool have_qc = false;
       std::string qc_resolved_path;
@@ -3058,12 +3115,30 @@ if (args.list_channels || args.list_channels_json) {
 
     ensure_directory(args.outdir);
 
+    std::string channel_map_out_path;
+
     EEGRecording rec;
     if (args.demo) {
       Montage montage = Montage::builtin_standard_1020_19();
       rec = make_demo_recording(montage, args.fs_csv, args.demo_seconds);
     } else {
       rec = read_recording_auto(args.input_path, args.fs_csv);
+    }
+
+    if (!args.channel_map_path.empty()) {
+      const ChannelMap cmap = load_channel_map_file(args.channel_map_path);
+      apply_channel_map(&rec, cmap);
+      if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels after --channel-map");
+      // Copy the applied map into the outdir for provenance / reproducibility.
+      channel_map_out_path = args.outdir + "/channel_map_applied.csv";
+      try {
+        std::ifstream in(args.channel_map_path);
+        std::ofstream out(channel_map_out_path);
+        if (!in || !out) throw std::runtime_error("copy failed");
+        out << in.rdbuf();
+      } catch (...) {
+        channel_map_out_path.clear();
+      }
     }
 
     if (rec.n_channels() < 1) throw std::runtime_error("Recording has no channels");
@@ -3177,6 +3252,14 @@ if (args.list_channels || args.list_channels_json) {
         meta << "\n  ],\n";
         meta << "  \"demo\": " << (args.demo ? "true" : "false") << ",\n";
         meta << "  \"input_path\": \"" << json_escape(args.input_path) << "\",\n";
+        meta << "  \"channel_map\": ";
+        if (!args.channel_map_path.empty()) meta << "\"" << json_escape(args.channel_map_path) << "\"";
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"channel_map_out\": ";
+        if (!channel_map_out_path.empty()) meta << "\"" << json_escape(channel_map_out_path) << "\"";
+        else meta << "null";
+        meta << ",\n";
         meta << "  \"channel_qc\": ";
         if (!args.channel_qc.empty()) meta << "\"" << json_escape(args.channel_qc) << "\"";
         else meta << "null";
@@ -3975,6 +4058,7 @@ if (args.list_channels || args.list_channels_json) {
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(feedback_raw, reward_value);
           out << "\n";
+          if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
         }
       }
@@ -4234,6 +4318,7 @@ if (args.list_channels || args.list_channels_json) {
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(feedback_raw, reward_value);
           out << "\n";
+          if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
         }
       }
@@ -4305,6 +4390,7 @@ if (args.list_channels || args.list_channels_json) {
                     << "," << af.bad_channel_count
                     << "," << af.max_ptp_z << "," << af.max_rms_z
                     << "," << af.max_kurtosis_z << "\n";
+            if (args.flush_csv) out_art.flush();
           }
         }
       }
@@ -4449,6 +4535,7 @@ if (args.list_channels || args.list_channels_json) {
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
           out << "\n";
+          if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
           continue;
         }
@@ -4491,6 +4578,7 @@ if (args.list_channels || args.list_channels_json) {
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
           out << "\n";
+          if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
           continue;
         }
@@ -4556,6 +4644,7 @@ if (args.list_channels || args.list_channels_json) {
         append_feedback_optional_cols(val_raw);
         append_reward_value_cols(feedback_raw, reward_value);
         out << "\n";
+        if (args.flush_csv) out.flush();
 
         ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
 
@@ -4568,6 +4657,7 @@ if (args.list_channels || args.list_channels_json) {
             }
           }
           out_bp << "\n";
+          if (args.flush_csv) out_bp.flush();
         }
       }
     }

@@ -917,6 +917,23 @@ This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral chan
 **Notes on BioTrace+ export formats**
 - The `.bcd` / `.mbd` formats are BioTrace+/NeXus session containers/backups and are **not supported** here.
   Export to EDF/BDF or ASCII from BioTrace+ first.
+  
+  *Best-effort helper:* some `.bcd`/`.mbd` files are ZIP containers that include an EDF/BDF/ASCII export.
+  If so, you can try extracting the embedded recording:
+  
+  ```bash
+  python3 scripts/biotrace_extract_container.py --input session.bcd --list
+  python3 scripts/biotrace_extract_container.py --input session.bcd --outdir extracted --print
+  ```
+
+  If your end goal is to run **qeeg_nf_cli** on a `.bcd`/`.mbd` in one step (when it happens to be a ZIP container with an embedded export), there is also a small wrapper that extracts + launches the CLI:
+
+  ```bash
+  python3 scripts/biotrace_run_nf.py --container session.bcd --outdir out_nf -- \
+    --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+    --realtime --export-bandpowers --flush-csv
+  ```
+
 - BioTrace+ ASCII exports are often saved as `.txt` / `.tsv` / `.asc`; these are treated like CSV inputs in this project.
 
 **Trigger/event channels (important for some BDF recordings)**
@@ -1282,6 +1299,97 @@ external UI via OSC, or when watching the built-in BioTrace-style UI):
 ./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
   --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 --speed 2.0
 ```
+
+#### Real-time qEEG visualization dashboard (experimental)
+
+This repo includes a tiny **local web dashboard** (no third-party dependencies) that can
+visualize key neurofeedback/qEEG time-series outputs *while a session is running*.
+
+It provides:
+- a live neurofeedback plot (metric + threshold + reward shading)
+- an interpolated scalp "topography" for bandpower values (approx 10-10 positions)
+- a bandpower time-series plot for a selected band/channel
+- click-to-select channels on the scalp view and optional log/db value transforms
+- basic file status warnings if outputs are missing or appear stale
+
+It watches these files in `--outdir`:
+- `nf_feedback.csv` (metric/threshold/reward over time)
+- `bandpower_timeseries.csv` (optional; enables a simple scalp topography view)
+- `artifact_gate_timeseries.csv` (optional)
+
+Because C++ iostreams buffer output, you should enable CSV flushing when you want live
+visualization:
+
+```bash
+./build/qeeg_nf_cli --input path/to/recording.bdf --outdir out_nf --metric alpha/beta:Pz \
+  --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+  --realtime --export-bandpowers --flush-csv
+```
+
+**NeXus-10 MKII / BioTrace+ tip (channel labels):** if your recording uses non-standard channel names
+(e.g., `ExG1`, `ExG2`, …), remap them to standard 10-20 labels so metric specs and the scalp view line up:
+
+```bash
+# 1) Create a mapping template from the input file (EDF/BDF/REC/CSV)
+./build/qeeg_nf_cli --input path/to/session.rec --channel-map-template channel_map.csv
+
+# 2) Edit channel_map.csv (examples: ExG1->Fz, ExG2->Pz; drop unused channels with DROP)
+
+# 3) Run with the map applied
+./build/qeeg_nf_cli --input path/to/session.rec --outdir out_nf --channel-map channel_map.csv \
+  --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+  --realtime --export-bandpowers --flush-csv
+```
+
+If you want explicit electrode coordinates (for custom labels), you can also drop a `montage.csv`
+file into `out_nf/` with rows `name,x,y` (values in roughly `[-1,1]` head coordinates). The dashboard
+will prefer it over built-in 10-10 positions.
+
+Then start the dashboard server (in another terminal):
+
+```bash
+python3 scripts/rt_qeeg_dashboard.py --outdir out_nf --open
+
+# Optional tuning:
+#  - throttle SSE updates (browser-friendly) and keep more history for new connections
+python3 scripts/rt_qeeg_dashboard.py --outdir out_nf --open --max-hz 10 --history-rows 2000
+```
+
+View from another device on the same network (e.g., a Nexus/Android tablet):
+
+```bash
+# Bind to all interfaces (LAN). Requires explicit opt-in.
+python3 scripts/rt_qeeg_dashboard.py --outdir out_nf --host 0.0.0.0 --allow-remote
+
+# The server prints both a "Dashboard (LAN)" URL (full UI) and a "Kiosk (LAN)" URL.
+# /kiosk is a lightweight, fullscreen-friendly view for tablets/second screens.
+```
+
+You can also auto-open the lightweight kiosk view locally:
+
+```bash
+python3 scripts/rt_qeeg_dashboard.py --outdir out_nf --open-kiosk
+```
+
+
+By default the server binds to `127.0.0.1` and prints the URL to open in your browser. If you bind to a non-loopback host, the script requires `--allow-remote` (LAN use only). It also prints a `/kiosk` URL for a lightweight tablet-friendly view.
+If expected CSVs don't exist yet (or stop updating), the page shows a small status panel
+to help diagnose what the runner is doing.
+
+Notes:
+- The server batches frames and throttles per-stream send rate (see `--max-hz`) so long sessions
+  don't overwhelm the browser.
+- The dashboard frontend now prefers a **single multiplexed SSE connection** (`/api/sse/stream`) that
+  carries `nf/meta/bandpower/artifact/state` updates as **named SSE events**. This improves compatibility
+  with browsers that enforce low per-origin connection limits. The legacy per-topic SSE endpoints remain.
+- If `EventSource` is unavailable (or you want a simpler transport), the server also exposes a polling endpoint
+  (`/api/snapshot`) that returns incremental batches using cursors (sequence numbers). The UI can fall back to it.
+- The main dashboard page now uses a modern `<script type="module">` for `/app.js` plus a legacy `<script nomodule>`
+  fallback (`/app_legacy.js`) to improve compatibility with older browsers/devices.
+- The Bandpower panel supports optional linear/log10/dB transforms (handy when your pipeline writes raw power).
+- Live file status uses a meta SSE stream (with a polling fallback if EventSource is unavailable).
+- Dashboard UI state (window/band/channel/transform/pause) is shared across clients via `/api/state` and persisted to `<outdir>/rt_dashboard_state.json`.
+- The HTML/CSS/JS frontend lives in `scripts/rt_dashboard_frontend/` (override with `--frontend-dir` if you want to customize/skin the UI).
 
 Optional: smooth the metric with an **exponential moving average** before thresholding/feedback:
 

@@ -1,0 +1,91 @@
+/* Legacy CSS fallback: many colors also have hard-coded values so the UI remains readable
+   on older browsers that do not support CSS variables. */
+
+:root{
+  --bg:#0b0f14; --panel:#121a22; --panel2:#0f151c; --fg:#e8eef6; --muted:#9fb0c3;
+  --border:#203040; --accent:#64d2ff; --warn:#ffcf5c; --bad:#ff6b6b;
+}
+
+html,body{height:100%;}
+body{
+  margin:0;
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;
+  background:#0b0f14;
+  background:var(--bg);
+  color:#e8eef6;
+  color:var(--fg);
+}
+a{color:var(--accent);}
+code{color:#fff;}
+
+header{
+  padding:14px 16px;
+  border-bottom:1px solid #203040;
+  border-bottom:1px solid var(--border);
+  background:linear-gradient(180deg, #0d141d, #0b0f14);
+}
+header h1{margin:0; font-size:16px; letter-spacing:0.4px;}
+header .sub{margin-top:6px; font-size:12px; color:var(--muted)}
+
+main{padding:12px 12px 24px;}
+.grid{display:grid; grid-template-columns: 1.2fr 1fr; gap:12px; align-items:start;}
+@media (max-width: 980px){ .grid{grid-template-columns:1fr;} }
+.panel{background:#121a22;
+  background:var(--panel);
+  border:1px solid #203040;
+  border:1px solid var(--border); border-radius:10px; overflow:hidden;}
+.panel h2{margin:0; padding:10px 12px; font-size:13px; background:var(--panel2); border-bottom:1px solid #203040;
+  border-bottom:1px solid var(--border);}
+.panel .content{padding:12px;}
+.row{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+.badge{display:inline-block; padding:3px 8px; border-radius:999px; border:1px solid #203040; border:1px solid var(--border); background:#0c1118; font-size:12px; color:#9fb0c3; color:var(--muted)}
+.badge.good{color:#b9fbc0; border-color:#2e5b33}
+.badge.warn{color:var(--warn); border-color:#5b4a2e}
+.badge.bad{color:var(--bad); border-color:#5b2e2e}
+.kv{display:grid; grid-template-columns:auto auto; gap:4px 10px; font-size:12px; color:var(--muted)}
+.kv b{color:var(--fg); font-weight:600}
+
+canvas{width:100%; height:260px; background:#071018; border:1px solid #203040; border:1px solid var(--border); border-radius:10px;}
+#bpChart{height:240px;}
+
+.ctrl{font-size:12px; color:var(--muted)}
+select,button{font:inherit; font-size:12px; padding:6px 8px; background:#0c1118; color:#e8eef6; color:var(--fg); border:1px solid #203040; border:1px solid var(--border); border-radius:8px;}
+button{cursor:pointer}
+button:disabled{opacity:0.5; cursor:not-allowed}
+
+.small{font-size:12px; color:var(--muted)}
+.topoWrap{position:relative; width:100%; max-width:520px; margin:0 auto;}
+.topoWrap canvas{height:320px;}
+.legend{display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:8px;}
+.warnbox{padding:10px 12px; background:#1b1520; border:1px solid #3b2a45; border-radius:10px; color:#e5d4ff;}
+.warnbox code{color:#fff}
+.split{display:grid; grid-template-columns:1fr; gap:12px;}
+
+/* --- Session panel helpers --- */
+.span2{grid-column:1 / -1;}
+.label{font-size:12px; color:var(--muted); min-width:74px;}
+.value{font-size:12px; color:var(--fg);}
+.muted{color:var(--muted);}
+.details{margin-top:10px;}
+.details summary{cursor:pointer; font-size:12px; color:var(--fg);}
+.detailsBody{margin-top:8px;}
+.detailsActions{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px;}
+.btn{font:inherit; font-size:12px; padding:6px 8px; background:#0c1118; color:var(--fg); border:1px solid var(--border); border-radius:8px; cursor:pointer;}
+.btn:disabled{opacity:0.5; cursor:not-allowed;}
+.codebox{margin-top:8px; background:#0c1118; border:1px solid var(--border); border-radius:8px; padding:8px; font-size:11px; color:var(--muted); max-height:240px; overflow:auto; white-space:pre-wrap; word-break:break-word;}
+
+
+
+/* --- Kiosk view --- */
+body.kiosk{background:#000; color:#fff;}
+body.kiosk #wrap{min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:16px; box-sizing:border-box;}
+body.kiosk .big{font-size:64px; font-weight:700; letter-spacing:0.5px;}
+body.kiosk .mid{font-size:18px; color:#bbb; margin-top:10px; text-align:center;}
+body.kiosk .row{display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:center; margin-top:16px;}
+body.kiosk .badge{display:inline-block; padding:6px 12px; border-radius:999px; border:1px solid #444; background:#111; font-size:16px; color:#ddd;}
+body.kiosk .badge.reward{border-color:#2e5b33; color:#b9fbc0;}
+body.kiosk .badge.noreward{border-color:#555; color:#ddd;}
+body.kiosk .badge.artifact{border-color:#5b2e2e; color:#ff6b6b;}
+body.kiosk button{font:inherit; font-size:16px; padding:10px 14px; border-radius:10px; border:1px solid #444; background:#111; color:#fff;}
+body.kiosk button:active{transform:translateY(1px);}
+body.kiosk .small{font-size:14px; color:#aaa; margin-top:18px; text-align:center; max-width:720px; line-height:1.35;}

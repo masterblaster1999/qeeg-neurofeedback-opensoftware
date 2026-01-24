@@ -61,6 +61,19 @@
       }
     },
     {
+      "name": "fast",
+      "displayName": "Fast dev (PCH, no CLI/tests)",
+      "generator": "Ninja",
+      "binaryDir": "build/fast",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "QEEG_BUILD_TESTS": "OFF",
+        "QEEG_BUILD_CLI": "OFF",
+        "QEEG_ENABLE_PCH": "ON",
+        "QEEG_ENABLE_CCACHE": "ON"
+      }
+    },
+    {
       "name": "asan",
       "displayName": "ASan/UBSan (Debug)",
       "generator": "Ninja",
@@ -146,6 +159,10 @@
     {
       "name": "tidy",
       "configurePreset": "tidy"
+    },
+    {
+      "name": "fast",
+      "configurePreset": "fast"
     }
   ],
   "testPresets": [

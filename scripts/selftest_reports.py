@@ -26,6 +26,7 @@ import math
 import os
 import random
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
@@ -2089,6 +2090,7 @@ def _run_renderers(root: Path) -> None:
     import render_pac_report
     import render_epoch_report
     import render_reports_dashboard
+    import validate_reports_dashboard_index
     import render_quality_report
     import render_spectral_features_report
     import render_trace_plot_report
@@ -2192,8 +2194,13 @@ def _run_renderers(root: Path) -> None:
     _assert_contains(out_bids / "bids_scan_report.html", "downloadTableCSV")
     _assert_contains(out_bids / "bids_scan_report.html", "bids_index_filtered.csv")
 
-    # Dashboard (no-render; use the reports we generated above)
+    # Dashboard (no-render; use the reports we generated above) + bundle.
+    # Exercise the convenience flags:
+    #  - --bundle (with no explicit path): defaults to <out-dir>/qeeg_reports_bundle.zip
+    #  - implicit JSON index creation when --bundle is present (even if --json-index is omitted)
     dash_out = root / "qeeg_reports_dashboard.html"
+    dash_json = root / "qeeg_reports_dashboard_index.json"
+    bundle_zip = root / "qeeg_reports_bundle.zip"
     assert (
         render_reports_dashboard.main(
             [
@@ -2201,11 +2208,54 @@ def _run_renderers(root: Path) -> None:
                 "--out",
                 str(dash_out),
                 "--no-render",
+                "--bundle",
+                "--verify-bundle",
             ]
         )
         == 0
     )
     _assert_file(dash_out, min_bytes=500)
+    _assert_file(dash_json, min_bytes=200)
+    _assert_file(bundle_zip, min_bytes=600)
+    dash_idx = json.loads(dash_json.read_text(encoding="utf-8"))
+    assert dash_idx.get("$schema")
+    assert dash_idx.get("schema_version") == 1
+    assert dash_idx.get("dashboard_html")
+    assert dash_idx.get("dashboard_exists") is True
+    assert isinstance(dash_idx.get("dashboard_mtime_utc"), str) and dash_idx["dashboard_mtime_utc"].endswith("Z")
+    assert isinstance(dash_idx.get("dashboard_size_bytes"), int) and int(dash_idx["dashboard_size_bytes"]) > 0
+
+    assert isinstance(dash_idx.get("reports"), list)
+    assert isinstance(dash_idx.get("reports_summary"), dict)
+    assert any((r.get("kind") == "quality") for r in dash_idx.get("reports", []))
+
+    # Per-report metadata should be present for existing reports.
+    q = [r for r in dash_idx.get("reports", []) if r.get("kind") == "quality"]
+    assert q, "Expected at least one quality report entry"
+    assert q[0].get("report_exists") is True
+    assert isinstance(q[0].get("report_mtime_utc"), str) and str(q[0]["report_mtime_utc"]).endswith("Z")
+    assert isinstance(q[0].get("report_size_bytes"), int) and int(q[0]["report_size_bytes"]) > 0
+
+    # Validate the JSON index against the repo schema (prefers python-jsonschema
+    # when available, but is dependency-free in minimal mode).
+    assert validate_reports_dashboard_index.main([str(dash_json), "--check-files"]) == 0
+
+    # Verify bundle integrity (manifest + index references) and safely extract it.
+    import verify_reports_bundle
+    extract_dir = root / "bundle_extract"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    assert verify_reports_bundle.main(["--bundle", str(bundle_zip), "--extract", str(extract_dir)]) == 0
+
+    extracted_index = extract_dir / dash_json.name
+    _assert_file(extracted_index, min_bytes=200)
+    assert validate_reports_dashboard_index.main([str(extracted_index), "--check-files"]) == 0
+
+    # Convenience wrapper: verify+extract+open script (run in no-serve/no-open mode for tests).
+    import open_reports_bundle
+    extract_dir2 = root / "bundle_open_extract"
+    assert open_reports_bundle.main(["--bundle", str(bundle_zip), "--extract", str(extract_dir2), "--force", "--no-serve", "--no-open"]) == 0
+    _assert_file(extract_dir2 / dash_out.name, min_bytes=500)
+    _assert_file(extract_dir2 / dash_json.name, min_bytes=200)
     _assert_contains(dash_out, "Quality runs")
     _assert_contains(dash_out, "Trace plot runs")
     _assert_contains(dash_out, "BIDS scan runs")
