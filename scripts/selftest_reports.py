@@ -223,6 +223,41 @@ def _write_dummy_bmp(path: Path, *, w: int = 1, h: int = 1, bgr: tuple[int, int,
     path.write_bytes(header + rows)
 
 
+def _make_topomap(outdir: Path) -> None:
+    """Synthetic topomap outputs.
+
+    Create a few small valid 24-bit BMPs to exercise:
+      - discovery via topomap_*.bmp
+      - grouping raw vs *_z variants
+      - image embedding (data URI) in render_topomap_report.py
+    """
+
+    _write_dummy_bmp(outdir / "topomap_alpha.bmp", w=48, h=48, bgr=(30, 144, 255))
+    _write_dummy_bmp(outdir / "topomap_alpha_z.bmp", w=48, h=48, bgr=(255, 127, 80))
+    _write_dummy_bmp(outdir / "topomap_theta_beta.bmp", w=48, h=48, bgr=(80, 200, 120))
+
+    _write_json(
+        outdir / "topomap_run_meta.json",
+        {
+            "Tool": "qeeg_topomap_cli",
+            "Version": "selftest",
+            "GitDescribe": "selftest",
+            "BuildType": "unknown",
+            "Compiler": "unknown",
+            "CppStandard": "c++17",
+            "TimestampUTC": "selftest",
+            "input_path": "synthetic",
+            "OutputDir": str(outdir),
+            "Outputs": [
+                "topomap_alpha.bmp",
+                "topomap_alpha_z.bmp",
+                "topomap_theta_beta.bmp",
+                "topomap_run_meta.json",
+            ],
+        },
+    )
+
+
 def _make_iaf(outdir: Path) -> None:
     headers = ["channel", "iaf_hz", "found", "peak_value_db", "prominence_db", "cog_hz"]
     rows = [
@@ -1310,6 +1345,81 @@ def _make_connectivity(outdir: Path) -> None:
     _write_csv(outdir / "coherence_matrix_alpha.csv", mat_headers, mat_rows)
 
 
+def _make_connectivity_pair(outdir: Path) -> None:
+    """Synthetic outputs for pair-mode connectivity runs.
+
+    Matches qeeg_coherence_cli --pair style outputs:
+      - coherence_band.csv
+      - coherence_spectrum.csv
+      - coherence_timeseries.csv + coherence_timeseries.json
+      - coherence_run_meta.json (best-effort)
+    """
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Single-edge summary.
+    _write_csv(
+        outdir / "coherence_band.csv",
+        ["band", "channel_a", "channel_b", "coherence"],
+        [
+            {
+                "band": "alpha",
+                "channel_a": "F3",
+                "channel_b": "F4",
+                "coherence": 0.42,
+            }
+        ],
+    )
+
+    # Spectrum (0..50 Hz, 0.5 Hz step). Synthetic bump in the alpha range.
+    spec_rows: List[Dict[str, object]] = []
+    for i in range(0, 101):
+        f = 0.5 * i
+        # Simple, deterministic shape (no RNG): alpha bump near 10 Hz.
+        bump = math.exp(-0.5 * ((f - 10.0) / 3.0) ** 2)
+        v = 0.18 + 0.22 * bump
+        spec_rows.append({"freq_hz": f, "coherence": round(v, 6)})
+    _write_csv(outdir / "coherence_spectrum.csv", ["freq_hz", "coherence"], spec_rows)
+
+    # Time series (0..60 sec, 0.25 sec step). Synthetic slow modulation.
+    ts_rows: List[Dict[str, object]] = []
+    t = 0.0
+    for _ in range(0, 241):
+        # Slow oscillation between ~0.30 and ~0.50.
+        v = 0.40 + 0.10 * math.sin(2.0 * math.pi * 0.05 * t)
+        ts_rows.append({"t_end_sec": round(t, 3), "coherence": round(v, 6)})
+        t += 0.25
+    _write_csv(outdir / "coherence_timeseries.csv", ["t_end_sec", "coherence"], ts_rows)
+
+    # Sidecar JSON (mirrors qeeg_coherence_cli's timeseries JSON schema style).
+    _write_json(
+        outdir / "coherence_timeseries.json",
+        {
+            "t_end_sec": {"Units": "s", "Description": "End time of the coherence window."},
+            "coherence": {
+                "Units": "1",
+                "Description": "Magnitude-squared coherence integrated from 8.0000 to 12.0000 Hz.",
+            },
+        },
+    )
+
+    # Minimal run meta (best-effort, not exhaustive).
+    _write_json(
+        outdir / "coherence_run_meta.json",
+        {
+            "Tool": "qeeg_coherence_cli",
+            "TimestampUTC": "2020-01-01T00:00:00Z",
+            "Outputs": [
+                "coherence_band.csv",
+                "coherence_spectrum.csv",
+                "coherence_timeseries.csv",
+                "coherence_timeseries.json",
+                "coherence_run_meta.json",
+            ],
+        },
+    )
+
+
 def _make_channel_qc(outdir: Path) -> None:
     headers = [
         "channel",
@@ -1648,6 +1758,61 @@ def _make_trace_plot(outdir: Path) -> None:
         },
     )
 
+
+
+
+def _make_spectrogram(outdir: Path) -> None:
+    """Create a tiny spectrogram_cli-like output folder.
+
+    We include a BMP + a small wide-format CSV to exercise:
+      - image embedding (data URI)
+      - CSV summary stats (time/frequency/power range)
+    """
+
+    # Dummy spectrogram image (a small valid 24-bit BMP).
+    _write_dummy_bmp(outdir / "spectrogram_Cz.bmp", w=32, h=16, bgr=(80, 200, 120))
+
+    # Small wide-format CSV: time_sec,<freq bins...>
+    headers = ["time_sec", "1", "2", "4", "8", "12"]
+    rows = []
+    for t in range(0, 6):
+        # simple synthetic power surface (not scientifically meaningful)
+        rows.append({
+            "time_sec": float(t),
+            "1": -20.0 + t,
+            "2": -18.0 + 0.5 * t,
+            "4": -15.0 + 0.25 * t,
+            "8": -12.0 + 0.1 * t,
+            "12": -10.0 + 0.05 * t,
+        })
+    _write_csv(outdir / "spectrogram_Cz.csv", headers, rows)
+
+    # Per-channel meta file (qeeg_spectrogram_cli writes a small *_meta.txt).
+    (outdir / "spectrogram_Cz_meta.txt").write_text(
+        "channel=Cz\nwindow_sec=2.0\nhop_sec=0.25\nfmin_hz=1\nfmax_hz=12\n",
+        encoding="utf-8",
+    )
+
+    _write_json(
+        outdir / "spectrogram_run_meta.json",
+        {
+            "Tool": "qeeg_spectrogram_cli",
+            "Version": "selftest",
+            "GitDescribe": "selftest",
+            "BuildType": "unknown",
+            "Compiler": "unknown",
+            "CppStandard": "c++17",
+            "TimestampUTC": "selftest",
+            "input_path": "synthetic",
+            "OutputDir": str(outdir),
+            "Outputs": [
+                "spectrogram_Cz.bmp",
+                "spectrogram_Cz.csv",
+                "spectrogram_Cz_meta.txt",
+                "spectrogram_run_meta.json",
+            ],
+        },
+    )
 
 
 def _make_nf(outdir: Path) -> None:
@@ -2083,6 +2248,7 @@ def _run_renderers(root: Path) -> None:
     import render_bandratios_report
     import render_channel_qc_report
     import render_connectivity_report
+    import render_connectivity_pair_report
     import render_iaf_report
     import render_bids_scan_report
     import render_microstates_report
@@ -2094,10 +2260,13 @@ def _run_renderers(root: Path) -> None:
     import render_quality_report
     import render_spectral_features_report
     import render_trace_plot_report
+    import render_spectrogram_report
+    import render_topomap_report
 
     out_bp = root / "out_bp"
     out_ratios = root / "out_ratios"
     out_conn = root / "out_conn"
+    out_conn_pair = root / "out_conn_pair"
     out_qc = root / "out_qc"
     out_art = root / "out_art"
     out_nf = root / "out_nf"
@@ -2108,11 +2277,14 @@ def _run_renderers(root: Path) -> None:
     out_sf = root / "out_sf"
     out_quality = root / "out_quality"
     out_traces = root / "out_traces"
+    out_spec = root / "out_spec"
+    out_topomap = root / "out_topomap"
     out_bids = root / "out_bids_scan"
 
     _make_bandpowers(out_bp)
     _make_bandratios(out_ratios)
     _make_connectivity(out_conn)
+    _make_connectivity_pair(out_conn_pair)
     _make_channel_qc(out_qc)
     _make_artifacts(out_art)
     _make_nf(out_nf)
@@ -2123,6 +2295,8 @@ def _run_renderers(root: Path) -> None:
     _make_spectral_features(out_sf)
     _make_quality(out_quality)
     _make_trace_plot(out_traces)
+    _make_spectrogram(out_spec)
+    _make_topomap(out_topomap)
     _make_bids_scan(out_bids)
 
     # Run individual reports
@@ -2140,6 +2314,11 @@ def _run_renderers(root: Path) -> None:
     _assert_file(out_conn / "connectivity_report.html")
     _assert_contains(out_conn / "connectivity_report.html", "downloadTableCSV")
     _assert_contains(out_conn / "connectivity_report.html", "Download CSV")
+
+    assert render_connectivity_pair_report.main(["--input", str(out_conn_pair)]) == 0
+    _assert_file(out_conn_pair / "connectivity_pair_report.html")
+    _assert_contains(out_conn_pair / "connectivity_pair_report.html", "downloadTableCSV")
+    _assert_contains(out_conn_pair / "connectivity_pair_report.html", "Download CSV")
 
     assert render_channel_qc_report.main(["--input", str(out_qc)]) == 0
     _assert_file(out_qc / "channel_qc_report.html")
@@ -2188,6 +2367,17 @@ def _run_renderers(root: Path) -> None:
     assert render_trace_plot_report.main(["--input", str(out_traces)]) == 0
     _assert_file(out_traces / "trace_plot_report.html")
     _assert_contains(out_traces / "trace_plot_report.html", "data:image/svg+xml")
+    assert render_spectrogram_report.main(["--input", str(out_spec)]) == 0
+    _assert_file(out_spec / "spectrogram_report.html")
+    _assert_contains(out_spec / "spectrogram_report.html", "data:image/bmp")
+    _assert_contains(out_spec / "spectrogram_report.html", "spectrogram_Cz.csv")
+
+    assert render_topomap_report.main(["--input", str(out_topomap)]) == 0
+    _assert_file(out_topomap / "topomap_report.html")
+    _assert_contains(out_topomap / "topomap_report.html", "data:image/bmp")
+    _assert_contains(out_topomap / "topomap_report.html", "topomap_alpha.bmp")
+    _assert_contains(out_topomap / "topomap_report.html", "topomap_alpha_z.bmp")
+
 
     assert render_bids_scan_report.main(["--input", str(out_bids)]) == 0
     _assert_file(out_bids / "bids_scan_report.html")
@@ -2228,6 +2418,11 @@ def _run_renderers(root: Path) -> None:
     assert isinstance(dash_idx.get("reports"), list)
     assert isinstance(dash_idx.get("reports_summary"), dict)
     assert any((r.get("kind") == "quality") for r in dash_idx.get("reports", []))
+    assert any((r.get("kind") == "spectrogram") for r in dash_idx.get("reports", []))
+    assert any((r.get("kind") == "topomap") for r in dash_idx.get("reports", []))
+    _assert_contains(dash_out, "Spectrogram runs")
+    _assert_contains(dash_out, "Topomap runs")
+
 
     # Per-report metadata should be present for existing reports.
     q = [r for r in dash_idx.get("reports", []) if r.get("kind") == "quality"]
@@ -2258,8 +2453,10 @@ def _run_renderers(root: Path) -> None:
     _assert_file(extract_dir2 / dash_json.name, min_bytes=200)
     _assert_contains(dash_out, "Quality runs")
     _assert_contains(dash_out, "Trace plot runs")
+    _assert_contains(dash_out, "Topomap runs")
     _assert_contains(dash_out, "BIDS scan runs")
     _assert_contains(dash_out, "Epoch runs")
+    _assert_contains(dash_out, "Connectivity pair runs")
     # Dashboard should include the shared table helpers for sorting/filtering/export.
     _assert_contains(dash_out, "sortTable")
     _assert_contains(dash_out, "filterTable")
@@ -2270,6 +2467,7 @@ def _run_renderers(root: Path) -> None:
         out_bp / "bandpowers_report.html",
         out_ratios / "bandratios_report.html",
         out_conn / "connectivity_report.html",
+        out_conn_pair / "connectivity_pair_report.html",
         out_qc / "channel_qc_report.html",
         out_art / "artifacts_report.html",
         out_nf / "nf_feedback_report.html",

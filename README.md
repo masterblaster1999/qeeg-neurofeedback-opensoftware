@@ -106,6 +106,9 @@ python3 scripts/render_bandpowers_report.py --input out_bp
 # From an output directory produced by qeeg_bandratios_cli
 python3 scripts/render_bandratios_report.py --input out_ratios
 
+# From an output directory containing topomap_<metric>.bmp (qeeg_map_cli or qeeg_topomap_cli)
+python3 scripts/render_topomap_report.py --input out_topomap
+
 # From an output directory produced by qeeg_spectral_features_cli
 python3 scripts/render_spectral_features_report.py --input out_sf
 
@@ -117,6 +120,9 @@ python3 scripts/render_pac_report.py --input out_pac
 
 # From an output directory produced by qeeg_coherence_cli / qeeg_plv_cli (matrix mode)
 python3 scripts/render_connectivity_report.py --input out_conn
+
+# From an output directory produced by qeeg_coherence_cli / qeeg_plv_cli (pair mode)
+python3 scripts/render_connectivity_pair_report.py --input out_conn_pair
 
 # From an output directory produced by qeeg_microstates_cli
 python3 scripts/render_microstates_report.py --input out_ms
@@ -139,11 +145,14 @@ python3 scripts/render_quality_report.py --input out_quality
 # From an output directory produced by qeeg_trace_plot_cli
 python3 scripts/render_trace_plot_report.py --input out_traces
 
+# From an output directory produced by qeeg_spectrogram_cli
+python3 scripts/render_spectrogram_report.py --input out_spec
+
 # From an output directory produced by qeeg_epoch_cli
 python3 scripts/render_epoch_report.py --input out_epochs
 
 # Build a dashboard that links to all available reports (and renders any missing ones)
-python3 scripts/render_reports_dashboard.py out_quality out_traces out_bids_scan out_epochs out_iaf out_bp out_ratios out_sf out_nf out_pac out_conn out_ms out_qc out_art --out qeeg_reports_dashboard.html
+python3 scripts/render_reports_dashboard.py out_quality out_traces out_spec out_bids_scan out_epochs out_iaf out_bp out_ratios out_topomap out_sf out_nf out_pac out_conn out_conn_pair out_ms out_qc out_art --out qeeg_reports_dashboard.html
 ```
 
 The generated dashboard tables are sortable (click headers), include a **global filter** that applies to all sections, and provide **Download CSV** buttons to export the currently visible rows.
@@ -915,26 +924,52 @@ If you record with Mind Media BioTrace+ (e.g., a NeXus-10 MKII), export sessions
 This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral channels at lower sampling rates (skin conductance, respiration, temperature, etc.), the reader will keep all non-annotation channels and resample them to the highest EEG/ExG-like sampling rate (best effort). Voltage-like channels exported in mV or V are converted to microvolts. If you only want EEG/ExG channels, drop peripherals with a channel-map (set `new=DROP`; leaving `new` blank keeps the channel unchanged).
 
 **Notes on BioTrace+ export formats**
-- The `.bcd` / `.mbd` formats are BioTrace+/NeXus session containers/backups and are **not supported** here.
+- The `.bcd` / `.mbd` formats are BioTrace+/NeXus session containers/backups and are **not supported** directly by the C++ readers here.
   Export to EDF/BDF or ASCII from BioTrace+ first.
+
+  **About `.m2k`:** some `.m2k` files are plain ASCII/CSV exports (supported as CSV input), but some `.m2k` files are ZIP-like containers (especially SD-card/session backups). If your `.m2k` triggers a "ZIP container" error, use the extractor below.
   
-  *Best-effort helper:* some `.bcd`/`.mbd` files are ZIP containers that include an EDF/BDF/ASCII export.
+  *Best-effort helper:* some `.bcd`/`.mbd`/`.m2k` files are ZIP containers that include an EDF/BDF/ASCII export.
   If so, you can try extracting the embedded recording:
   
   ```bash
-  python3 scripts/biotrace_extract_container.py --input session.bcd --list
-  python3 scripts/biotrace_extract_container.py --input session.bcd --outdir extracted --print
+  python3 scripts/biotrace_extract_container.py --input session.m2k --list
+  python3 scripts/biotrace_extract_container.py --input session.m2k --outdir extracted --print
+  # Alias for --input:
+  python3 scripts/biotrace_extract_container.py --container session.m2k --outdir extracted --print
+
+  # If the container has multiple candidates, you can pick one explicitly
+  # (1-based index from --list, exact name, substring, or glob pattern):
+  python3 scripts/biotrace_extract_container.py --input session.m2k --outdir extracted --select 2 --print
+  python3 scripts/biotrace_extract_container.py --input session.m2k --outdir extracted --select "*.vhdr" --print
   ```
 
-  If your end goal is to run **qeeg_nf_cli** on a `.bcd`/`.mbd` in one step (when it happens to be a ZIP container with an embedded export), there is also a small wrapper that extracts + launches the CLI:
+  **BrainVision note:** if the embedded export is a BrainVision recording (`.vhdr`), remember that it is a multi-file set (`.vhdr` + `.eeg` + `.vmrk`). The extractor will also pull the referenced `.eeg`/`.vmrk` files into the same output folder so the `.vhdr` remains readable. On case-sensitive file systems, it also patches `DataFile=` / `MarkerFile=` references (best effort) so they match the extracted filenames.
+
+  If the BrainVision header inside the container is stored with a non-`.vhdr` extension (e.g. `.txt`), the extractor will detect it and rename it to `.vhdr` during extraction (best effort).
+
+  If your end goal is to run **qeeg_nf_cli** on a ZIP-like container in one step (when it happens to be a ZIP container with an embedded export), there is also a small wrapper that extracts + launches the CLI:
 
   ```bash
-  python3 scripts/biotrace_run_nf.py --container session.bcd --outdir out_nf -- \
+  # Optional: if the container includes multiple exports (e.g., EDF + ASCII),
+  # you can control which one gets picked with --prefer, or choose one with --select.
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --prefer .edf,.bdf,.csv -- \
+    --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+    --realtime --export-bandpowers --flush-csv
+
+  # Choose the 2nd candidate shown by --list (for example, a BrainVision export):
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --select 2 -- \
     --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
     --realtime --export-bandpowers --flush-csv
   ```
 
-- BioTrace+ ASCII exports are often saved as `.txt` / `.tsv` / `.asc`; these are treated like CSV inputs in this project.
+- BioTrace+ ASCII exports are often saved as `.txt` / `.tsv` / `.asc` (and sometimes `.m2k`); these are treated like CSV inputs in this project.
+  - Headerless exports (no column names) are supported: the loader infers the delimiter and synthesizes channel names (`Ch1`, `Ch2`, ...).
+  - If you **don't** have a usable time column (e.g., the axis is a sample index), you normally need to pass `--fs`.
+    As a convenience for some BioTrace+/NeXus exports, the CSV loader also tries to recover `fs` from a metadata line like `Sample Rate;250 Hz` (best effort).
+  - Common BioTrace footer markers like `<end of exported RAW data>` / `<Unbearbeitete Daten exportiert>` are ignored.
+  - Some BioTrace+ ASCII exports on Windows are saved as "Unicode text" (UTF-16, sometimes without a BOM); the CSV loader can decode UTF-16LE/BE (best effort).
+  - Some legacy ASCII exports may be saved as Windows-1252 / Latin-1. In particular, the micro sign in unit labels can appear as a single byte (`0xB5`) rather than UTF-8; the CSV loader treats this as `u` during unit parsing (best effort).
 
 **Trigger/event channels (important for some BDF recordings)**
 

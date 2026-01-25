@@ -580,6 +580,382 @@ int main() {
 
   std::remove(path17.c_str());
 
+
+  // 18) Headerless BioTrace+ style: hh:mm:ss axis + footer marker line.
+  // Some exports omit the header row entirely, and add a footer like
+  // "<end of exported RAW data>".
+  const std::string path18 = "tmp_biotrace_headerless_hms.txt";
+  {
+    std::ofstream out(path18);
+    out << "00:00:00\t2.276\n";
+    out << "00:00:00\t2.476\n";
+    out << "00:00:01\t2.482\n";
+    out << "<end of exported RAW data>\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/32.0); // provided (time column is coarse)
+    EEGRecording rec = r.read(path18);
+    assert(approx(rec.fs_hz, 32.0));
+    assert(rec.channel_names.size() == 1);
+    assert(rec.channel_names[0] == "Ch1");
+    assert(rec.data.size() == 1);
+    assert(rec.data[0].size() == 3);
+    assert(std::fabs(rec.data[0][0] - 2.276f) < 1e-6f);
+    assert(std::fabs(rec.data[0][2] - 2.482f) < 1e-6f);
+  }
+
+  std::remove(path18.c_str());
+
+  // 19) Headerless sample index + value, with footer marker.
+  // Many BioTrace+ files represent "time" as a sample counter (0,1,2,...).
+  const std::string path19 = "tmp_biotrace_headerless_sample.txt";
+  {
+    std::ofstream out(path19);
+    out << "0\t2.276\n";
+    out << "1\t2.476\n";
+    out << "2\t2.482\n";
+    out << "<end of exported RAW data>\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/32.0); // provided
+    EEGRecording rec = r.read(path19);
+    assert(approx(rec.fs_hz, 32.0));
+    assert(rec.channel_names.size() == 1);
+    assert(rec.channel_names[0] == "Ch1");
+    assert(rec.data.size() == 1);
+    assert(rec.data[0].size() == 3);
+    assert(std::fabs(rec.data[0][1] - 2.476f) < 1e-6f);
+  }
+
+  std::remove(path19.c_str());
+
+  // 20) Headerless segment column: treat repeating labels as a segment stream.
+  const std::string path20 = "tmp_biotrace_headerless_segment.txt";
+  {
+    std::ofstream out(path20);
+    out << "00:00:00\t1.0\t\tBaseline\n";
+    out << "00:00:00\t2.0\t\tBaseline\n";
+    out << "00:00:00\t3.0\t\tTrain\n";
+    out << "00:00:00\t4.0\t\tTrain\n";
+    out << "00:00:00\t5.0\t\t\n";
+    out << "<Unbearbeitete Daten exportiert>\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/4.0); // provided (time axis is not strictly increasing here)
+    EEGRecording rec = r.read(path20);
+    assert(approx(rec.fs_hz, 4.0));
+    assert(rec.channel_names.size() == 1);
+    assert(rec.channel_names[0] == "Ch1");
+    assert(rec.data.size() == 1);
+    assert(rec.data[0].size() == 5);
+
+    assert(rec.events.size() == 2);
+    assert(rec.events[0].text == "Baseline");
+    assert(approx(rec.events[0].onset_sec, 0.0));
+    assert(approx(rec.events[0].duration_sec, 2.0 / 4.0));
+
+    assert(rec.events[1].text == "Train");
+    assert(approx(rec.events[1].onset_sec, 2.0 / 4.0));
+    assert(approx(rec.events[1].duration_sec, 2.0 / 4.0));
+  }
+
+  std::remove(path20.c_str());
+
+  // 21) German BioTrace+/NeXus style: sample index + "Zeit" time column.
+  // Some installations export headers in German (Beispiele/Zeit) and may use a comma
+  // as the decimal separator in the hh:mm:ss,ms time representation.
+  const std::string path21 = "tmp_biotrace_de_sample_time.csv";
+  {
+    std::ofstream out(path21);
+    out << "BioTrace+ ASCII Export;TEST\n";
+    out << "Beispiele;Zeit;C1;C2\n";
+    out << "0;00:00:00,000;1;2\n";
+    out << "1;00:00:00,004;1.1;2.1\n";
+    out << "2;00:00:00,008;1.2;2.2\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer from Zeit
+    EEGRecording rec = r.read(path21);
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 3);
+    assert(std::fabs(rec.data[0][2] - 1.2f) < 1e-6f);
+  }
+
+  std::remove(path21.c_str());
+
+  // 22) Metadata sampling rate line: allow sample-index files to be read without --fs.
+  // BioTrace+/NeXus exports sometimes include a "Sample Rate" metadata row.
+  const std::string path22 = "tmp_meta_samplerate_sample_axis.csv";
+  {
+    std::ofstream out(path22);
+    out << "Sample Rate;250 Hz\n";
+    out << "sample;C1;C2\n";
+    out << "0;1;2\n";
+    out << "1;3;4\n";
+    out << "2;5;6\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0); // infer from metadata
+    EEGRecording rec = r.read(path22);
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 3);
+    assert(std::fabs(rec.data[1][2] - 6.0f) < 1e-6f);
+  }
+
+  std::remove(path22.c_str());
+
+
+
+  // 23) UTF-16LE BOM ("Unicode" text) export.
+  // Some BioTrace+/NeXus ASCII exports on Windows may be saved as UTF-16.
+  const std::string path23 = "tmp_utf16le_bom.tsv";
+  {
+    std::ofstream out(path23, std::ios::binary);
+    assert(out && "failed to open temp file for writing");
+
+    // UTF-16LE BOM
+    out.put(static_cast<char>(0xFF));
+    out.put(static_cast<char>(0xFE));
+
+    auto write_u16le_ascii = [&](const std::string& s) {
+      for (unsigned char c : s) {
+        out.put(static_cast<char>(c));
+        out.put(static_cast<char>(0x00));
+      }
+    };
+
+    write_u16le_ascii("time_ms\tC1\tC2\r\n");
+    write_u16le_ascii("0\t1\t2\r\n");
+    write_u16le_ascii("4\t3\t4\r\n");
+    write_u16le_ascii("8\t5\t6\r\n");
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0);
+    EEGRecording rec = r.read(path23);
+
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 3);
+    assert(rec.data[1].size() == 3);
+    assert(std::fabs(rec.data[0][2] - 5.0f) < 1e-6f);
+    assert(std::fabs(rec.data[1][2] - 6.0f) < 1e-6f);
+  }
+  std::remove(path23.c_str());
+
+
+
+  // 23b) UTF-16LE without BOM.
+  // Some Windows tools save UTF-16 text without writing a BOM.
+  const std::string path23b = "tmp_utf16le_nobom.tsv";
+  {
+    std::ofstream out(path23b, std::ios::binary);
+    assert(out && "failed to open temp file for writing");
+
+    auto write_u16le_ascii = [&](const std::string& s) {
+      for (unsigned char c : s) {
+        out.put(static_cast<char>(c));
+        out.put(static_cast<char>(0x00));
+      }
+    };
+
+    write_u16le_ascii("time_ms\tC1\tC2\r\n");
+    write_u16le_ascii("0\t1\t2\r\n");
+    write_u16le_ascii("4\t3\t4\r\n");
+    write_u16le_ascii("8\t5\t6\r\n");
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0);
+    EEGRecording rec = r.read(path23b);
+
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 3);
+    assert(rec.data[1].size() == 3);
+    assert(std::fabs(rec.data[0][2] - 5.0f) < 1e-6f);
+    assert(std::fabs(rec.data[1][2] - 6.0f) < 1e-6f);
+  }
+  std::remove(path23b.c_str());
+
+
+
+  // 23d) UTF-16LE without BOM, very small file.
+  // Ensure the UTF-16 sniffing does not require a large sample.
+  const std::string path23d = "tmp_utf16le_nobom_small.tsv";
+  {
+    std::ofstream out(path23d, std::ios::binary);
+    assert(out && "failed to open temp file for writing");
+
+    auto write_u16le_ascii = [&](const std::string& s) {
+      for (unsigned char c : s) {
+        out.put(static_cast<char>(c));
+        out.put(static_cast<char>(0x00));
+      }
+    };
+
+    write_u16le_ascii("sample\tC1\r\n");
+    write_u16le_ascii("0\t1\r\n");
+    write_u16le_ascii("1\t2\r\n");
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/250.0);
+    EEGRecording rec = r.read(path23d);
+
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 1);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.data.size() == 1);
+    assert(rec.data[0].size() == 2);
+    assert(std::fabs(rec.data[0][0] - 1.0f) < 1e-6f);
+    assert(std::fabs(rec.data[0][1] - 2.0f) < 1e-6f);
+  }
+  std::remove(path23d.c_str());
+
+
+
+  // 23c) UTF-16BE without BOM.
+  const std::string path23c = "tmp_utf16be_nobom.tsv";
+  {
+    std::ofstream out(path23c, std::ios::binary);
+    assert(out && "failed to open temp file for writing");
+
+    auto write_u16be_ascii = [&](const std::string& s) {
+      for (unsigned char c : s) {
+        out.put(static_cast<char>(0x00));
+        out.put(static_cast<char>(c));
+      }
+    };
+
+    write_u16be_ascii("time_ms\tC1\tC2\r\n");
+    write_u16be_ascii("0\t1\t2\r\n");
+    write_u16be_ascii("4\t3\t4\r\n");
+    write_u16be_ascii("8\t5\t6\r\n");
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0);
+    EEGRecording rec = r.read(path23c);
+
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "C1");
+    assert(rec.channel_names[1] == "C2");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 3);
+    assert(rec.data[1].size() == 3);
+    assert(std::fabs(rec.data[0][2] - 5.0f) < 1e-6f);
+    assert(std::fabs(rec.data[1][2] - 6.0f) < 1e-6f);
+  }
+  std::remove(path23c.c_str());
+
+
+  // 24) Windows-1252 / Latin-1 micro sign (0xB5) in unit suffixes.
+  // Some BioTrace+/NeXus ASCII exports may be saved with a legacy single-byte encoding
+  // where the micro sign is written as 0xB5 instead of UTF-8.
+  // Ensure we still interpret "(µV)" as microvolts, not volts.
+  const std::string path24 = "tmp_units_in_header_cp1252.csv";
+  {
+    std::ofstream out(path24, std::ios::binary);
+    out << "time_ms;Pz (\xB5V);EEG1 (mV)\n";
+    out << "0;10;0.001\n";
+    out << "4;11;0.002\n";
+    out << "8;12;0.003\n";
+  }
+
+  {
+    CSVReader r(/*fs_hz=*/0.0);
+    EEGRecording rec = r.read(path24);
+
+    assert(approx(rec.fs_hz, 250.0));
+    assert(rec.channel_names.size() == 2);
+    assert(rec.channel_names[0] == "Pz");
+    assert(rec.channel_names[1] == "EEG1");
+    assert(rec.data.size() == 2);
+    assert(rec.data[0].size() == 3);
+
+    // Pz is already µV -> values should not be scaled by 1e6.
+    assert(std::fabs(rec.data[0][0] - 10.0f) < 1e-6f);
+    assert(std::fabs(rec.data[0][2] - 12.0f) < 1e-6f);
+
+    // EEG1 is mV -> scaled to µV.
+    assert(std::fabs(rec.data[1][0] - 1.0f) < 1e-6f);
+    assert(std::fabs(rec.data[1][2] - 3.0f) < 1e-6f);
+  }
+
+  std::remove(path24.c_str());
+
+
+// 25) ZIP container sniffing: provide a helpful error for ZIP-like containers.
+// Some BioTrace+/NeXus session containers are ZIP-like archives that embed an EDF/BDF/ASCII export.
+const std::string path25 = "tmp_zip_container.m2k";
+{
+  std::ofstream out(path25, std::ios::binary);
+  out.write("PK\x03\x04", 4);
+  out << "dummy";
+}
+
+{
+  CSVReader r(/*fs_hz=*/0.0);
+  bool threw = false;
+  try {
+    (void)r.read(path25);
+  } catch (const std::exception& e) {
+    threw = true;
+    const std::string msg = e.what();
+    assert(msg.find("ZIP") != std::string::npos || msg.find("zip") != std::string::npos);
+    // The error should suggest the extractor script with the correct flag.
+    assert(msg.find("biotrace_extract_container.py") != std::string::npos);
+    assert(msg.find("--input") != std::string::npos);
+  }
+  assert(threw);
+}
+
+std::remove(path25.c_str());
+
+// 26) Binary blob sniffing: NUL/control bytes should yield a helpful error.
+const std::string path26 = "tmp_binary_blob.m2k";
+{
+  std::ofstream out(path26, std::ios::binary);
+  const unsigned char bytes[] = {0x00, 0x01, 0x02, 0x03, 0xFF, 0x00, 0x10, 0x11};
+  out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+}
+
+{
+  CSVReader r(/*fs_hz=*/0.0);
+  bool threw = false;
+  try {
+    (void)r.read(path26);
+  } catch (const std::exception& e) {
+    threw = true;
+    const std::string msg = e.what();
+    assert(msg.find("binary") != std::string::npos || msg.find("Binary") != std::string::npos);
+  }
+  assert(threw);
+}
+
+std::remove(path26.c_str());
+
   std::cout << "test_csv_reader OK\n";
   return 0;
 }

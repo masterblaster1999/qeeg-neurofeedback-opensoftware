@@ -329,7 +329,7 @@ static int ext_rank_score(const std::string& ext,
 }
 
 static bool is_ascii_like_ext(const std::string& ext) {
-  return ext == ".csv" || ext == ".tsv" || ext == ".txt" || ext == ".asc" || ext == ".ascii";
+  return ext == ".csv" || ext == ".tsv" || ext == ".txt" || ext == ".asc" || ext == ".ascii" || ext == ".m2k";
 }
 
 static int score_candidate_file(const std::filesystem::path& p,
@@ -665,14 +665,14 @@ ResolvedInputPath resolve_input_recording_path(const std::string& input_spec) {
       ".edf", ".edf+", ".rec",
       ".bdf", ".bdf+",
       ".vhdr",
-      ".csv", ".tsv", ".txt", ".asc", ".ascii",
+      ".csv", ".tsv", ".txt", ".asc", ".ascii", ".m2k",
   };
 
   // Prefer common naming conventions when multiple candidates exist.
   opt.preferred_filenames = {
-      "preprocessed.edf", "preprocessed.bdf", "preprocessed.vhdr", "preprocessed.csv",
-      "clean.edf", "clean.bdf", "clean.vhdr", "clean.csv",
-      "recording.edf", "recording.bdf", "recording.vhdr", "recording.csv",
+      "preprocessed.edf", "preprocessed.bdf", "preprocessed.vhdr", "preprocessed.csv", "preprocessed.m2k",
+      "clean.edf", "clean.bdf", "clean.vhdr", "clean.csv", "clean.m2k",
+      "recording.edf", "recording.bdf", "recording.vhdr", "recording.csv", "recording.m2k",
   };
 
   opt.preferred_contains = {"preprocess", "preprocessed", "clean", "recording", "eeg"};

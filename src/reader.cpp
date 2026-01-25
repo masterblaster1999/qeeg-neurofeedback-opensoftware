@@ -100,7 +100,7 @@ EEGRecording read_recording_auto(const std::string& path, double fs_hz_for_csv) 
 
   // Treat common ASCII export extensions as CSV-like inputs.
   if (ends_with(low, ".csv") || ends_with(low, ".txt") || ends_with(low, ".tsv") || ends_with(low, ".asc") ||
-      ends_with(low, ".ascii")) {
+      ends_with(low, ".ascii") || ends_with(low, ".m2k")) {
     CSVReader r(fs_hz_for_csv);
     EEGRecording rec = r.read(resolved_path);
     // CSVReader already detects marker/event columns, but a file may also contain a separate

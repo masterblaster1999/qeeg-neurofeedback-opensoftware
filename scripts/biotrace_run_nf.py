@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """biotrace_run_nf.py
 
-One-step helper for Mind Media BioTrace+ / NeXus session containers (.bcd/.mbd).
+One-step helper for Mind Media BioTrace+ / NeXus session containers (ZIP-like .bcd/.mbd/.m2k/.zip).
 
 Background
 ----------
 BioTrace+ can export recordings to open formats like EDF/BDF or ASCII. Those exported
 files are supported directly by this repository.
 
-However, some exported/backup `.bcd`/`.mbd` files are *ZIP containers* that already
+However, some exported/backup `.bcd`/`.mbd`/`.m2k` files are *ZIP containers* that already
 include an embedded EDF/BDF/ASCII export. For those cases, this script can:
 
   1) Extract the best embedded export to a temp folder (or user-specified folder)
@@ -22,13 +22,19 @@ Usage
 -----
 List embedded items:
 
-  python3 scripts/biotrace_run_nf.py --container session.bcd --list
+  python3 scripts/biotrace_run_nf.py --container session.m2k --list
 
 Run neurofeedback from a container (note the `--`):
 
-  python3 scripts/biotrace_run_nf.py --container session.bcd --outdir out_nf -- \
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf -- \
     --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
     --realtime --export-bandpowers --flush-csv
+
+If the container has multiple embedded recordings, you can pick one explicitly:
+
+  # Use the 2nd candidate shown by --list
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --select 2 -- \
+    --metric alpha:Pz --window 2.0
 
 Tips
 ----
@@ -48,6 +54,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -113,10 +120,10 @@ def _strip_overrides(args: List[str]) -> List[str]:
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Extract a ZIP-like BioTrace+ .bcd/.mbd container and run qeeg_nf_cli in one step.",
+        description="Extract a ZIP-like BioTrace+/NeXus container (.bcd/.mbd/.m2k/.zip) and run qeeg_nf_cli in one step.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--container", required=True, help="Path to BioTrace+ session container (.bcd/.mbd)")
+    ap.add_argument("--container", required=True, help="Path to a ZIP-like BioTrace+/NeXus session container (.bcd/.mbd/.m2k/.zip) or a directory")
     ap.add_argument("--outdir", default="", help="Output directory for qeeg_nf_cli (required unless --list)")
     ap.add_argument(
         "--extract-dir",
@@ -124,6 +131,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Directory to place extracted export (default: a temporary folder that is deleted after qeeg_nf_cli exits)",
     )
     ap.add_argument("--keep-extracted", action="store_true", help="Do not delete temporary extracted export folder")
+    ap.add_argument(
+        "--prefer",
+        default="",
+        help=(
+            "Comma-separated extension preference order used to pick the embedded recording "
+            "(e.g. .edf,.bdf,.csv). Default: extractor defaults."
+        ),
+    )
+    ap.add_argument(
+        "--select",
+        default="",
+        help=(
+            "Select which embedded recording to run on when the container has multiple candidates. "
+            "Accepts 1-based index from --list, exact name, substring, or glob pattern (case-insensitive)."
+        ),
+    )
     ap.add_argument("--nf-cli", default="", help="Path to qeeg_nf_cli (default: try ./build/qeeg_nf_cli, then PATH)")
     ap.add_argument("--list", action="store_true", help="List container contents and exit")
     ap.add_argument(
@@ -143,14 +166,38 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     bt = _import_biotrace_extract()
 
+    # Validate container type early for clearer errors.
+    if not container.is_dir() and not zipfile.is_zipfile(str(container)):
+        msg = (
+            'Error: container is not a ZIP-like session container.\n'
+            'Some BioTrace+/NeXus exports are proprietary (e.g., BCD/MBD/M2K session backups) and cannot be opened here.\n'
+            'Please export an open format from BioTrace+ (EDF/BDF/ASCII) and run qeeg_nf_cli on that file.\n'
+            f'Container: {container}'
+        )
+        print(msg, file=sys.stderr)
+        return 2
+
+    # Optional preference override.
+    prefer_exts = getattr(bt, "DEFAULT_PREFER", None)
+    if ns.prefer:
+        parse_fn = getattr(bt, "_parse_prefer_list", None)
+        if callable(parse_fn):
+            prefer_exts = parse_fn(ns.prefer)
+        else:
+            prefer_exts = [p.strip().lower() for p in ns.prefer.split(",") if p.strip()]
+
     if ns.list:
         # Print a friendly listing and exit.
-        items = bt.list_contents(container)
+        items = bt.list_contents(container, prefer_exts=prefer_exts) if prefer_exts else bt.list_contents(container)
         if not items:
             print("(no listable contents; file may not be ZIP-like)")
             return 0
         for i, it in enumerate(items):
             name = it.get("name", "")
+            ext = str(it.get("ext", "") or "")
+            disp_name = name
+            if ext and (not name.lower().endswith(ext.lower())):
+                disp_name = f"{name} [as {ext}]"
             size = it.get("size", None)
             mtime = it.get("mtime", None)
             extra = []
@@ -159,7 +206,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if mtime:
                 extra.append(str(mtime))
             extra_s = ("; " + ", ".join(extra)) if extra else ""
-            print(f"{i+1:02d}. {name}{extra_s}")
+            print(f"{i+1:02d}. {disp_name}{extra_s}")
         return 0
 
     if not ns.outdir:
@@ -179,9 +226,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         extract_dir = Path(tmp_obj.name)
 
     try:
-        extracted = bt.extract_best_export(container, extract_dir)
+        if ns.select:
+            # Selection overrides the "best export" heuristic.
+            if prefer_exts:
+                extracted = bt.extract_selected_export(container, extract_dir, ns.select, prefer_exts=prefer_exts)
+            else:
+                extracted = bt.extract_selected_export(container, extract_dir, ns.select)
+        else:
+            if prefer_exts:
+                extracted = bt.extract_best_export(container, extract_dir, prefer_exts=prefer_exts)
+            else:
+                extracted = bt.extract_best_export(container, extract_dir)
     except Exception as e:
-        print(f"Error: failed to extract embedded export from {container}: {e}", file=sys.stderr)
+        mode = "select/extract" if ns.select else "extract"
+        print(f"Error: failed to {mode} embedded export from {container}: {e}", file=sys.stderr)
         if tmp_obj is not None:
             tmp_obj.cleanup()
         return 3

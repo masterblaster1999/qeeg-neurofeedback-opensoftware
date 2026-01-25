@@ -52,7 +52,7 @@ int main() {
     fs::create_directories(bp_dir);
 
     // Step outputs.
-    const fs::path pre_file = pre_dir / "preprocessed.csv";
+    const fs::path pre_file = pre_dir / "preprocessed.m2k";
     const fs::path bp_file = bp_dir / "bandpowers.csv";
 
     write_file(pre_file, "time,Fz\n0.0,1.0\n");
@@ -105,13 +105,13 @@ int main() {
     // In a pipeline workspace, that is typically the preprocess output (preprocessed.*), not a derived table.
     {
       const auto r = resolve_input_recording_path(root.u8string());
-      TEST_CHECK(fs::path(r.path).filename().u8string() == "preprocessed.csv");
+      TEST_CHECK(fs::path(r.path).filename().u8string() == "preprocessed.m2k");
     }
 
-    // Recording resolver: passing pipeline_run_meta.json should also resolve preprocessed.csv.
+    // Recording resolver: passing pipeline_run_meta.json should also resolve preprocessed.m2k.
     {
       const auto r = resolve_input_recording_path(pipe_meta.u8string());
-      TEST_CHECK(fs::path(r.path).filename().u8string() == "preprocessed.csv");
+      TEST_CHECK(fs::path(r.path).filename().u8string() == "preprocessed.m2k");
     }
 
   } catch (...) {

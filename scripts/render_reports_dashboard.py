@@ -9,13 +9,16 @@ By default it will also (re)generate any missing reports using:
 
   - scripts/render_quality_report.py
   - scripts/render_trace_plot_report.py
+  - scripts/render_spectrogram_report.py
   - scripts/render_bandpowers_report.py
   - scripts/render_bandratios_report.py
+  - scripts/render_topomap_report.py
   - scripts/render_spectral_features_report.py
   - scripts/render_pac_report.py
   - scripts/render_epoch_report.py
   - scripts/render_nf_feedback_report.py
   - scripts/render_connectivity_report.py
+  - scripts/render_connectivity_pair_report.py
   - scripts/render_microstates_report.py
   - scripts/render_iaf_report.py
   - scripts/render_bids_scan_report.py
@@ -26,14 +29,17 @@ Recognized outputs:
 
   - Quality:      quality_report.json / line_noise_per_channel.csv (qeeg_quality_cli)
   - Trace plot:   trace_plot_run_meta.json (qeeg_trace_plot_cli)
+  - Spectrogram:  spectrogram_<channel>.bmp / spectrogram_run_meta.json (qeeg_spectrogram_cli)
   - Bandpowers:   bandpowers.csv
   - Band ratios:  bandratios.csv
+  - Topomap:      topomap_<metric>.bmp / topomap_run_meta.json
   - Spectral features: spectral_features.csv
   - Neurofeedback: nf_feedback.csv
   - PAC:          pac_timeseries.csv (qeeg_pac_cli)
   - Epochs:       epoch_bandpowers_summary.csv / epoch_bandpowers.csv (qeeg_epoch_cli)
   - Connectivity: coherence_pairs.csv / imcoh_pairs.csv / plv_pairs.csv / etc
                    and/or <measure>_matrix_<band>.csv (matrix mode)
+  - Connectivity (pair): coherence_band.csv / imcoh_band.csv / plv_band.csv / etc
   - Microstates:  microstate_state_stats.csv (qeeg_microstates_cli)
   - IAF:          iaf_by_channel.csv (qeeg_iaf_cli)
   - BIDS scan:    bids_index.csv / bids_index.json (qeeg_bids_scan_cli)
@@ -83,6 +89,16 @@ _KNOWN_CONN_PAIR_FILES: Set[str] = {
     "wpli2_debiased_pairs.csv",
 }
 
+# Pair-mode connectivity summary files (single-edge summary CSVs).
+_KNOWN_CONN_BAND_FILES: Set[str] = {
+    "coherence_band.csv",
+    "imcoh_band.csv",
+    "plv_band.csv",
+    "pli_band.csv",
+    "wpli_band.csv",
+    "wpli2_debiased_band.csv",
+}
+
 _CONN_MATRIX_RE = re.compile(
     r"^(coherence|imcoh|plv|pli|wpli|wpli2_debiased)_matrix_.+\\.csv$",
     re.IGNORECASE,
@@ -115,6 +131,54 @@ _TRACE_PLOT_HINT_FILES: Set[str] = {
 }
 
 
+_SPECTROGRAM_HINT_FILES: Set[str] = {
+    "spectrogram_run_meta.json",
+}
+
+_SPECTROGRAM_IMG_RE = re.compile(r"^spectrogram_.+?\.(bmp|png|jpe?g|gif|svg)$", re.IGNORECASE)
+
+
+def _looks_like_spectrogram(filenames: Sequence[str]) -> bool:
+    s = set(filenames)
+    if any(name in s for name in _SPECTROGRAM_HINT_FILES):
+        return True
+    return any(_SPECTROGRAM_IMG_RE.match(name or "") for name in filenames)
+
+
+_TOPOMAP_HINT_FILES: Set[str] = {
+    "topomap_run_meta.json",
+}
+
+_TOPOMAP_IMG_RE = re.compile(r"^topomap_.+?\.(bmp|png|jpe?g|gif|svg)$", re.IGNORECASE)
+
+
+def _looks_like_topomap(filenames: Sequence[str]) -> bool:
+    """Detect directories that primarily contain topomap outputs.
+
+    Many tools can emit an auxiliary single map (e.g., IAF may write
+    topomap_iaf.bmp). To avoid duplicating those runs in the dashboard, we only
+    treat a directory as a "topomap run" when either:
+
+      - topomap_run_meta.json is present, or
+      - there are >= 2 topomap_* image files.
+
+    This heuristic still captures typical outputs from qeeg_map_cli and
+    qeeg_topomap_cli while avoiding incidental single-image cases.
+    """
+
+    s = set(filenames)
+    if any(name in s for name in _TOPOMAP_HINT_FILES):
+        return True
+    n_imgs = 0
+    for name in filenames:
+        if _TOPOMAP_IMG_RE.match(name or ""):
+            n_imgs += 1
+            if n_imgs >= 2:
+                return True
+    return False
+
+
+
 def _walk_dirs(roots: Sequence[str]) -> Iterable[Tuple[str, List[str]]]:
     """Yield (dirpath, filenames) for every directory under each root."""
     for root in roots:
@@ -127,6 +191,17 @@ def _looks_like_connectivity(filenames: Sequence[str]) -> bool:
     if any(name in s for name in _KNOWN_CONN_PAIR_FILES):
         return True
     return any(_CONN_MATRIX_RE.match(name or "") for name in filenames)
+
+
+def _looks_like_connectivity_pair(filenames: Sequence[str]) -> bool:
+    """Detect pair-mode connectivity outputs.
+
+    These are distinct from the edge-list/matrix outputs consumed by
+    render_connectivity_report.py.
+    """
+
+    s = set(filenames)
+    return any(name in s for name in _KNOWN_CONN_BAND_FILES)
 
 
 # ---- Rendering -------------------------------------------------------------
@@ -156,6 +231,19 @@ def _try_import_renderers() -> Dict[str, object]:
     try:
         import render_trace_plot_report as _tr  # type: ignore
         mods["trace_plot"] = _tr
+    except Exception:
+        pass
+
+
+    try:
+        import render_spectrogram_report as _sp  # type: ignore
+        mods["spectrogram"] = _sp
+    except Exception:
+        pass
+
+    try:
+        import render_topomap_report as _tm  # type: ignore
+        mods["topomap"] = _tm
     except Exception:
         pass
 
@@ -192,6 +280,12 @@ def _try_import_renderers() -> Dict[str, object]:
     try:
         import render_connectivity_report as _conn  # type: ignore
         mods["connectivity"] = _conn
+    except Exception:
+        pass
+
+    try:
+        import render_connectivity_pair_report as _connp  # type: ignore
+        mods["connectivity_pair"] = _connp
     except Exception:
         pass
 
@@ -247,6 +341,16 @@ def _render_report(kind: str, outdir: str, *, force: bool, renderer_mods: Dict[s
         argv = ["--input", outdir, "--out", report]
         mod = renderer_mods.get("trace_plot")
 
+    elif kind == "spectrogram":
+        report = os.path.join(outdir, "spectrogram_report.html")
+        argv = ["--input", outdir, "--out", report]
+        mod = renderer_mods.get("spectrogram")
+
+    elif kind == "topomap":
+        report = os.path.join(outdir, "topomap_report.html")
+        argv = ["--input", outdir, "--out", report]
+        mod = renderer_mods.get("topomap")
+
     elif kind == "bandpowers":
         report = os.path.join(outdir, "bandpowers_report.html")
         argv = ["--input", outdir, "--out", report]
@@ -281,6 +385,11 @@ def _render_report(kind: str, outdir: str, *, force: bool, renderer_mods: Dict[s
         report = os.path.join(outdir, "connectivity_report.html")
         argv = ["--input", outdir, "--out", report]
         mod = renderer_mods.get("connectivity")
+
+    elif kind == "connectivity_pair":
+        report = os.path.join(outdir, "connectivity_pair_report.html")
+        argv = ["--input", outdir, "--out", report]
+        mod = renderer_mods.get("connectivity_pair")
 
     elif kind == "microstates":
         report = os.path.join(outdir, "microstates_report.html")
@@ -367,6 +476,7 @@ def _build_dashboard(items: Sequence[ReportItem], out_path: str, roots: Sequence
     kind_order: List[Tuple[str, str]] = [
         ("quality", "Quality runs"),
         ("trace_plot", "Trace plot runs"),
+        ("spectrogram", "Spectrogram runs"),
         ("bids_scan", "BIDS scan runs"),
         ("nf", "Neurofeedback runs"),
         ("pac", "PAC runs"),
@@ -374,8 +484,10 @@ def _build_dashboard(items: Sequence[ReportItem], out_path: str, roots: Sequence
         ("iaf", "IAF runs"),
         ("bandpowers", "Bandpower runs"),
         ("bandratios", "Band ratio runs"),
+        ("topomap", "Topomap runs"),
         ("spectral_features", "Spectral feature runs"),
         ("connectivity", "Connectivity runs"),
+        ("connectivity_pair", "Connectivity pair runs"),
         ("microstates", "Microstate runs"),
         ("channel_qc", "Channel QC runs"),
         ("artifacts", "Artifacts runs"),
@@ -812,6 +924,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     quality_dirs: Set[str] = set()
     trace_dirs: Set[str] = set()
+    spectrogram_dirs: Set[str] = set()
+    topomap_dirs: Set[str] = set()
     band_dirs: Set[str] = set()
     br_dirs: Set[str] = set()
     sf_dirs: Set[str] = set()
@@ -819,6 +933,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pac_dirs: Set[str] = set()
     epoch_dirs: Set[str] = set()
     conn_dirs: Set[str] = set()
+    conn_pair_dirs: Set[str] = set()
     ms_dirs: Set[str] = set()
     iaf_dirs: Set[str] = set()
     bids_dirs: Set[str] = set()
@@ -836,6 +951,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if any(name in s for name in _TRACE_PLOT_HINT_FILES):
             trace_dirs.add(os.path.abspath(dirpath))
 
+        if _looks_like_spectrogram(filenames):
+            spectrogram_dirs.add(os.path.abspath(dirpath))
+
+        if _looks_like_topomap(filenames):
+            topomap_dirs.add(os.path.abspath(dirpath))
+
         if "bandpowers.csv" in s:
             band_dirs.add(os.path.abspath(dirpath))
         if "bandratios.csv" in s:
@@ -848,8 +969,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pac_dirs.add(os.path.abspath(dirpath))
         if ("epoch_bandpowers_summary.csv" in s) or ("epoch_bandpowers.csv" in s):
             epoch_dirs.add(os.path.abspath(dirpath))
+        # Connectivity has two report paths:
+        #  - edge-list / matrix mode (render_connectivity_report.py)
+        #  - pair-summary mode (render_connectivity_pair_report.py)
         if _looks_like_connectivity(filenames):
             conn_dirs.add(os.path.abspath(dirpath))
+        elif _looks_like_connectivity_pair(filenames):
+            conn_pair_dirs.add(os.path.abspath(dirpath))
         if "microstate_state_stats.csv" in s:
             ms_dirs.add(os.path.abspath(dirpath))
         if "iaf_by_channel.csv" in s:
@@ -879,6 +1005,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             add_existing("quality", d, "quality_report.html")
         for d in sorted(trace_dirs):
             add_existing("trace_plot", d, "trace_plot_report.html")
+        for d in sorted(spectrogram_dirs):
+            add_existing("spectrogram", d, "spectrogram_report.html")
+        for d in sorted(topomap_dirs):
+            add_existing("topomap", d, "topomap_report.html")
         for d in sorted(nf_dirs):
             add_existing("nf", d, "nf_feedback_report.html")
         for d in sorted(pac_dirs):
@@ -897,6 +1027,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             add_existing("spectral_features", d, "spectral_features_report.html")
         for d in sorted(conn_dirs):
             add_existing("connectivity", d, "connectivity_report.html")
+        for d in sorted(conn_pair_dirs):
+            add_existing("connectivity_pair", d, "connectivity_pair_report.html")
         for d in sorted(ms_dirs):
             add_existing("microstates", d, "microstates_report.html")
         for d in sorted(qc_dirs):
@@ -908,6 +1040,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             items.append(_render_report("quality", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(trace_dirs):
             items.append(_render_report("trace_plot", d, force=bool(args.force), renderer_mods=renderer_mods))
+        for d in sorted(spectrogram_dirs):
+            items.append(_render_report("spectrogram", d, force=bool(args.force), renderer_mods=renderer_mods))
+        for d in sorted(topomap_dirs):
+            items.append(_render_report("topomap", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(nf_dirs):
             items.append(_render_report("nf", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(pac_dirs):
@@ -926,6 +1062,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             items.append(_render_report("spectral_features", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(conn_dirs):
             items.append(_render_report("connectivity", d, force=bool(args.force), renderer_mods=renderer_mods))
+        for d in sorted(conn_pair_dirs):
+            items.append(_render_report("connectivity_pair", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(ms_dirs):
             items.append(_render_report("microstates", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(qc_dirs):
