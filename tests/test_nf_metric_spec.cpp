@@ -1,6 +1,6 @@
 #include "qeeg/nf_metric.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <iostream>
 #include <stdexcept>
 

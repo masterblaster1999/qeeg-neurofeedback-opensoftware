@@ -2,7 +2,7 @@
 #include "qeeg/edf_writer.hpp"
 #include "qeeg/types.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cmath>
 #include <filesystem>
 #include <iostream>

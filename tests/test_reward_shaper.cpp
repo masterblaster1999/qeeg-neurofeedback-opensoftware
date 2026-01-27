@@ -1,6 +1,6 @@
 #include "qeeg/reward_shaper.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 
 using namespace qeeg;
 

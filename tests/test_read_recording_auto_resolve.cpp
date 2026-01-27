@@ -1,7 +1,7 @@
 #include "qeeg/edf_writer.hpp"
 #include "qeeg/reader.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iostream>

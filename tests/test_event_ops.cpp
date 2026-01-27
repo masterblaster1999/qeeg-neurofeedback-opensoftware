@@ -1,6 +1,6 @@
 #include "qeeg/event_ops.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <iostream>
 #include <vector>
 

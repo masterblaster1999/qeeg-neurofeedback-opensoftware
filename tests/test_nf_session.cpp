@@ -1,6 +1,6 @@
 #include "qeeg/nf_session.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iostream>

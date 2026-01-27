@@ -1,6 +1,6 @@
 #include "qeeg/line_noise.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cmath>
 #include <random>
 #include <vector>

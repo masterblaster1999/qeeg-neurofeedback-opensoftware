@@ -320,7 +320,134 @@ def parse_bandpower_timeseries_header(header: List[str]) -> Optional[BandpowerHe
     return BandpowerHeader(time_idx=time_idx, bands=bands, channels=channels, col_indices=col_indices)
 
 
+# ---------------------------------------------------------------------------
+# Reference (normative) z-score support
+# ---------------------------------------------------------------------------
+
+_REFERENCE_CACHE_LOCK = threading.Lock()
+_REFERENCE_CACHE_KEY: Optional[Tuple[float, int, float, int]] = None  # (ref_mtime, ref_size, bp_mtime, bp_size)
+_REFERENCE_CACHE: Optional[Dict[str, object]] = None
+
+
+def _parse_reference_csv(path: Path) -> Tuple[Dict[Tuple[str, str], Tuple[float, float]], Dict[str, str]]:
+    """Parse qeeg_reference_cli CSV into a lookup map.
+
+    Returns:
+      - stats[(band_lower, channel_norm)] = (mean, stdev)
+      - meta parsed from comment lines (best-effort)
+    """
+    stats: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    meta: Dict[str, str] = {}
+    try:
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = (raw or "").strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                s = line.lstrip("#").strip()
+                if "=" in s:
+                    k, v = s.split("=", 1)
+                    meta[k.strip()] = v.strip()
+                continue
+            # CSV row: channel,band,mean,stdev
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 4:
+                continue
+            if parts[0].strip().lower() == "channel":
+                continue
+            ch = normalize_channel_name(parts[0])
+            band = (parts[1] or "").strip().lower()
+            mean = _safe_float(parts[2])
+            sd = _safe_float(parts[3])
+            if not ch or not band or mean is None or sd is None:
+                continue
+            stats[(band, ch)] = (float(mean), float(sd))
+    except Exception:
+        pass
+    return stats, meta
+
+
+def build_reference_info(outdir: Path) -> Dict[str, object]:
+    """Build reference stats aligned to bandpower_timeseries column order."""
+    ref_path = outdir / "reference_used.csv"
+    bp_path = outdir / "bandpower_timeseries.csv"
+
+    st_ref = _stat_dict(ref_path)
+    st_bp = _stat_dict(bp_path)
+
+    resp: Dict[str, object] = {
+        "schema_version": 1,
+        "server_time_utc": float(time.time()),
+        "reference": {"path": str(ref_path), "stat": st_ref},
+        "bandpower": {"path": str(bp_path), "stat": st_bp},
+        "aligned": None,
+        "meta": None,
+    }
+
+    if not st_ref.get("exists"):
+        return resp
+
+    hdr = _read_csv_header_line(bp_path)
+    bp = parse_bandpower_timeseries_header(hdr) if hdr else None
+    if not bp:
+        return resp
+
+    # Cache keyed by file stats (mtime+size).
+    key = (
+        float(st_ref.get("mtime_utc", 0.0) or 0.0),
+        int(st_ref.get("size_bytes", 0) or 0),
+        float(st_bp.get("mtime_utc", 0.0) or 0.0),
+        int(st_bp.get("size_bytes", 0) or 0),
+    )
+    global _REFERENCE_CACHE_KEY, _REFERENCE_CACHE
+    with _REFERENCE_CACHE_LOCK:
+        if _REFERENCE_CACHE_KEY == key and _REFERENCE_CACHE is not None:
+            return dict(_REFERENCE_CACHE)
+
+    stats, meta = _parse_reference_csv(ref_path)
+
+    means: List[Optional[float]] = []
+    stdevs: List[Optional[float]] = []
+    present: List[int] = []
+    # band-major order matching parse_bandpower_timeseries_header()
+    for b in bp.bands:
+        for c in bp.channels:
+            idx = bp.col_indices[len(means)]
+            if idx < 0:
+                means.append(None)
+                stdevs.append(None)
+                present.append(0)
+                continue
+            k = ((b or "").strip().lower(), normalize_channel_name(c))
+            v = stats.get(k)
+            if not v:
+                means.append(None)
+                stdevs.append(None)
+                present.append(0)
+            else:
+                m, sd = v
+                means.append(float(m))
+                stdevs.append(float(sd))
+                present.append(1)
+
+    resp["aligned"] = {
+        "bands": bp.bands,
+        "channels": bp.channels,
+        "means": means,
+        "stdevs": stdevs,
+        "present": present,
+    }
+    resp["meta"] = meta
+
+    with _REFERENCE_CACHE_LOCK:
+        _REFERENCE_CACHE_KEY = key
+        _REFERENCE_CACHE = dict(resp)
+
+    return resp
+
+
 class CsvTailer:
+
     """Incrementally tails a CSV file that is appended over time."""
 
     def __init__(self, path: Path, *, max_initial_rows: int = 1200):
@@ -554,6 +681,8 @@ def _summarize_run_meta_obj(obj: object) -> Optional[Dict[str, object]]:
         "fs_hz",
         "metric_spec",
         "band_spec",
+        "reference_csv",
+        "reference_csv_out",
         "reward_direction",
         "threshold_init",
         "baseline_seconds",
@@ -642,12 +771,14 @@ def compute_meta(outdir: Path) -> Dict[str, object]:
             "bandpower_timeseries": str(outdir / "bandpower_timeseries.csv"),
             "artifact_gate_timeseries": str(outdir / "artifact_gate_timeseries.csv"),
             "nf_run_meta": str(run_meta_path),
+            "reference_used": str(outdir / "reference_used.csv"),
         },
         "files_stat": {
             "nf_feedback": _stat_dict(outdir / "nf_feedback.csv"),
             "bandpower_timeseries": _stat_dict(outdir / "bandpower_timeseries.csv"),
             "artifact_gate_timeseries": _stat_dict(outdir / "artifact_gate_timeseries.csv"),
             "nf_run_meta": _stat_dict(run_meta_path),
+            "reference_used": _stat_dict(outdir / "reference_used.csv"),
         },
         # Compact run meta summary (full JSON via /api/run_meta).
         "run_meta": _run_meta_summary_info(outdir),
@@ -782,6 +913,10 @@ class LiveHub:
                 idx_art = hmap.get("artifact", -1)
                 idx_bad_ch = hmap.get("bad_channels", -1)
                 idx_phase = hmap.get("phase", -1)
+                idx_metric_z = hmap.get("metric_z", -1)
+                idx_thr_z = hmap.get("threshold_z", -1)
+                idx_metric_z_ref = hmap.get("metric_z_ref", -1)
+                idx_thr_z_ref = hmap.get("threshold_z_ref", -1)
 
                 def emit_row(row: List[str]) -> Optional[Dict[str, object]]:
                     if not row:
@@ -798,6 +933,14 @@ class LiveHub:
                         "reward": reward,
                         "reward_rate": rr,
                     }
+                    if 0 <= idx_metric_z < len(row):
+                        obj["metric_z"] = _safe_float(row[idx_metric_z])
+                    if 0 <= idx_thr_z < len(row):
+                        obj["threshold_z"] = _safe_float(row[idx_thr_z])
+                    if 0 <= idx_metric_z_ref < len(row):
+                        obj["metric_z_ref"] = _safe_float(row[idx_metric_z_ref])
+                    if 0 <= idx_thr_z_ref < len(row):
+                        obj["threshold_z_ref"] = _safe_float(row[idx_thr_z_ref])
                     if 0 <= idx_art_ready < len(row):
                         obj["artifact_ready"] = int(_safe_float(row[idx_art_ready]) or 0)
                     if 0 <= idx_art < len(row):
@@ -2317,6 +2460,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, self.server.get_ui_state())
                 return
 
+            if path == "/api/reference":
+                if not self._require_token():
+                    return
+                self._send_json(HTTPStatus.OK, self.server.build_reference())
+                return
+
             if path == "/api/run_meta":
                 if not self._require_token():
                     return
@@ -2648,11 +2797,17 @@ class DashboardServer(ThreadingHTTPServer):
                 "snapshot": True,
                 "run_meta": True,
                 "stats": True,
+                "reference": True,
                 "asset_etag": True,
             },
         }
 
     
+
+    def build_reference(self) -> Dict[str, object]:
+        """Normative reference stats aligned to bandpower columns (if available)."""
+        return build_reference_info(self.config.outdir)
+
 
     # ------------------------ snapshot (polling) API ------------------------
 
@@ -2829,6 +2984,8 @@ class DashboardServer(ThreadingHTTPServer):
             "transform": "linear",
             "scale": "auto",
             "labels": "on",
+            "nf_mode": "raw",
+            "map_mode": "raw",
             "updated_utc": float(time.time()),
             "updated_by": None,
         }
@@ -2904,6 +3061,16 @@ class DashboardServer(ThreadingHTTPServer):
             labels = "on"
         out["labels"] = labels
 
+        nf_mode = st.get("nf_mode", out.get("nf_mode", "raw"))
+        if nf_mode not in ("raw", "zbase", "zref"):
+            nf_mode = "raw"
+        out["nf_mode"] = nf_mode
+
+        map_mode = st.get("map_mode", out.get("map_mode", "raw"))
+        if map_mode not in ("raw", "zbase", "zref"):
+            map_mode = "raw"
+        out["map_mode"] = map_mode
+
         out["updated_utc"] = _num(st.get("updated_utc", time.time()), 0.0, 1e12, float(time.time()))
         out["updated_by"] = _s(st.get("updated_by"), 96)
         return out
@@ -2916,7 +3083,7 @@ class DashboardServer(ThreadingHTTPServer):
 
     def update_ui_state(self, patch: Dict[str, object]) -> Dict[str, object]:
         # Only allow specific keys.
-        allowed = {"win_sec", "paused", "band", "channel", "transform", "scale", "labels", "client_id"}
+        allowed = {"win_sec", "paused", "band", "channel", "transform", "scale", "labels", "nf_mode", "map_mode", "client_id"}
         clean_patch: Dict[str, object] = {k: patch[k] for k in patch.keys() if k in allowed}
         client_id = clean_patch.get("client_id")
         updated_by = None

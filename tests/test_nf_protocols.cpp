@@ -4,7 +4,7 @@
 #include "qeeg/nf_metric.hpp"
 #include "qeeg/utils.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <iostream>
 #include <unordered_set>
 #include <vector>

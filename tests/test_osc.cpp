@@ -1,6 +1,6 @@
 #include "qeeg/osc.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cstdint>
 #include <iostream>
 #include <vector>

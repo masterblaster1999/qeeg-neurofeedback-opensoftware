@@ -1,6 +1,6 @@
 #include "qeeg/run_meta.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <iostream>
 #include <fstream>
 #include <stdexcept>

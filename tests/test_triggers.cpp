@@ -1,7 +1,7 @@
 #include "qeeg/triggers.hpp"
 #include "qeeg/resample.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cmath>
 #include <iostream>
 #include <vector>

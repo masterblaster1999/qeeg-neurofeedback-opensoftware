@@ -34,6 +34,12 @@
               <option value="300">300s</option>
             </select>
             <button id="pauseBtn" type="button">Pause</button>
+            <span class="ctrl">NF</span>
+            <select id="nfModeSel">
+              <option value="raw" selected>raw</option>
+              <option value="zbase">z (baseline)</option>
+              <option value="zref">z (reference)</option>
+            </select>
           </div>
         </div>
         <div class="kv" id="nfStats"></div>
@@ -57,6 +63,12 @@
               </div>
               <div class="row">
                 <span class="ctrl">Transform</span>
+                <span class="ctrl">Map</span>
+                <select id="mapSel">
+                  <option value="raw" selected>raw</option>
+                  <option value="zbase">z (baseline)</option>
+                  <option value="zref">z (reference)</option>
+                </select>
                 <select id="xformSel">
                   <option value="linear" selected>linear</option>
                   <option value="log10">log10</option>

@@ -1,6 +1,6 @@
 #include "qeeg/smoother.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cmath>
 #include <limits>
 

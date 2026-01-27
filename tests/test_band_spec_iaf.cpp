@@ -1,6 +1,6 @@
 #include "qeeg/bandpower.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cmath>
 #include <filesystem>
 #include <fstream>

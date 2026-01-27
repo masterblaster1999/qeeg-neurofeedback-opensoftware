@@ -1,6 +1,6 @@
 #include "qeeg/ui_dashboard.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iostream>

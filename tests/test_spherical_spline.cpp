@@ -2,7 +2,7 @@
 #include "qeeg/topomap.hpp"
 #include "qeeg/montage.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cmath>
 #include <iostream>
 #include <random>

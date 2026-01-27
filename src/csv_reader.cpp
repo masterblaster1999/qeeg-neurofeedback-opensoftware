@@ -1061,7 +1061,9 @@ EEGRecording CSVReader::read(const std::string& path) {
   // when a user accidentally passes a compressed/session container (e.g., some
   // BioTrace+/NeXus exports) instead of a plain delimited text export.
   unsigned char sniff[4096];
-  std::fill(std::begin(sniff), std::end(sniff), 0);
+  // MSVC warns about implicit narrowing when the fill value is an int literal.
+  // Use an explicit unsigned-char zero to keep builds warning-free.
+  std::fill(std::begin(sniff), std::end(sniff), static_cast<unsigned char>(0));
   f.read(reinterpret_cast<char*>(sniff), sizeof(sniff));
   const std::streamsize sniff_n = f.gcount();
   f.clear();

@@ -367,12 +367,14 @@ if (QEEG_BUILD_CLI)
   # nf_cli.cpp is mostly orchestration + UI/report generation. The hot DSP paths
   # live in libqeeg, so compiling this translation unit with full -O3 / /O2 in
   # Release isn't performance-critical but can noticeably slow down builds.
-  # Keep this TU unoptimized for faster incremental builds (especially helpful
-  # when embedding large HTML/JS strings).
+  #
+  # We disable optimization for this TU *only* in Debug builds to keep Release
+  # builds warning-free on MSVC (avoids D9025: overriding '/O2' with '/Od') and
+  # to preserve expected performance characteristics in Release packages.
   if (MSVC)
-    target_compile_options(qeeg_cli_impl_nf PRIVATE /Od)
+    target_compile_options(qeeg_cli_impl_nf PRIVATE $<$<CONFIG:Debug>:/Od>)
   else()
-    target_compile_options(qeeg_cli_impl_nf PRIVATE -O0)
+    target_compile_options(qeeg_cli_impl_nf PRIVATE $<$<CONFIG:Debug>:-O0>)
   endif()
 
   add_executable(qeeg_nf_cli src/nf_cli_main.cpp $<TARGET_OBJECTS:qeeg_cli_impl_nf>)
@@ -1263,20 +1265,11 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_interpolate PRIVATE qeeg)
   add_test(NAME qeeg_test_interpolate COMMAND qeeg_test_interpolate)
 
-  # Keep assertions enabled in unit tests even when the overall build type
-  # defines NDEBUG (e.g., Release). This avoids tests silently becoming
-  # no-ops and prevents "unused variable/function" warnings when compiling
-  # tests with -Werror.
-  get_property(qeeg_all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-  foreach(tgt IN LISTS qeeg_all_targets)
-    if (tgt MATCHES "^qeeg_test_")
-      if (MSVC)
-        target_compile_options(${tgt} PRIVATE /UNDEBUG)
-      else()
-        target_compile_options(${tgt} PRIVATE -UNDEBUG)
-      endif()
-    endif()
-  endforeach()
+  # Unit tests:
+  #
+  # Tests include tests/test_support.hpp which overrides assert() with an
+  # always-on check, so tests remain meaningful even in Release builds without
+  # forcing toolchain-level /UNDEBUG flags (avoids MSVC D9025 warnings).
 
 endif()
 

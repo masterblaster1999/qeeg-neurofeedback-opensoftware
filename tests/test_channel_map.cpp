@@ -1,6 +1,6 @@
 #include "qeeg/channel_map.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>

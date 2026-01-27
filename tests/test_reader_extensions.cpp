@@ -1,6 +1,6 @@
 #include "qeeg/reader.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <cmath>
 #include <cstdio>
 #include <fstream>

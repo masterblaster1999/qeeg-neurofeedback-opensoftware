@@ -132,6 +132,11 @@ struct Args {
   double relative_fmin_hz{0.0};
   double relative_fmax_hz{0.0};
 
+  // Optional: normative reference stats CSV (qeeg_reference_cli output).
+  // When provided, qeeg_nf_cli can compute reference-based z-scores for bandpower metrics
+  // and makes the file available to real-time dashboards by copying it into --outdir.
+  std::string reference_csv;
+
   // Neurofeedback threshold params
   // Initial threshold is estimated from the first --baseline seconds unless overridden by --threshold.
   double baseline_seconds{10.0};
@@ -854,6 +859,12 @@ static void print_nf_config_json(const Args& args,
   std::cout << "  \"relative_fmin_hz\": " << args.relative_fmin_hz << ",\n";
   std::cout << "  \"relative_fmax_hz\": " << args.relative_fmax_hz << ",\n";
 
+  // Optional normative reference stats.
+  std::cout << "  \"reference_csv\": ";
+  if (!args.reference_csv.empty()) std::cout << "\"" << json_escape(args.reference_csv) << "\"";
+  else std::cout << "null";
+  std::cout << ",\n";
+
   // Reward stability / shaping.
   std::cout << "  \"reward_on_frames\": " << args.reward_on_frames << ",\n";
   std::cout << "  \"reward_off_frames\": " << args.reward_off_frames << ",\n";
@@ -974,6 +985,7 @@ static void print_help() {
     << "  --relative                Use relative power: band_power / total_power (bandpower/ratio/asymmetry metrics only)\n"
     << "  --relative-range LO HI    Total-power integration range used for --relative.\n"
     << "                           Default: [min_band_fmin, max_band_fmax] from --bands.\n"
+    << "  --reference-csv PATH      Optional: reference stats CSV (qeeg_reference_cli output) for z-score mapping (bandpower metrics only)\n"
     << "  --baseline S              Baseline duration seconds for initial threshold (default: 10)\n"
     << "  --baseline-quantile Q     Baseline quantile in [0,1] for initial threshold.\n"
     << "                           Default: auto (matches --target-rate): above=>1-R, below=>R.\n"
@@ -1140,6 +1152,8 @@ static Args parse_args(int argc, char** argv) {
       a.relative_power = true;
       a.relative_fmin_hz = to_double(argv[++i]);
       a.relative_fmax_hz = to_double(argv[++i]);
+    } else if ((arg == "--reference" || arg == "--reference-csv") && i + 1 < argc) {
+      a.reference_csv = argv[++i];
     } else if (arg == "--baseline" && i + 1 < argc) {
       a.baseline_seconds = to_double(argv[++i]);
       a.explicit_set.baseline = true;
@@ -3115,6 +3129,30 @@ if (args.list_channels || args.list_channels_json) {
 
     ensure_directory(args.outdir);
 
+    // Optional: load normative reference stats for z-score mapping (qeeg_reference_cli output).
+    bool have_reference = false;
+    ReferenceStats reference;
+    std::string reference_csv_out;
+    if (!args.reference_csv.empty()) {
+      try {
+        reference = load_reference_csv(args.reference_csv);
+        have_reference = true;
+        // Copy into the output directory for provenance / dashboards.
+        reference_csv_out = args.outdir + "/reference_used.csv";
+        try {
+          std::ifstream in(std::filesystem::u8path(args.reference_csv), std::ios::binary);
+          std::ofstream out(std::filesystem::u8path(reference_csv_out), std::ios::binary);
+          if (!in || !out) throw std::runtime_error("copy failed");
+          out << in.rdbuf();
+        } catch (const std::exception& e) {
+          std::cerr << "Warning: failed to copy reference CSV into outdir: " << e.what() << "\n";
+          reference_csv_out.clear();
+        }
+      } catch (const std::exception& e) {
+        std::cerr << "Warning: failed to load reference CSV '" << args.reference_csv << "': " << e.what() << "\n";
+      }
+    }
+
     std::string channel_map_out_path;
 
     EEGRecording rec;
@@ -3236,6 +3274,7 @@ if (args.list_channels || args.list_channels_json) {
         emit_out("nf_run_meta.json");
         emit_out("nf_feedback.csv");
         emit_out("nf_summary.json");
+        if (!reference_csv_out.empty()) emit_out("reference_used.csv");
         if (have_qc) emit_out("bad_channels_used.txt");
         if (args.export_artifacts) emit_out("artifact_gate_timeseries.csv");
         if (args.export_bandpowers) emit_out("bandpower_timeseries.csv");
@@ -3283,6 +3322,14 @@ if (args.list_channels || args.list_channels_json) {
         meta << ",\n";
         meta << "  \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
         meta << "  \"band_spec\": \"" << json_escape(args.band_spec) << "\",\n";
+        meta << "  \"reference_csv\": ";
+        if (!args.reference_csv.empty()) meta << "\"" << json_escape(args.reference_csv) << "\""
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"reference_csv_out\": ";
+        if (!reference_csv_out.empty()) meta << "\"reference_used.csv\"";
+        else meta << "null";
+        meta << ",\n";
         meta << "  \"reward_direction\": \"" << reward_direction_name(args.reward_direction) << "\",\n";
         meta << "  \"threshold_init\": ";
         if (std::isfinite(args.initial_threshold)) meta << args.initial_threshold;
@@ -3604,6 +3651,8 @@ if (args.list_channels || args.list_channels_json) {
     if (continuous_feedback) {
       out << ",feedback_raw,reward_value";
     }
+    // Always append z-score columns (blank when unavailable) for real-time dashboards.
+    out << ",metric_z,threshold_z,metric_z_ref,threshold_z_ref";
     out << "\n";
 
     std::ofstream out_bp;
@@ -3615,6 +3664,11 @@ if (args.list_channels || args.list_channels_json) {
     bool have_threshold = std::isfinite(args.initial_threshold);
     double threshold = have_threshold ? args.initial_threshold
                                      : std::numeric_limits<double>::quiet_NaN();
+
+    // Baseline-derived robust stats (median + scale) used for z-scores.
+    bool baseline_stats_ready = false;
+    double baseline_median = std::numeric_limits<double>::quiet_NaN();
+    double baseline_scale = std::numeric_limits<double>::quiet_NaN();
 
     const size_t rate_window_frames = std::max<size_t>(
       1,
@@ -3781,6 +3835,34 @@ if (args.list_channels || args.list_channels_json) {
       }
     };
 
+    auto append_zscore_cols = [&](double metric_val, double thr, bool thr_ready) {
+      double metric_z = std::numeric_limits<double>::quiet_NaN();
+      double thr_z = std::numeric_limits<double>::quiet_NaN();
+      if (thr_ready && baseline_stats_ready && std::isfinite(baseline_scale) && baseline_scale > 0.0) {
+        metric_z = (metric_val - baseline_median) / baseline_scale;
+        thr_z = (thr - baseline_median) / baseline_scale;
+      }
+      double metric_z_ref = std::numeric_limits<double>::quiet_NaN();
+      double thr_z_ref = std::numeric_limits<double>::quiet_NaN();
+      if (thr_ready && have_reference && metric.type == NfMetricSpec::Type::Band) {
+        double z = 0.0;
+        if (compute_zscore(reference, metric.channel, metric.band, metric_val, &z)) {
+          metric_z_ref = z;
+        }
+        if (compute_zscore(reference, metric.channel, metric.band, thr, &z)) {
+          thr_z_ref = z;
+        }
+      }
+      out << ",";
+      if (std::isfinite(metric_z)) out << metric_z;
+      out << ",";
+      if (std::isfinite(thr_z)) out << thr_z;
+      out << ",";
+      if (std::isfinite(metric_z_ref)) out << metric_z_ref;
+      out << ",";
+      if (std::isfinite(thr_z_ref)) out << thr_z_ref;
+    };
+
     if (metric.type == NfMetricSpec::Type::Coherence) {
       // Resolve pair indices from the recording.
       const int ia = find_channel_index(rec.channel_names, metric.channel_a);
@@ -3897,26 +3979,45 @@ if (args.list_channels || args.list_channels_json) {
                 summary.threshold_init_set = true;
               }
 
+              // Compute robust baseline stats for z-scores (and feedback span if needed).
+            if (!baseline_values.empty()) {
+              std::vector<double> tmp = baseline_values;
+              const double med = median_inplace(&tmp);
+              const double sc = robust_scale(baseline_values, med);
+              if (std::isfinite(med) && std::isfinite(sc) && sc > 0.0) {
+                baseline_median = med;
+                baseline_scale = sc;
+                baseline_stats_ready = true;
+              }
               if (continuous_feedback && !feedback_span_ready) {
-                if (!baseline_values.empty()) {
-                  std::vector<double> tmp = baseline_values;
-                  const double med = median_inplace(&tmp);
-                  const double sc = robust_scale(baseline_values, med);
-                  if (std::isfinite(sc) && sc > 0.0) {
-                    feedback_span_used = sc;
-                  } else {
-                    feedback_span_used = 1.0;
-                    std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
-                  }
+                if (std::isfinite(sc) && sc > 0.0) {
+                  feedback_span_used = sc;
                 } else {
                   feedback_span_used = 1.0;
-                  std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+                  std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
                 }
                 feedback_span_ready = true;
                 summary.feedback_span_used = feedback_span_used;
                 summary.feedback_span_used_set = true;
                 osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
                 std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
+              }
+            } else if (continuous_feedback && !feedback_span_ready) {
+              feedback_span_used = 1.0;
+              std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+              feedback_span_ready = true;
+              summary.feedback_span_used = feedback_span_used;
+              summary.feedback_span_used_set = true;
+              osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+              std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
+            } else if (continuous_feedback && !feedback_span_ready) {
+                feedback_span_used = 1.0;
+                std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+                feedback_span_ready = true;
+                summary.feedback_span_used = feedback_span_used;
+                summary.feedback_span_used_set = true;
+                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+                std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
               }
               std::cout << "Initial threshold set to: " << threshold
                         << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
@@ -3929,6 +4030,34 @@ if (args.list_channels || args.list_channels_json) {
             audio_reward_values.push_back(0);
             ui_push(fr.t_end_sec, val, threshold, have_threshold, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, /*rr=*/0.0, af);
             derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+            // Emit a CSV row during baseline so dashboards can plot immediately.
+            out << fr.t_end_sec << "," << val << ",";
+            if (have_threshold) out << threshold;
+            out << ",0,0.0";
+            if (do_artifacts) {
+              out << "," << (af.baseline_ready ? 1 : 0)
+                  << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                  << "," << af.bad_channel_count;
+            }
+            append_phase_and_raw(phase, /*raw_reward=*/false);
+            if (metric.type == NfMetricSpec::Type::Band) {
+              out << "," << metric.band << "," << metric.channel;
+            } else if (metric.type == NfMetricSpec::Type::Ratio) {
+              out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
+            } else if (metric.type == NfMetricSpec::Type::Asymmetry) {
+              out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
+            } else if (metric.type == NfMetricSpec::Type::Coherence) {
+              out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
+                  << "," << coherence_measure_name(metric.coherence_measure);
+            } else {
+              out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel
+                  << "," << pac_method_name(metric.pac_method);
+            }
+            append_feedback_optional_cols(val_raw);
+            append_reward_value_cols(0.0, 0.0);
+            append_zscore_cols(val, threshold, /*thr_ready=*/have_threshold);
+            out << "\n";
+            if (args.flush_csv) out.flush();
             continue;
           }
 
@@ -3962,6 +4091,7 @@ if (args.list_channels || args.list_channels_json) {
                 << "," << coherence_measure_name(metric.coherence_measure);
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
+            append_zscore_cols(val, threshold, /*thr_ready=*/true);
             out << "\n";
             ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
@@ -3998,6 +4128,7 @@ if (args.list_channels || args.list_channels_json) {
                 << "," << coherence_measure_name(metric.coherence_measure);
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
+            append_zscore_cols(val, threshold, /*thr_ready=*/true);
             out << "\n";
             ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
@@ -4057,6 +4188,7 @@ if (args.list_channels || args.list_channels_json) {
               << "," << coherence_measure_name(metric.coherence_measure);
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(feedback_raw, reward_value);
+          append_zscore_cols(val, threshold, /*thr_ready=*/true);
           out << "\n";
           if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
@@ -4157,26 +4289,45 @@ if (args.list_channels || args.list_channels_json) {
                 summary.threshold_init = threshold;
                 summary.threshold_init_set = true;
               }
+              // Compute robust baseline stats for z-scores (and feedback span if needed).
+            if (!baseline_values.empty()) {
+              std::vector<double> tmp = baseline_values;
+              const double med = median_inplace(&tmp);
+              const double sc = robust_scale(baseline_values, med);
+              if (std::isfinite(med) && std::isfinite(sc) && sc > 0.0) {
+                baseline_median = med;
+                baseline_scale = sc;
+                baseline_stats_ready = true;
+              }
               if (continuous_feedback && !feedback_span_ready) {
-                if (!baseline_values.empty()) {
-                  std::vector<double> tmp = baseline_values;
-                  const double med = median_inplace(&tmp);
-                  const double sc = robust_scale(baseline_values, med);
-                  if (std::isfinite(sc) && sc > 0.0) {
-                    feedback_span_used = sc;
-                  } else {
-                    feedback_span_used = 1.0;
-                    std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
-                  }
+                if (std::isfinite(sc) && sc > 0.0) {
+                  feedback_span_used = sc;
                 } else {
                   feedback_span_used = 1.0;
-                  std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+                  std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
                 }
                 feedback_span_ready = true;
                 summary.feedback_span_used = feedback_span_used;
                 summary.feedback_span_used_set = true;
                 osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
                 std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
+              }
+            } else if (continuous_feedback && !feedback_span_ready) {
+              feedback_span_used = 1.0;
+              std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+              feedback_span_ready = true;
+              summary.feedback_span_used = feedback_span_used;
+              summary.feedback_span_used_set = true;
+              osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+              std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
+            } else if (continuous_feedback && !feedback_span_ready) {
+                feedback_span_used = 1.0;
+                std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+                feedback_span_ready = true;
+                summary.feedback_span_used = feedback_span_used;
+                summary.feedback_span_used_set = true;
+                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+                std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
               }
               std::cout << "Initial threshold set to: " << threshold
                         << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
@@ -4189,6 +4340,34 @@ if (args.list_channels || args.list_channels_json) {
             audio_reward_values.push_back(0);
             ui_push(fr.t_end_sec, val, threshold, have_threshold, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, /*rr=*/0.0, af);
             derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+            // Emit a CSV row during baseline so dashboards can plot immediately.
+            out << fr.t_end_sec << "," << val << ",";
+            if (have_threshold) out << threshold;
+            out << ",0,0.0";
+            if (do_artifacts) {
+              out << "," << (af.baseline_ready ? 1 : 0)
+                  << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                  << "," << af.bad_channel_count;
+            }
+            append_phase_and_raw(phase, /*raw_reward=*/false);
+            if (metric.type == NfMetricSpec::Type::Band) {
+              out << "," << metric.band << "," << metric.channel;
+            } else if (metric.type == NfMetricSpec::Type::Ratio) {
+              out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
+            } else if (metric.type == NfMetricSpec::Type::Asymmetry) {
+              out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
+            } else if (metric.type == NfMetricSpec::Type::Coherence) {
+              out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
+                  << "," << coherence_measure_name(metric.coherence_measure);
+            } else {
+              out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel
+                  << "," << pac_method_name(metric.pac_method);
+            }
+            append_feedback_optional_cols(val_raw);
+            append_reward_value_cols(0.0, 0.0);
+            append_zscore_cols(val, threshold, /*thr_ready=*/have_threshold);
+            out << "\n";
+            if (args.flush_csv) out.flush();
             continue;
           }
 
@@ -4222,6 +4401,7 @@ if (args.list_channels || args.list_channels_json) {
             out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
+            append_zscore_cols(val, threshold, /*thr_ready=*/true);
             out << "\n";
             ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
@@ -4258,6 +4438,7 @@ if (args.list_channels || args.list_channels_json) {
             out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
+            append_zscore_cols(val, threshold, /*thr_ready=*/true);
             out << "\n";
             ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
@@ -4317,6 +4498,7 @@ if (args.list_channels || args.list_channels_json) {
           out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(feedback_raw, reward_value);
+          append_zscore_cols(val, threshold, /*thr_ready=*/true);
           out << "\n";
           if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
@@ -4464,26 +4646,46 @@ if (args.list_channels || args.list_channels_json) {
               summary.threshold_init = threshold;
               summary.threshold_init_set = true;
             }
-            if (continuous_feedback && !feedback_span_ready) {
-              if (!baseline_values.empty()) {
-                std::vector<double> tmp = baseline_values;
-                const double med = median_inplace(&tmp);
-                const double scale = robust_scale(baseline_values, med);
-                if (std::isfinite(scale) && scale > 0.0) {
-                  feedback_span_used = scale;
+            // Compute robust baseline stats for z-scores (and feedback span if needed).
+            if (!baseline_values.empty()) {
+              std::vector<double> tmp = baseline_values;
+              const double med = median_inplace(&tmp);
+              const double sc = robust_scale(baseline_values, med);
+              if (std::isfinite(med) && std::isfinite(sc) && sc > 0.0) {
+                baseline_median = med;
+                baseline_scale = sc;
+                baseline_stats_ready = true;
+              }
+              if (continuous_feedback && !feedback_span_ready) {
+                if (std::isfinite(sc) && sc > 0.0) {
+                  feedback_span_used = sc;
                 } else {
                   feedback_span_used = 1.0;
-                  std::cerr << "Warning: could not estimate baseline scale for continuous feedback; using feedback_span=1.0\n";
+                  std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
                 }
-              } else {
-                feedback_span_used = 1.0;
-                std::cerr << "Warning: no baseline samples for continuous feedback; using feedback_span=1.0\n";
+                feedback_span_ready = true;
+                summary.feedback_span_used = feedback_span_used;
+                summary.feedback_span_used_set = true;
+                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+                std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
               }
+            } else if (continuous_feedback && !feedback_span_ready) {
+              feedback_span_used = 1.0;
+              std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
               feedback_span_ready = true;
               summary.feedback_span_used = feedback_span_used;
               summary.feedback_span_used_set = true;
               osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-            }
+              std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
+            } else if (continuous_feedback && !feedback_span_ready) {
+                feedback_span_used = 1.0;
+                std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
+                feedback_span_ready = true;
+                summary.feedback_span_used = feedback_span_used;
+                summary.feedback_span_used_set = true;
+                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+                std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
+              }
             std::cout << "Initial threshold set to: " << threshold
                       << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
                       << ", n=" << baseline_values.size() << ")\n";
@@ -4495,6 +4697,34 @@ if (args.list_channels || args.list_channels_json) {
           audio_reward_values.push_back(0);
           ui_push(fr.t_end_sec, val, threshold, have_threshold, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, /*rr=*/0.0, af);
           derived_update(fr.t_end_sec, /*reward_on=*/false, artifact_state, phase);
+          // Emit a CSV row during baseline so dashboards can plot immediately.
+          out << fr.t_end_sec << "," << val << ",";
+          if (have_threshold) out << threshold;
+          out << ",0,0.0";
+          if (do_artifacts) {
+            out << "," << (af.baseline_ready ? 1 : 0)
+                << "," << ((af.baseline_ready && af.bad) ? 1 : 0)
+                << "," << af.bad_channel_count;
+          }
+          append_phase_and_raw(phase, /*raw_reward=*/false);
+          if (metric.type == NfMetricSpec::Type::Band) {
+            out << "," << metric.band << "," << metric.channel;
+          } else if (metric.type == NfMetricSpec::Type::Ratio) {
+            out << "," << metric.band_num << "," << metric.band_den << "," << metric.channel;
+          } else if (metric.type == NfMetricSpec::Type::Asymmetry) {
+            out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b;
+          } else if (metric.type == NfMetricSpec::Type::Coherence) {
+            out << "," << metric.band << "," << metric.channel_a << "," << metric.channel_b
+                << "," << coherence_measure_name(metric.coherence_measure);
+          } else {
+            out << "," << metric.phase_band << "," << metric.amp_band << "," << metric.channel
+                << "," << pac_method_name(metric.pac_method);
+          }
+          append_feedback_optional_cols(val_raw);
+          append_reward_value_cols(0.0, 0.0);
+          append_zscore_cols(val, threshold, /*thr_ready=*/have_threshold);
+          out << "\n";
+          if (args.flush_csv) out.flush();
           continue;
         }
 
@@ -4534,6 +4764,7 @@ if (args.list_channels || args.list_channels_json) {
           }
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
+          append_zscore_cols(val, threshold, /*thr_ready=*/true);
           out << "\n";
           if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
@@ -4577,6 +4808,7 @@ if (args.list_channels || args.list_channels_json) {
           }
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
+          append_zscore_cols(val, threshold, /*thr_ready=*/true);
           out << "\n";
           if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
@@ -4643,6 +4875,7 @@ if (args.list_channels || args.list_channels_json) {
         }
         append_feedback_optional_cols(val_raw);
         append_reward_value_cols(feedback_raw, reward_value);
+        append_zscore_cols(val, threshold, /*thr_ready=*/true);
         out << "\n";
         if (args.flush_csv) out.flush();
 

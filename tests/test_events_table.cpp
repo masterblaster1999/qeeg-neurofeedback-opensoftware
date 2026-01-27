@@ -1,6 +1,6 @@
 #include "qeeg/csv_io.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iostream>

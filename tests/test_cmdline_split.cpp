@@ -1,6 +1,6 @@
 #include "qeeg/utils.hpp"
 
-#include <cassert>
+#include "test_support.hpp"
 #include <iostream>
 
 int main() {

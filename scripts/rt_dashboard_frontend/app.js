@@ -35,6 +35,8 @@
   const bandSel = qs('bandSel');
   const chSel = qs('chSel');
   const xformSel = qs('xformSel');
+  const mapSel = qs('mapSel');
+  const nfModeSel = qs('nfModeSel');
   const scaleSel = qs('scaleSel');
   const lblSel = qs('lblSel');
   const vminEl = qs('vmin');
@@ -67,7 +69,7 @@
     pendingUi: null,
     applyingRemote: false,
     nf: {frames: [], lastT: -Infinity},
-    bp: {meta: null, frames: [], lastT: -Infinity, rollingMin: null, rollingMax: null, tmpCanvas: null, tmpW: 0, tmpH: 0, electrodesPx: []},
+    bp: {meta: null, frames: [], lastT: -Infinity, rollingMin: null, rollingMax: null, tmpCanvas: null, tmpW: 0, tmpH: 0, electrodesPx: [], baseline: null, reference: null, baselineSec: 10.0},
     art: {frames: [], latest: null, lastT: -Infinity},
   };
 
@@ -75,14 +77,14 @@
   let statsTimer = null;
 
   function fmt(x){
-    if(x===null || x===undefined || !isFinite(x)) return '—';
+    if(x===null || x===undefined || !Number.isFinite(x)) return '—';
     if(Math.abs(x) >= 100) return x.toFixed(1);
     if(Math.abs(x) >= 10) return x.toFixed(2);
     return x.toFixed(3);
   }
 
   function fmtAgeSec(age){
-    if(age===null || age===undefined || !isFinite(age)) return '—';
+    if(age===null || age===undefined || !Number.isFinite(age)) return '—';
     if(age < 1.0) return '<1s';
     if(age < 60) return `${Math.round(age)}s`;
     const m = Math.floor(age/60); const s = Math.round(age - 60*m);
@@ -160,6 +162,9 @@
           'qc_bad_channel_count','qc_bad_channels','biotrace_ui','export_derived_events'
         ];
         renderKvGrid(runMetaKv, rm.summary, order);
+        // Cache baseline duration for client-side z-scoring.
+        const bs = rm.summary.baseline_seconds;
+        if(typeof bs === 'number' && Number.isFinite(bs) && bs > 0){ state.bp.baselineSec = bs; }
       }
       if(rm && rm.parse_error){
         if(runMetaRaw) runMetaRaw.textContent = `Parse error: ${rm.parse_error}`;
@@ -176,7 +181,7 @@
   }
 
   function xformValue(v){
-    if(v===null || v===undefined || !isFinite(v)) return null;
+    if(v===null || v===undefined || !Number.isFinite(v)) return null;
     const mode = (xformSel && xformSel.value) ? xformSel.value : 'linear';
     if(mode === 'linear') return v;
     const eps = 1e-12;
@@ -186,6 +191,103 @@
     return v;
   }
 
+  function nfMode(){
+    return (nfModeSel && nfModeSel.value) ? nfModeSel.value : 'raw';
+  }
+
+  function nfPick(f){
+    const mode = nfMode();
+    const raw = {metric: f.metric, threshold: f.threshold, label: 'raw'};
+    if(mode === 'zbase'){
+      const mz = (f.metric_z !== undefined) ? f.metric_z : null;
+      const tz = (f.threshold_z !== undefined) ? f.threshold_z : null;
+      if(mz !== null || tz !== null) return {metric: mz, threshold: tz, label: 'z (baseline)'};
+    }
+    if(mode === 'zref'){
+      const mz = (f.metric_z_ref !== undefined) ? f.metric_z_ref : null;
+      const tz = (f.threshold_z_ref !== undefined) ? f.threshold_z_ref : null;
+      if(mz !== null || tz !== null) return {metric: mz, threshold: tz, label: 'z (reference)'};
+    }
+    return raw;
+  }
+
+  function mapMode(){
+    return (mapSel && mapSel.value) ? mapSel.value : 'raw';
+  }
+
+  function ensureBaselineStats(nCols){
+    if(state.bp.baseline && state.bp.baseline.n && state.bp.baseline.n.length === nCols) return;
+    state.bp.baseline = {n: new Array(nCols).fill(0), mean: new Array(nCols).fill(0), m2: new Array(nCols).fill(0)};
+  }
+
+  function baselineUpdate(vals){
+    if(!Array.isArray(vals)) return;
+    ensureBaselineStats(vals.length);
+    const b = state.bp.baseline;
+    for(let i=0;i<vals.length;i++){
+      const x = vals[i];
+      if(x === null || x === undefined || !Number.isFinite(x)) continue;
+      const n1 = b.n[i] + 1;
+      b.n[i] = n1;
+      const delta = x - b.mean[i];
+      b.mean[i] += delta / n1;
+      const delta2 = x - b.mean[i];
+      b.m2[i] += delta * delta2;
+    }
+  }
+
+  function baselineZ(i, x){
+    const b = state.bp.baseline;
+    if(!b || !b.n || i<0 || i>=b.n.length) return null;
+    const n = b.n[i];
+    if(n < 5) return null;
+    const var_ = b.m2[i] / Math.max(1, (n - 1));
+    const sd = Math.sqrt(var_);
+    if(!(sd > 0) || !Number.isFinite(sd)) return null;
+    return (x - b.mean[i]) / sd;
+  }
+
+  function referenceZ(i, x){
+    const ref = state.bp.reference;
+    if(!ref || !ref.stdevs || !ref.means) return null;
+    if(i<0 || i>=ref.means.length) return null;
+    const m = ref.means[i];
+    const sd = ref.stdevs[i];
+    if(m === null || m === undefined || sd === null || sd === undefined) return null;
+    if(!Number.isFinite(m) || !Number.isFinite(sd) || !(sd > 0)) return null;
+    return (x - m) / sd;
+  }
+
+  function bpDisplayValue(colIdx, rawVal){
+    const mode = mapMode();
+    if(rawVal === null || rawVal === undefined || !Number.isFinite(rawVal)) return null;
+    if(mode === 'raw') return xformValue(rawVal);
+    if(mode === 'zbase') return baselineZ(colIdx, rawVal);
+    if(mode === 'zref') return referenceZ(colIdx, rawVal);
+    return xformValue(rawVal);
+  }
+
+  async function loadReference(){
+    if(!TOKEN) return;
+    try{
+      const r = await fetch(`/api/reference?token=${encodeURIComponent(TOKEN)}`);
+      if(!r.ok) return;
+      const obj = await r.json();
+      if(obj && obj.aligned){
+        state.bp.reference = {
+          bands: obj.aligned.bands,
+          channels: obj.aligned.channels,
+          means: obj.aligned.means,
+          stdevs: obj.aligned.stdevs,
+          present: obj.aligned.present,
+          meta: obj.meta || null,
+        };
+        dirtyBp = true;
+        scheduleRender();
+      }
+    }catch(e){}
+  }
+
   function updateStats(){
     const f = state.nf.frames.length ? state.nf.frames[state.nf.frames.length-1] : null;
     const a = state.art.latest;
@@ -193,8 +295,10 @@
     const add = (k,v) => parts.push(`<span>${k}</span><b>${v}</b>`);
     if(f){
       add('t (s)', fmt(f.t));
-      add('metric', fmt(f.metric));
-      add('threshold', fmt(f.threshold));
+      const picked = nfPick(f);
+      add('nf_mode', picked.label);
+      add('metric', fmt(picked.metric));
+      add('threshold', fmt(picked.threshold));
       add('reward', (f.reward? '1':'0'));
       add('reward_rate', fmt(f.reward_rate));
       if(f.artifact_ready!==null && f.artifact_ready!==undefined) add('artifact_ready', String(f.artifact_ready));
@@ -258,8 +362,9 @@
 
     let yMin = Infinity, yMax = -Infinity;
     for(const f of vis){
-      if(isFinite(f.metric)){ yMin = Math.min(yMin, f.metric); yMax = Math.max(yMax, f.metric); }
-      if(isFinite(f.threshold)){ yMin = Math.min(yMin, f.threshold); yMax = Math.max(yMax, f.threshold); }
+      const pv = nfPick(f);
+      if(Number.isFinite(pv.metric)){ yMin = Math.min(yMin, pv.metric); yMax = Math.max(yMax, pv.metric); }
+      if(Number.isFinite(pv.threshold)){ yMin = Math.min(yMin, pv.threshold); yMax = Math.max(yMax, pv.threshold); }
     }
     if(!(yMax>yMin)) { yMax = yMin + 1; }
     const pad = 0.05*(yMax-yMin);
@@ -330,7 +435,8 @@
     for(let i=0;i<vis.length;i++){
       const f = vis[i];
       const xx = x(f.t);
-      const yy = y(f.metric);
+      const pv = nfPick(f);
+      const yy = y(pv.metric);
       if(i===0) ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy);
     }
     ctx.stroke();
@@ -343,7 +449,8 @@
     for(let i=0;i<vis.length;i++){
       const f = vis[i];
       const xx = x(f.t);
-      const yy = y(f.threshold);
+      const pv = nfPick(f);
+      const yy = y(pv.threshold);
       if(i===0) ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy);
     }
     ctx.stroke();
@@ -376,7 +483,7 @@
   }
 
   function valueToRgb(v, vmin, vmax){
-    if(v===null || v===undefined || !isFinite(v) || !(vmax>vmin)) return [42,52,64];
+    if(v===null || v===undefined || !Number.isFinite(v) || !(vmax>vmin)) return [42,52,64];
     let t = (v - vmin) / (vmax - vmin);
     if(t<0) t=0; if(t>1) t=1;
     const hue = (1 - t) * 240;
@@ -404,12 +511,15 @@
     let vals = null;
     if(latest && Array.isArray(latest.values) && latest.values.length >= (meta.bands.length*nCh)){
       vals = [];
-      for(let c=0;c<nCh;c++) vals.push(xformValue(latest.values[bIdx*nCh + c]));
+      for(let c=0;c<nCh;c++){
+        const col = bIdx*nCh + c;
+        vals.push(bpDisplayValue(col, latest.values[col]));
+      }
     }
 
     let vmin = Infinity, vmax = -Infinity;
     if(vals){
-      for(const v of vals){ if(v!==null && v!==undefined && isFinite(v)){ vmin=Math.min(vmin,v); vmax=Math.max(vmax,v);} }
+      for(const v of vals){ if(v!==null && v!==undefined && Number.isFinite(v)){ vmin=Math.min(vmin,v); vmax=Math.max(vmax,v);} }
     }
     if(!(vmax>vmin)) { vmin = 0; vmax = 1; }
 
@@ -424,8 +534,8 @@
       vmax = state.bp.rollingMax;
     }
 
-    vminEl.textContent = `min: ${isFinite(vmin)?vmin.toFixed(3):'—'}`;
-    vmaxEl.textContent = `max: ${isFinite(vmax)?vmax.toFixed(3):'—'}`;
+    vminEl.textContent = `min: ${Number.isFinite(vmin)?vmin.toFixed(3):'—'}`;
+    vmaxEl.textContent = `max: ${Number.isFinite(vmax)?vmax.toFixed(3):'—'}`;
 
     resizeCanvasTo(topoCanvas);
     const w = topoCanvas.width, h = topoCanvas.height;
@@ -450,7 +560,7 @@
         const pos = meta.positions[i];
         const v = vals[i];
         if(!pos) continue;
-        if(v===null || v===undefined || !isFinite(v)) continue;
+        if(v===null || v===undefined || !Number.isFinite(v)) continue;
         pts.push({x:pos[0], y:pos[1], v});
       }
     }
@@ -571,14 +681,15 @@
     const vis = [];
     for(const f of frames){
       if(f.t >= tMin && f.values && f.values.length >= meta.bands.length*nCh){
-        vis.push({t:f.t, v:xformValue(f.values[bIdx*nCh + cIdx])});
+        const col = bIdx*nCh + cIdx;
+        vis.push({t:f.t, v:bpDisplayValue(col, f.values[col])});
       }
     }
     if(vis.length < 2) return;
 
     let yMin = Infinity, yMax = -Infinity;
     for(const p of vis){
-      if(p.v!==null && p.v!==undefined && isFinite(p.v)){
+      if(p.v!==null && p.v!==undefined && Number.isFinite(p.v)){
         yMin = Math.min(yMin, p.v);
         yMax = Math.max(yMax, p.v);
       }
@@ -637,7 +748,7 @@
     const t = Array.isArray(topics) ? topics.filter(Boolean).join(',') : String(topics||'');
     const qp = [];
     if(t){ qp.push(`topics=${encodeURIComponent(t)}`); }
-    if(hz && isFinite(hz) && hz > 0){ qp.push(`hz=${encodeURIComponent(String(hz))}`); }
+    if(Number.isFinite(hz) && hz > 0){ qp.push(`hz=${encodeURIComponent(String(hz))}`); }
     const q = qp.length ? ('&' + qp.join('&')) : '';
     const url = `/api/sse/stream?token=${encodeURIComponent(TOKEN)}${q}`;
     return new EventSource(url);
@@ -661,6 +772,8 @@
       transform: (xformSel && xformSel.value) ? xformSel.value : 'linear',
       scale: (scaleSel && scaleSel.value) ? scaleSel.value : 'auto',
       labels: (lblSel && lblSel.value) ? lblSel.value : 'on',
+      nf_mode: (nfModeSel && nfModeSel.value) ? nfModeSel.value : 'raw',
+      map_mode: (mapSel && mapSel.value) ? mapSel.value : 'raw',
       client_id: CLIENT_ID,
     };
   }
@@ -685,7 +798,7 @@
     if(!st || typeof st !== 'object') return;
     state.applyingRemote = true;
     try{
-      if(typeof st.win_sec === 'number' && isFinite(st.win_sec)){
+      if(typeof st.win_sec === 'number' && Number.isFinite(st.win_sec)){
         const v = Math.round(st.win_sec);
         // If the select doesn't have this value, keep existing.
         const opt = Array.from(winSel.options).find(o => parseInt(o.value,10) === v);
@@ -704,10 +817,19 @@
       if(typeof st.labels === 'string'){
         if(['on','off'].includes(st.labels)) lblSel.value = st.labels;
       }
+      if(typeof st.nf_mode === 'string'){
+        if(nfModeSel && ['raw','zbase','zref'].includes(st.nf_mode)) nfModeSel.value = st.nf_mode;
+      }
+      if(typeof st.map_mode === 'string'){
+        if(mapSel && ['raw','zbase','zref'].includes(st.map_mode)) mapSel.value = st.map_mode;
+      }
       // band/channel depend on meta; stash if not yet available.
       state.pendingUi = state.pendingUi || {};
       if(typeof st.band === 'string' && st.band) state.pendingUi.band = st.band;
       if(typeof st.channel === 'string' && st.channel) state.pendingUi.channel = st.channel;
+      dirtyNf = true;
+      dirtyBp = true;
+      scheduleRender();
     } finally {
       state.applyingRemote = false;
     }
@@ -754,6 +876,16 @@
   chSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); };
   lblSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); };
   xformSel.onchange = () => { state.bp.rollingMin = null; state.bp.rollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
+  if(mapSel){
+    mapSel.onchange = () => {
+      state.bp.rollingMin = null; state.bp.rollingMax = null;
+      if(mapSel.value === 'zref' && !state.bp.reference){ loadReference(); }
+      dirtyBp = true; scheduleRender(); schedulePushUiState();
+    };
+  }
+  if(nfModeSel){
+    nfModeSel.onchange = () => { dirtyNf = true; updateStats(); scheduleRender(); schedulePushUiState(); };
+  }
   scaleSel.onchange = () => { state.bp.rollingMin = null; state.bp.rollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
 
   function applyMeta(meta){
@@ -770,6 +902,7 @@
       const bandWas = bandSel.value;
       const chWas = chSel.value;
       state.bp.meta = bp;
+      if(newBands !== prevBands || newCh !== prevCh){ state.bp.baseline = null; state.bp.reference = null; }
       if(newBands !== prevBands){
         bandSel.innerHTML = '';
         for(const b of bp.bands){
@@ -790,6 +923,9 @@
       if(chWas && bp.channels.includes(chWas)) chSel.value = chWas;
       tryApplyPendingSelection();
     }
+    // Load normative reference (if provided by qeeg_nf_cli).
+    const refStat = meta.files_stat && meta.files_stat.reference_used;
+    if(refStat && refStat.exists && !state.bp.reference){ loadReference(); }
   }
 
   // ---------------- rendering + event handlers ----------------
@@ -856,7 +992,7 @@
       if(un.reset){ state.nf.frames = []; state.nf.lastT = -Infinity; }
       for(const f of un.frames){
         if(!f || typeof f !== 'object') continue;
-        if(f.t !== null && f.t !== undefined && isFinite(f.t)){
+        if(f.t !== null && f.t !== undefined && Number.isFinite(f.t)){
           if(f.t <= state.nf.lastT) continue;
           state.nf.lastT = f.t;
         }
@@ -875,14 +1011,19 @@
     if(state.paused) return;
     try{
       const un = unpackMsg(raw);
-      if(un.reset){ state.bp.frames = []; state.bp.lastT = -Infinity; state.bp.rollingMin = null; state.bp.rollingMax = null; }
+      if(un.reset){ state.bp.frames = []; state.bp.lastT = -Infinity; state.bp.rollingMin = null; state.bp.rollingMax = null; state.bp.baseline = null; }
       for(const f of un.frames){
         if(!f || typeof f !== 'object') continue;
-        if(f.t !== null && f.t !== undefined && isFinite(f.t)){
+        if(f.t !== null && f.t !== undefined && Number.isFinite(f.t)){
           if(f.t <= state.bp.lastT) continue;
           state.bp.lastT = f.t;
         }
         state.bp.frames.push(f);
+        // Collect baseline stats (client-side) for z-score mapping.
+        if(f && Array.isArray(f.values) && typeof f.t === 'number' && Number.isFinite(f.t)){
+          const badNow = state.art.latest && state.art.latest.bad;
+          if(!badNow && f.t <= (state.bp.baselineSec || 0)) baselineUpdate(f.values);
+        }
       }
       if(state.bp.frames.length > 20000) state.bp.frames.splice(0, state.bp.frames.length-20000);
       dirtyBp = true;
@@ -898,7 +1039,7 @@
       if(un.reset){ state.art.frames = []; state.art.lastT = -Infinity; state.art.latest = null; }
       for(const f of un.frames){
         if(!f || typeof f !== 'object') continue;
-        if(f.t !== null && f.t !== undefined && isFinite(f.t)){
+        if(f.t !== null && f.t !== undefined && Number.isFinite(f.t)){
           if(f.t <= state.art.lastT) continue;
           state.art.lastT = f.t;
         }
@@ -1080,7 +1221,7 @@
 
     function applyTopic(topic, payload, handler){
       if(!payload || typeof payload !== 'object') return;
-      if(typeof payload.cursor === 'number' && isFinite(payload.cursor)){
+      if(typeof payload.cursor === 'number' && Number.isFinite(payload.cursor)){
         cur[topic] = payload.cursor;
       }
       if(payload.batch){
