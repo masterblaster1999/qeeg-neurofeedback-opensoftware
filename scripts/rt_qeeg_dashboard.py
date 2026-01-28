@@ -23,11 +23,16 @@ Tested with Python 3.8+.
 
 from __future__ import annotations
 
+import datetime
+
 import argparse
 import csv
 import json
 import hashlib
 import math
+import mimetypes
+import tempfile
+import zipfile
 import os
 import socket
 import secrets
@@ -38,12 +43,12 @@ import traceback
 import webbrowser
 from collections import deque
 from dataclasses import dataclass
-from email.utils import formatdate
+from email.utils import formatdate, parsedate_to_datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, quote
 
 
 # ---------------------------------------------------------------------------
@@ -758,9 +763,10 @@ class CsvTailer:
 
     """Incrementally tails a CSV file that is appended over time."""
 
-    def __init__(self, path: Path, *, max_initial_rows: int = 1200):
+    def __init__(self, path: Path, *, max_initial_rows: int = 1200, stop_event: Optional[threading.Event] = None):
         self.path = path
         self.max_initial_rows = max_initial_rows
+        self.stop_event = stop_event
         self._fp = None  # type: Optional[object]
         self._buf = b""
         self._header: Optional[List[str]] = None
@@ -775,21 +781,30 @@ class CsvTailer:
         finally:
             self._fp = None
 
-    def _open_wait(self, timeout: float = 0.0) -> None:
+    def _open_wait(self, timeout: float = 0.0, stop_event: Optional[threading.Event] = None) -> None:
         t0 = time.time()
+        se = stop_event if stop_event is not None else self.stop_event
         while True:
+            if se is not None and se.is_set():
+                raise InterruptedError("Stopped")
             if self.path.exists() and self.path.stat().st_size > 0:
                 self._fp = self.path.open("rb")
                 self._buf = b""
                 # Read header line.
                 while True:
+                    if se is not None and se.is_set():
+                        raise InterruptedError("Stopped")
                     line = self._fp.readline()
                     if not line:
                         # No data yet.
+                        if se is not None and se.is_set():
+                            raise InterruptedError("Stopped")
                         time.sleep(0.05)
                         continue
                     if b"\n" not in line and b"\r" not in line:
                         # Incomplete line; keep waiting.
+                        if se is not None and se.is_set():
+                            raise InterruptedError("Stopped")
                         time.sleep(0.05)
                         continue
                     hdr = next(csv.reader([line.decode("utf-8", errors="replace")]))
@@ -797,6 +812,8 @@ class CsvTailer:
                     return
             if timeout > 0 and (time.time() - t0) >= timeout:
                 raise TimeoutError(f"Timed out waiting for file: {self.path}")
+            if se is not None and se.is_set():
+                raise InterruptedError("Stopped")
             time.sleep(0.1)
 
     def _ensure_open(self) -> None:
@@ -811,7 +828,7 @@ class CsvTailer:
                 self.close()
 
         if self._fp is None:
-            self._open_wait(timeout=0.0)
+            self._open_wait(timeout=0.0, stop_event=self.stop_event)
 
     def read_initial_rows(self) -> List[List[str]]:
         """Return up to max_initial_rows from the existing file (tail)."""
@@ -838,6 +855,7 @@ class CsvTailer:
 
         If stop_event is provided, the generator exits promptly when it is set.
         """
+        stop_event = stop_event if stop_event is not None else self.stop_event
         self._ensure_open()
         assert self._fp is not None
 
@@ -1185,8 +1203,28 @@ class LiveHub:
         for t in self._threads:
             t.start()
 
-    def stop(self) -> None:
+    def stop(self, *, join_timeout_sec: float = 1.5) -> None:
+        """Request worker threads to stop (best effort).
+
+        The LiveHub workers run as daemon threads (so they won't prevent process exit),
+        but joining them helps keep tests and programmatic use tidy.
+        """
         self._stop.set()
+
+        # Best-effort: join workers so selftests don't leave stray background activity.
+        threads = list(self._threads or [])
+        if not threads:
+            return
+
+        # Split the timeout across threads to avoid an unbounded wait.
+        per = float(join_timeout_sec) / float(max(1, len(threads)))
+        for t in threads:
+            if t is threading.current_thread():
+                continue
+            try:
+                t.join(timeout=max(0.0, per))
+            except Exception:
+                pass
 
     def latest_meta(self) -> Dict[str, object]:
         if self._last_meta is not None:
@@ -1218,7 +1256,7 @@ class LiveHub:
     def _run_nf(self) -> None:
         path = self.outdir / "nf_feedback.csv"
         while not self._stop.is_set():
-            tailer = CsvTailer(path, max_initial_rows=self.history_rows)
+            tailer = CsvTailer(path, max_initial_rows=self.history_rows, stop_event=self._stop)
             try:
                 init_rows = tailer.read_initial_rows()
                 header = tailer.header() or []
@@ -1305,7 +1343,7 @@ class LiveHub:
     def _run_artifact(self) -> None:
         path = self.outdir / "artifact_gate_timeseries.csv"
         while not self._stop.is_set():
-            tailer = CsvTailer(path, max_initial_rows=self.history_rows)
+            tailer = CsvTailer(path, max_initial_rows=self.history_rows, stop_event=self._stop)
             try:
                 init_rows = tailer.read_initial_rows()
                 header = tailer.header() or []
@@ -1343,7 +1381,7 @@ class LiveHub:
     def _run_bandpower(self) -> None:
         path = self.outdir / "bandpower_timeseries.csv"
         while not self._stop.is_set():
-            tailer = CsvTailer(path, max_initial_rows=self.history_rows)
+            tailer = CsvTailer(path, max_initial_rows=self.history_rows, stop_event=self._stop)
             try:
                 init_rows = tailer.read_initial_rows()
                 header = tailer.header() or []
@@ -1462,6 +1500,119 @@ def _http_date(ts: float) -> str:
         return formatdate(timeval=time.time(), usegmt=True)
 
 
+
+def _parse_http_date(value: str) -> Optional[float]:
+    """Parse an HTTP-date header into a UNIX timestamp (UTC).
+
+    Returns None if the value cannot be parsed.
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+    try:
+        dt = parsedate_to_datetime(v)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = dt.astimezone(datetime.timezone.utc)
+        return float(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _if_modified_since_matches(header_value: str, mtime_utc: float) -> bool:
+    """Return True if If-Modified-Since indicates the resource is not modified."""
+    ts = _parse_http_date(header_value)
+    if ts is None:
+        return False
+    # HTTP-date has 1-second resolution; treat <= as not modified.
+    return float(mtime_utc) <= float(ts)
+
+
+def _parse_single_byte_range(range_header: str, size_bytes: int) -> Optional[Tuple[int, int]]:
+    """Parse a single HTTP Range header (bytes=...).
+
+    Supports:
+      - bytes=START-END
+      - bytes=START-
+      - bytes=-SUFFIX
+
+    Returns (start,end) inclusive, or None if invalid/unsatisfiable.
+
+    Note: multiple ranges (comma-separated) are intentionally not supported.
+    """
+    hv = (range_header or "").strip()
+    if not hv:
+        return None
+    if not hv.lower().startswith("bytes="):
+        return None
+    spec = hv[len("bytes=") :].strip()
+    if not spec:
+        return None
+    if "," in spec:
+        return None
+    if "-" not in spec:
+        return None
+
+    if size_bytes <= 0:
+        return None
+
+    a, b = spec.split("-", 1)
+    a = a.strip()
+    b = b.strip()
+
+    # Suffix range: last N bytes.
+    if a == "":
+        if b == "":
+            return None
+        try:
+            suf = int(b)
+        except Exception:
+            return None
+        if suf <= 0:
+            return None
+        if suf >= size_bytes:
+            return (0, size_bytes - 1)
+        return (max(0, size_bytes - suf), size_bytes - 1)
+
+    try:
+        start = int(a)
+    except Exception:
+        return None
+    if start < 0 or start >= size_bytes:
+        return None
+
+    if b == "":
+        return (start, size_bytes - 1)
+
+    try:
+        end = int(b)
+    except Exception:
+        return None
+    if end < start:
+        return None
+    end = min(end, size_bytes - 1)
+    return (start, end)
+
+
+def _if_range_allows(range_validator: str, etag: str, mtime_utc: float) -> bool:
+    """Return True if If-Range permits serving a Range response."""
+    v = (range_validator or "").strip()
+    if not v:
+        return True
+
+    # ETag validators are quoted or weak/strong forms.
+    if v.startswith("W/") or v.startswith('"'):
+        return v == etag
+
+    # Otherwise treat as HTTP-date.
+    ts = _parse_http_date(v)
+    if ts is None:
+        return False
+    return float(mtime_utc) <= float(ts)
+
 def _weak_etag_from_stat(size_bytes: int, mtime_utc: float) -> str:
     """Generate a weak ETag from file size + mtime."""
     try:
@@ -1513,11 +1664,41 @@ _MIME_MAP: Dict[str, str] = {
     ".js": "application/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".tsv": "text/tab-separated-values; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".bmp": "image/bmp",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".wav": "audio/wav",
+    ".zip": "application/zip",
 }
 
 
 def _guess_mime(path: Path) -> str:
-    return _MIME_MAP.get(path.suffix.lower(), "application/octet-stream")
+    """Best-effort MIME type for static assets and downloadable files.
+
+    Uses an explicit map first (stable across platforms) and falls back to the
+    Python mimetypes registry.
+    """
+    ext = path.suffix.lower()
+    mt = _MIME_MAP.get(ext)
+    if mt:
+        return mt
+    try:
+        guess, _enc = mimetypes.guess_type(str(path))
+        if guess:
+            # Add charset for text-like types.
+            if guess.startswith("text/") or guess in ("application/json", "application/xml"):
+                return f"{guess}; charset=utf-8"
+            return guess
+    except Exception:
+        pass
+    return "application/octet-stream"
 
 
 def _stat_dict(p: Path) -> Dict[str, object]:
@@ -1543,6 +1724,126 @@ def _safe_read_file(path: Path, *, max_bytes: int = 2_000_000) -> Optional[bytes
         return None
 
 
+
+
+# ------------------------ safe downloads / bundling ------------------------
+
+_ALLOWED_DOWNLOAD_EXTS: Tuple[str, ...] = (
+    ".csv",
+    ".tsv",
+    ".json",
+    ".txt",
+    ".html",
+    ".bmp",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".wav",
+    ".zip",
+)
+
+# Maximum single-file download size (bytes). Files larger than this are rejected.
+_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200 MiB
+
+# Bundle guardrails.
+_MAX_BUNDLE_TOTAL_BYTES = 350 * 1024 * 1024  # 350 MiB across all files
+_MAX_BUNDLE_FILES = 250
+
+
+def _is_safe_rel_name(name: str) -> bool:
+    """Return True if name is a simple, safe relative filename."""
+    if not isinstance(name, str):
+        return False
+    n = (name or "").strip()
+    if not n:
+        return False
+    if len(n) > 240:
+        return False
+    if n in (".", ".."):
+        return False
+    if "/" in n or "\\" in n:
+        return False
+    if n.startswith("."):
+        return False
+    if ".." in n:
+        return False
+    return True
+
+
+def _sanitize_download_filename(name: str) -> str:
+    """Sanitize a filename for Content-Disposition."""
+    n = (name or "download").strip()
+    out = []
+    for ch in n:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            out.append(ch)
+        else:
+            out.append("_")
+    s = "".join(out)
+    s = s.strip("._")
+    if not s:
+        s = "download"
+    return s[:120]
+
+
+def _safe_outdir_file(outdir: Path, name: str) -> Optional[Path]:
+    """Resolve <outdir>/<name> safely (prevent traversal + symlink escapes)."""
+    if not _is_safe_rel_name(name):
+        return None
+
+    ext = Path(name).suffix.lower()
+    if ext and ext not in _ALLOWED_DOWNLOAD_EXTS:
+        return None
+    if not ext:
+        return None
+
+    try:
+        base = outdir.resolve()
+    except Exception:
+        base = outdir
+
+    cand = outdir / name
+    try:
+        cand_res = cand.resolve()
+    except Exception:
+        cand_res = cand
+
+    # Must remain within outdir after resolving symlinks.
+    if cand_res == base or (base not in cand_res.parents):
+        return None
+
+    try:
+        if not cand_res.is_file():
+            return None
+    except Exception:
+        return None
+
+    return cand_res
+
+
+def _file_category(name: str) -> str:
+    """Rough categorization used by /api/files and the UI."""
+    n = (name or "").lower()
+    if n in (
+        "nf_feedback.csv",
+        "bandpower_timeseries.csv",
+        "artifact_gate_timeseries.csv",
+        "nf_run_meta.json",
+        "nf_summary.json",
+        "reference_used.csv",
+        "baseline_used.csv",
+        "nf_topomap_latest.bmp",
+    ):
+        return "core"
+    if n in ("rt_dashboard_state.json", "biotrace_ui.html", "nf_live_ui.html"):
+        return "ui"
+    if n.startswith("nf_derived_events"):
+        return "events"
+    if n.endswith("_report.html") or "reports" in n:
+        return "report"
+    return "other"
 DASH_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -2640,6 +2941,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if cache_control:
             self.send_header("Cache-Control", cache_control)
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        if content_type and str(content_type).lower().startswith("text/html"):
+            # Allow both the external frontend (no inline) and the embedded fallback (inline).
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; "
+                "img-src 'self' data:; "
+                "style-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "connect-src 'self'; "
+                "object-src 'none'; "
+                "base-uri 'none'; "
+                "frame-ancestors 'none'",
+            )
         if etag:
             self.send_header("ETag", etag)
         if last_modified:
@@ -2668,7 +2986,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             last_modified=last_modified,
             extra_headers=extra_headers,
         )
-        if body:
+        if body and self.command != 'HEAD':
             try:
                 self.wfile.write(body)
             except BrokenPipeError:
@@ -2699,6 +3017,164 @@ class DashboardHandler(BaseHTTPRequestHandler):
             cache_control="no-store",
         )
 
+    def _send_file_path(
+        self,
+        path: Path,
+        *,
+        content_type: Optional[str] = None,
+        download_name: Optional[str] = None,
+        cache_control: str = "no-store",
+        max_bytes: int = _MAX_DOWNLOAD_BYTES,
+    ) -> None:
+        """Stream a file response to the client.
+
+        - Adds ETag/Last-Modified for caching.
+        - Supports If-None-Match / If-Modified-Since -> 304.
+        - Supports single-range byte requests (Range / If-Range) -> 206.
+        - Uses chunked streaming to avoid loading large files into memory.
+
+        Notes:
+        - Multiple ranges (comma-separated) are intentionally not supported.
+        - Range is only honored for "bytes".
+        """
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            self._send_json_error(HTTPStatus.NOT_FOUND, "File not found", error_code="not_found")
+            return
+        except Exception as e:
+            self._send_json_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Failed to stat file: {e}", error_code="stat_failed")
+            return
+
+        size = int(getattr(st, "st_size", 0) or 0)
+        if size > int(max_bytes):
+            self._send_json_error(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                f"File too large ({size} bytes) for this endpoint",
+                error_code="too_large",
+            )
+            return
+
+        mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
+        etag = _weak_etag_from_stat(size, mtime)
+        last_mod = _http_date(mtime)
+
+        # Conditional GET/HEAD: prefer ETag; fall back to Last-Modified.
+        inm = str(self.headers.get("If-None-Match", "") or "")
+        if etag and _if_none_match_matches(inm, etag):
+            self._send_not_modified(cache_control=cache_control, etag=etag, last_modified=last_mod)
+            return
+
+        ims = str(self.headers.get("If-Modified-Since", "") or "")
+        if ims and _if_modified_since_matches(ims, mtime):
+            self._send_not_modified(cache_control=cache_control, etag=etag, last_modified=last_mod)
+            return
+
+        ct = content_type or _guess_mime(path)
+
+        # Range handling (single range only).
+        range_header = str(self.headers.get("Range", "") or "")
+        want_range = bool(range_header and range_header.strip().lower().startswith("bytes="))
+
+        if want_range:
+            if_range = str(self.headers.get("If-Range", "") or "")
+            # If-Range mismatch -> ignore Range and send full body.
+            if if_range and not _if_range_allows(if_range, etag, mtime):
+                want_range = False
+
+        status = HTTPStatus.OK
+        start = 0
+        end = max(0, size - 1)
+        out_len = size
+
+        extra: Dict[str, str] = {"Accept-Ranges": "bytes"}
+
+        if want_range:
+            rng = _parse_single_byte_range(range_header, size)
+            if rng is None:
+                msg = b"Requested range not satisfiable\n"
+                extra.update(
+                    {
+                        "Content-Range": f"bytes */{size}",
+                        "Content-Length": str(len(msg)),
+                    }
+                )
+                if download_name:
+                    safe_name = _sanitize_download_filename(download_name)
+                    extra["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+
+                self._send(
+                    HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+                    msg,
+                    "text/plain; charset=utf-8",
+                    cache_control="no-store",
+                    etag=etag,
+                    last_modified=last_mod,
+                    extra_headers=extra,
+                )
+                return
+
+            start, end = rng
+            status = HTTPStatus.PARTIAL_CONTENT
+            out_len = int((end - start) + 1)
+            extra["Content-Range"] = f"bytes {start}-{end}/{size}"
+            extra["Content-Length"] = str(out_len)
+        else:
+            extra["Content-Length"] = str(size)
+
+        if download_name:
+            safe_name = _sanitize_download_filename(download_name)
+            extra["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+
+        self._send_headers(
+            status,
+            content_type=ct,
+            cache_control=cache_control,
+            etag=etag,
+            last_modified=last_mod,
+            extra_headers=extra,
+        )
+
+        # HEAD: headers only.
+        if self.command == "HEAD":
+            return
+
+        try:
+            with path.open("rb") as f:
+                if status == HTTPStatus.PARTIAL_CONTENT:
+                    try:
+                        f.seek(int(start))
+                    except Exception:
+                        f.seek(0)
+
+                    remaining = int(out_len)
+                    while remaining > 0:
+                        chunk = f.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        try:
+                            self.wfile.write(chunk)
+                        except BrokenPipeError:
+                            break
+                        remaining -= len(chunk)
+                else:
+                    while True:
+                        chunk = f.read(64 * 1024)
+                        if not chunk:
+                            break
+                        try:
+                            self.wfile.write(chunk)
+                        except BrokenPipeError:
+                            break
+        except BrokenPipeError:
+            pass
+        except Exception:
+            # Connection might be closed; ignore.
+            pass
+
+
+
+
     def _require_token(self) -> bool:
         q = parse_qs(urlparse(self.path).query)
         tok = (q.get("token") or [""])[0]
@@ -2727,6 +3203,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send(HTTPStatus.BAD_REQUEST, b"Invalid JSON\n")
             return None
+
+
+    def do_HEAD(self) -> None:
+        """Handle HEAD requests.
+
+        We delegate to do_GET() while suppressing bodies inside _send()/_send_file_path().
+        SSE endpoints are explicitly rejected because a HEAD request should not open
+        a long-lived event stream.
+        """
+        try:
+            p = urlparse(self.path).path
+            if p.startswith('/api/sse/'):
+                self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"Method not allowed\n")
+                return
+        except Exception:
+            pass
+        # Reuse the GET routing logic (responses will omit bodies for HEAD).
+        self.do_GET()
 
 
     def do_GET(self) -> None:
@@ -2872,6 +3366,70 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "parse_error": parse_error,
                 }
                 self._send_json(HTTPStatus.OK, resp, cache_control="no-cache", etag=etag, last_modified=last_mod)
+                return
+
+
+            if path == "/api/files":
+                if not self._require_token():
+                    return
+                self._send_json(HTTPStatus.OK, self.server.build_files(), cache_control="no-cache")
+                return
+
+            if path == "/api/file":
+                if not self._require_token():
+                    return
+                q = parse_qs(u.query)
+                name = ((q.get("name") or q.get("file") or [""])[0] or "").strip()
+                if not name:
+                    self._send_json_error(HTTPStatus.BAD_REQUEST, "Missing name=...", error_code="bad_request")
+                    return
+
+                pth = _safe_outdir_file(self.server.config.outdir, name)
+                if pth is None:
+                    self._send_json_error(HTTPStatus.NOT_FOUND, "File not found (or not allowed)", error_code="not_found")
+                    return
+
+                dl_flag = ((q.get("download") or [""])[0] or "").strip().lower()
+                want_download = dl_flag in ("1", "true", "yes", "y", "on")
+
+                # For safety, default to attachment when download=1.
+                self._send_file_path(
+                    pth,
+                    content_type=_guess_mime(pth),
+                    download_name=name if want_download else None,
+                    cache_control="no-cache",
+                    max_bytes=int(_MAX_DOWNLOAD_BYTES),
+                )
+                return
+
+            if path in ("/api/bundle", "/api/bundle.zip"):
+                if not self._require_token():
+                    return
+                q = parse_qs(u.query)
+                names_raw = ((q.get("names") or q.get("files") or [""])[0] or "").strip()
+                requested = None
+                if names_raw:
+                    requested = [n.strip() for n in names_raw.split(",") if n.strip()]
+
+                try:
+                    zip_path, _manifest = self.server.create_bundle_zip(requested)
+                except Exception as e:
+                    self._send_json_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Failed to build bundle: {e}", error_code="bundle_error")
+                    return
+
+                try:
+                    self._send_file_path(
+                        zip_path,
+                        content_type="application/zip",
+                        download_name="qeeg_session_bundle.zip",
+                        cache_control="no-store",
+                        max_bytes=int(_MAX_BUNDLE_TOTAL_BYTES) + 50 * 1024 * 1024,
+                    )
+                finally:
+                    try:
+                        zip_path.unlink()
+                    except Exception:
+                        pass
                 return
 
             if path == "/api/topomap_latest":
@@ -3087,16 +3645,32 @@ class DashboardServer(ThreadingHTTPServer):
         except Exception:
             pass
 
-    def _sse_send(self, handler: DashboardHandler, obj: object, *, event: Optional[str] = None) -> bool:
+    def _sse_send(
+        self,
+        handler: DashboardHandler,
+        obj: object,
+        *,
+        event: Optional[str] = None,
+        id: Optional[object] = None,
+    ) -> bool:
         """Send an SSE message.
 
-        If event is provided, the message is sent as a named event:
+        Supports the standard SSE fields:
+          id: <id>\n
           event: <name>\n
           data: <json>\n\n
+
+        If 'id' is provided, browsers will store it as the stream's lastEventId and
+        automatically send it back on reconnect via the Last-Event-ID header.
         """
         try:
             data = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
             parts: List[str] = []
+            if id is not None:
+                # Defensive: SSE id values are line-oriented.
+                sid = str(id).replace("\n", " ").replace("\r", " ").strip()
+                if sid:
+                    parts.append(f"id: {sid}\n")
             if event:
                 # Defensive: EventSource event names are line-oriented.
                 ev = str(event).replace("\n", " ").replace("\r", " ").strip()
@@ -3182,10 +3756,200 @@ class DashboardServer(ThreadingHTTPServer):
                 "reference": True,
                 "baseline": True,
                 "asset_etag": True,
+                "files": True,
+                "file_download": True,
+                "bundle_download": True,
             },
         }
 
     
+
+
+    # ------------------------ downloads API helpers ------------------------
+
+    def list_downloadable_files(self) -> List[Dict[str, object]]:
+        """Enumerate downloadable files in outdir.
+
+        This is intentionally conservative:
+        - Only files directly under outdir (no subdirs).
+        - Only extensions in _ALLOWED_DOWNLOAD_EXTS.
+        - Symlink escapes / path traversal are blocked via _safe_outdir_file().
+        """
+        out: List[Dict[str, object]] = []
+        outdir = self.config.outdir
+
+        try:
+            names = sorted([pp.name for pp in outdir.iterdir()])
+        except Exception:
+            names = []
+
+        for name in names:
+            pth = _safe_outdir_file(outdir, name)
+            if pth is None:
+                continue
+            st = _stat_dict(pth)
+            if not bool(st.get('exists')):
+                continue
+
+            size = int(st.get('size_bytes', 0) or 0)
+            mtime = float(st.get('mtime_utc', 0.0) or 0.0)
+            etag: Optional[str] = None
+            last_mod: Optional[str] = None
+            try:
+                etag = _weak_etag_from_stat(size, mtime)
+                last_mod = _http_date(mtime)
+            except Exception:
+                etag = None
+                last_mod = None
+
+            downloadable = bool(size <= int(_MAX_DOWNLOAD_BYTES))
+            cat = _file_category(name)
+            mime = _guess_mime(pth)
+
+            out.append(
+                {
+                    'name': name,
+                    'path': str(pth),
+                    'category': cat,
+                    'mime': mime,
+                    'stat': st,
+                    'etag': etag,
+                    'last_modified': last_mod,
+                    'downloadable': downloadable,
+                    'url': f"/api/file?name={quote(name)}",
+                    'download_url': f"/api/file?name={quote(name)}&download=1",
+                }
+            )
+
+        # Stable ordering: core -> ui -> events -> report -> other, then name.
+        cat_order = {'core': 0, 'ui': 1, 'events': 2, 'report': 3, 'other': 4}
+        out.sort(key=lambda e: (cat_order.get(str(e.get('category')), 99), str(e.get('name'))))
+        return out
+
+    def build_files(self) -> Dict[str, object]:
+        """Build JSON response for /api/files."""
+        return {
+            'schema_version': 1,
+            'server_time_utc': float(time.time()),
+            'server_instance_id': self.instance_id,
+            'outdir': str(self.config.outdir),
+            'max_download_bytes': int(_MAX_DOWNLOAD_BYTES),
+            'bundle_url': '/api/bundle',
+            'files': self.list_downloadable_files(),
+        }
+
+    def create_bundle_zip(self, requested_names: Optional[List[str]] = None) -> Tuple[Path, Dict[str, object]]:
+        """Create a temporary zip bundle of output files.
+
+        Returns: (zip_path, manifest_dict)
+        Caller is responsible for deleting zip_path after sending.
+        """
+        all_entries = self.list_downloadable_files()
+        name_to_path: Dict[str, Path] = {}
+        name_to_stat: Dict[str, Dict[str, object]] = {}
+        for e in all_entries:
+            nm = str(e.get('name') or '')
+            pp = str(e.get('path') or '')
+            if nm and pp:
+                name_to_path[nm] = Path(pp)
+                st = e.get('stat')
+                if isinstance(st, dict):
+                    name_to_stat[nm] = st
+
+        # Build selection list.
+        selected: List[str] = []
+        if requested_names:
+            for nm in requested_names:
+                n2 = (nm or '').strip()
+                if not n2:
+                    continue
+                if n2 not in selected:
+                    selected.append(n2)
+        else:
+            selected = [str(e.get('name')) for e in all_entries if e.get('name')]
+
+        included: List[Dict[str, object]] = []
+        skipped: List[Dict[str, object]] = []
+        total = 0
+
+        # Limit file count defensively.
+        if len(selected) > int(_MAX_BUNDLE_FILES):
+            skipped.append({'name': '*', 'reason': f'too_many_files>{int(_MAX_BUNDLE_FILES)}'})
+            selected = selected[: int(_MAX_BUNDLE_FILES)]
+
+        # Create temp file.
+        tmpf = tempfile.NamedTemporaryFile(prefix='qeeg_session_', suffix='.zip', delete=False)
+        tmp_path = Path(tmpf.name)
+        try:
+            tmpf.close()
+        except Exception:
+            pass
+
+        compression = getattr(zipfile, 'ZIP_DEFLATED', zipfile.ZIP_STORED)
+
+        manifest: Dict[str, object] = {
+            'schema_version': 1,
+            'server_time_utc': float(time.time()),
+            'server_instance_id': self.instance_id,
+            'outdir': str(self.config.outdir),
+            'requested_names': requested_names or None,
+            'limits': {
+                'max_download_bytes': int(_MAX_DOWNLOAD_BYTES),
+                'max_bundle_total_bytes': int(_MAX_BUNDLE_TOTAL_BYTES),
+                'max_bundle_files': int(_MAX_BUNDLE_FILES),
+            },
+            'included': included,
+            'skipped': skipped,
+        }
+
+        try:
+            with zipfile.ZipFile(str(tmp_path), 'w', compression=compression) as z:
+                for nm in selected:
+                    # Verify again through the safe resolver.
+                    pth = _safe_outdir_file(self.config.outdir, nm)
+                    if pth is None:
+                        skipped.append({'name': nm, 'reason': 'not_allowed_or_missing'})
+                        continue
+
+                    try:
+                        st = pth.stat()
+                        size = int(st.st_size)
+                        mtime = float(st.st_mtime)
+                    except Exception:
+                        skipped.append({'name': nm, 'reason': 'stat_failed'})
+                        continue
+
+                    if size > int(_MAX_DOWNLOAD_BYTES):
+                        skipped.append({'name': nm, 'reason': f'too_large>{int(_MAX_DOWNLOAD_BYTES)}'})
+                        continue
+
+                    if (total + size) > int(_MAX_BUNDLE_TOTAL_BYTES):
+                        skipped.append({'name': nm, 'reason': f'bundle_total_limit>{int(_MAX_BUNDLE_TOTAL_BYTES)}'})
+                        continue
+
+                    try:
+                        z.write(str(pth), arcname=nm)
+                        included.append({'name': nm, 'size_bytes': size, 'mtime_utc': mtime})
+                        total += size
+                    except Exception as e:
+                        skipped.append({'name': nm, 'reason': f'zip_write_failed:{e}'})
+                        continue
+
+                # Add a manifest so downstream tools know what was (not) included.
+                z.writestr('bundle_manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
+        except Exception:
+            # Ensure we don't leave behind a partial temp file.
+            try:
+                tmp_path.unlink(missing_ok=True)  # py3.8 lacks missing_ok; handled below
+            except TypeError:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
+            raise
+
+        return tmp_path, manifest
 
     def build_reference(self) -> Dict[str, object]:
         """Normative reference stats aligned to bandpower columns (if available)."""
@@ -3513,12 +4277,42 @@ class DashboardServer(ThreadingHTTPServer):
             self._conn_inc(topic)
 
         try:
-            # If requested, send a single immediate frame (useful for meta/state).
-            if initial is not None:
-                if not self._sse_send(handler, {"type": "batch", "reset": False, "frames": [initial]}):
-                    return
-
+            # Resume support:
+            # - EventSource reconnects send the last received SSE id in the Last-Event-ID header.
+            # - We also accept an explicit ?cursor=... query for non-EventSource clients.
             last_seq = 0
+            try:
+                v = (handler.headers.get("Last-Event-ID") or "").strip()
+                if v:
+                    last_seq = int(v)
+            except Exception:
+                last_seq = 0
+            try:
+                u = urlparse(handler.path)
+                q = parse_qs(u.query)
+                cur_s = (q.get("cursor") or q.get("last") or q.get("since") or q.get("after") or [""])[0]
+                if cur_s:
+                    last_seq = max(last_seq, int(cur_s))
+            except Exception:
+                pass
+
+            # If requested, send a single immediate frame (useful for meta/state).
+            # Only do this on a fresh connection; reconnects should resume from the buffer.
+            if initial is not None and last_seq <= 0:
+                snap_seq = 0
+                try:
+                    snap_seq = int(buf.latest_seq())
+                except Exception:
+                    snap_seq = 0
+                if not self._sse_send(
+                    handler,
+                    {"type": "batch", "reset": False, "frames": [initial]},
+                    id=snap_seq,
+                ):
+                    return
+                # Skip older buffered frames; the snapshot represents the current state.
+                last_seq = max(last_seq, snap_seq)
+
             last_keep = time.time()
             last_send = 0.0
             max_hz = float(self.config.max_hz) if self.config.max_hz else 15.0
@@ -3532,7 +4326,7 @@ class DashboardServer(ThreadingHTTPServer):
                     dt = now - last_send
                     if dt < interval:
                         time.sleep(interval - dt)
-                    ok = self._sse_send(handler, {"type": "batch", "reset": reset, "frames": frames})
+                    ok = self._sse_send(handler, {"type": "batch", "reset": reset, "frames": frames}, id=new_last)
                     if not ok:
                         break
                     last_send = time.time()
@@ -3601,6 +4395,12 @@ class DashboardServer(ThreadingHTTPServer):
         This improves compatibility with browsers that have low per-origin SSE
         connection limits (e.g., tablet browsers), since the UI can keep one
         streaming connection instead of several.
+
+        Resume support:
+        - Each SSE message is sent with an `id:` field that encodes per-topic cursors.
+        - Browsers will automatically send that id back on reconnect via the
+          `Last-Event-ID` header, allowing the server to resume without replaying
+          already-seen frames.
         """
         wanted = self._parse_stream_topics(topics)
 
@@ -3616,30 +4416,92 @@ class DashboardServer(ThreadingHTTPServer):
         eff_hz = max(0.5, min(60.0, eff_hz))
         interval = 1.0 / eff_hz
 
+        # Per-topic cursors carried in the SSE id.
+        id_keys = ("nf", "artifact", "bandpower", "meta", "state")
+
+        def _encode_id(cursors: Dict[str, int]) -> str:
+            parts = ["v1", f"sid={self.instance_id}"]
+            for k in id_keys:
+                parts.append(f"{k}={int(cursors.get(k, 0) or 0)}")
+            return "|".join(parts)
+
+        def _parse_id(s: str) -> Optional[Dict[str, int]]:
+            ss = (s or "").strip()
+            if not ss:
+                return None
+            parts = ss.split("|")
+            if not parts or parts[0] != "v1":
+                return None
+            sid: Optional[str] = None
+            out: Dict[str, int] = {}
+            for p in parts[1:]:
+                if "=" not in p:
+                    continue
+                k, v = p.split("=", 1)
+                k = (k or "").strip().lower()
+                v = (v or "").strip()
+                if k == "sid":
+                    sid = v
+                    continue
+                if k in id_keys:
+                    try:
+                        out[k] = int(v)
+                    except Exception:
+                        pass
+            if sid != self.instance_id:
+                return None
+            return out
+
+        cursors: Dict[str, int] = {k: 0 for k in id_keys}
+
+        # Resume from EventSource reconnects (Last-Event-ID header).
+        resume = _parse_id((handler.headers.get("Last-Event-ID") or ""))
+        if resume is None:
+            # Optional query param override for non-EventSource clients.
+            try:
+                u = urlparse(handler.path)
+                q = parse_qs(u.query)
+                cur_s = (q.get("cursor") or q.get("last") or q.get("since") or [""])[0]
+                resume = _parse_id(cur_s)
+            except Exception:
+                resume = None
+        if resume:
+            cursors.update(resume)
+
         self._sse_preamble(handler)
 
-        # Send a small "hello" burst (config/state/meta) so the UI can render
-        # without separate fetches.
+        # Send a small "hello" burst so the UI can render without separate fetches.
         if "config" in wanted:
-            if not self._sse_send(handler, self.build_config(), event="config"):
+            if not self._sse_send(handler, self.build_config(), event="config", id=_encode_id(cursors)):
                 return
 
-        # Meta + state are sent as batches for a consistent client parser.
-        meta_last = self.hub.meta.latest_seq()
         if "meta" in wanted:
-            if not self._sse_send(handler, {"type": "batch", "reset": False, "frames": [self.build_meta()]}, event="meta"):
+            meta_obj = self.build_meta()
+            try:
+                cursors["meta"] = int(self.hub.meta.latest_seq())
+            except Exception:
+                cursors["meta"] = int(cursors.get("meta", 0) or 0)
+            if not self._sse_send(
+                handler,
+                {"type": "batch", "reset": False, "frames": [meta_obj]},
+                event="meta",
+                id=_encode_id(cursors),
+            ):
                 return
-            meta_last = self.hub.meta.latest_seq()
 
-        state_last = self._ui_state_buf.latest_seq()
         if "state" in wanted:
-            if not self._sse_send(handler, {"type": "batch", "reset": False, "frames": [self.get_ui_state()]}, event="state"):
+            state_obj = self.get_ui_state()
+            try:
+                cursors["state"] = int(self._ui_state_buf.latest_seq())
+            except Exception:
+                cursors["state"] = int(cursors.get("state", 0) or 0)
+            if not self._sse_send(
+                handler,
+                {"type": "batch", "reset": False, "frames": [state_obj]},
+                event="state",
+                id=_encode_id(cursors),
+            ):
                 return
-            state_last = self._ui_state_buf.latest_seq()
-
-        nf_last = 0
-        art_last = 0
-        bp_last = 0
 
         last_keep = time.time()
         last_send = 0.0
@@ -3656,52 +4518,77 @@ class DashboardServer(ThreadingHTTPServer):
             any_sent = False
 
             if "nf" in wanted:
-                new_last, frames, reset = self.hub.nf.get_since(nf_last, limit=2500)
+                new_last, frames, reset = self.hub.nf.get_since(int(cursors.get("nf", 0) or 0), limit=2500)
                 if frames:
                     _maybe_sleep()
-                    if not self._sse_send(handler, {"type": "batch", "reset": reset, "frames": frames}, event="nf"):
+                    cursors["nf"] = int(new_last)
+                    if not self._sse_send(
+                        handler,
+                        {"type": "batch", "reset": reset, "frames": frames},
+                        event="nf",
+                        id=_encode_id(cursors),
+                    ):
                         return
-                    nf_last = new_last
                     last_keep = time.time()
                     any_sent = True
 
             if "artifact" in wanted:
-                new_last, frames, reset = self.hub.artifact.get_since(art_last, limit=2500)
+                new_last, frames, reset = self.hub.artifact.get_since(int(cursors.get("artifact", 0) or 0), limit=2500)
                 if frames:
                     _maybe_sleep()
-                    if not self._sse_send(handler, {"type": "batch", "reset": reset, "frames": frames}, event="artifact"):
+                    cursors["artifact"] = int(new_last)
+                    if not self._sse_send(
+                        handler,
+                        {"type": "batch", "reset": reset, "frames": frames},
+                        event="artifact",
+                        id=_encode_id(cursors),
+                    ):
                         return
-                    art_last = new_last
                     last_keep = time.time()
                     any_sent = True
 
             if "bandpower" in wanted:
-                new_last, frames, reset = self.hub.bandpower.get_since(bp_last, limit=2500)
+                new_last, frames, reset = self.hub.bandpower.get_since(int(cursors.get("bandpower", 0) or 0), limit=2500)
                 if frames:
                     _maybe_sleep()
-                    if not self._sse_send(handler, {"type": "batch", "reset": reset, "frames": frames}, event="bandpower"):
+                    cursors["bandpower"] = int(new_last)
+                    if not self._sse_send(
+                        handler,
+                        {"type": "batch", "reset": reset, "frames": frames},
+                        event="bandpower",
+                        id=_encode_id(cursors),
+                    ):
                         return
-                    bp_last = new_last
                     last_keep = time.time()
                     any_sent = True
 
             if "meta" in wanted:
-                new_last, frames, reset = self.hub.meta.get_since(meta_last, limit=50)
+                new_last, frames, reset = self.hub.meta.get_since(int(cursors.get("meta", 0) or 0), limit=50)
                 if frames:
                     _maybe_sleep()
-                    if not self._sse_send(handler, {"type": "batch", "reset": reset, "frames": frames}, event="meta"):
+                    cursors["meta"] = int(new_last)
+                    if not self._sse_send(
+                        handler,
+                        {"type": "batch", "reset": reset, "frames": frames},
+                        event="meta",
+                        id=_encode_id(cursors),
+                    ):
                         return
-                    meta_last = new_last
                     last_keep = time.time()
                     any_sent = True
 
             if "state" in wanted:
-                new_last, frames, reset = self._ui_state_buf.get_since(state_last, limit=200)
+                new_last, frames, reset = self._ui_state_buf.get_since(int(cursors.get("state", 0) or 0), limit=200)
                 if frames:
                     _maybe_sleep()
-                    if not self._sse_send(handler, {"type": "batch", "reset": reset, "frames": frames}, event="state"):
+                    cursors["state"] = int(new_last)
+                    if not self._sse_send(
+                        handler,
+                        {"type": "batch", "reset": reset, "frames": frames},
+                        event="state",
+                        id=_encode_id(cursors),
+                    ):
                         return
-                    state_last = new_last
                     last_keep = time.time()
                     any_sent = True
 
@@ -3711,6 +4598,7 @@ class DashboardServer(ThreadingHTTPServer):
                     if not self._sse_keepalive(handler):
                         return
                     last_keep = time.time()
+
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:

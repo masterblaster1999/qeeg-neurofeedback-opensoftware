@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import fnmatch
+import json
 import os
 import shutil
 import sys
@@ -57,6 +58,56 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+# Best-effort: avoid polluting the source tree with __pycache__ when this script
+# is invoked from CI/CTest or used as a helper module.
+sys.dont_write_bytecode = True
+
+
+# JSON Schema identifiers (also used as optional "$schema" hints in JSON output).
+# These URLs match the $id fields in the corresponding schemas/ files.
+SCHEMA_LIST_ID = (
+    "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/"
+    "biotrace_extract_list.schema.json"
+)
+SCHEMA_MANIFEST_ID = (
+    "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/"
+    "biotrace_extract_manifest.schema.json"
+)
+
+
+def _cleanup_stale_pycache() -> None:
+    """Remove bytecode cache files for this script (best effort)."""
+
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        pycache = os.path.join(here, "__pycache__")
+        if not os.path.isdir(pycache):
+            return
+
+        removed_any = False
+        for fn in os.listdir(pycache):
+            # Typical filename:
+            #   biotrace_extract_container.cpython-311.pyc
+            if fn.startswith("biotrace_extract_container.") and fn.endswith(".pyc"):
+                try:
+                    os.remove(os.path.join(pycache, fn))
+                    removed_any = True
+                except Exception:
+                    pass
+
+        if removed_any:
+            try:
+                if not os.listdir(pycache):
+                    os.rmdir(pycache)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_cleanup_stale_pycache()
 
 
 DEFAULT_PREFER = [
@@ -72,6 +123,49 @@ DEFAULT_PREFER = [
     ".txt",
     ".asc",
 ]
+
+
+def _mtime_to_iso(mtime: Any) -> Optional[str]:
+    """Convert a datetime-ish object to an ISO 8601 string (best effort)."""
+    if mtime is None:
+        return None
+    if isinstance(mtime, str):
+        return mtime
+    iso = getattr(mtime, "isoformat", None)
+    if callable(iso):
+        try:
+            return iso()
+        except Exception:
+            pass
+    try:
+        return str(mtime)
+    except Exception:
+        return None
+
+
+def candidates_to_jsonable(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert list_contents() output to a JSON-serializable structure.
+
+    Adds a 1-based `index` field (matching the human --list ordering) and
+    converts `mtime` (datetime) to an ISO 8601 string.
+    """
+    out: List[Dict[str, Any]] = []
+    for i, it in enumerate(items):
+        out.append(
+            {
+                "index": i + 1,
+                "name": str(it.get("name", "") or ""),
+                "ext": str(it.get("ext", "") or ""),
+                "size": int(it.get("size", 0) or 0),
+                "mtime": _mtime_to_iso(it.get("mtime", None)),
+            }
+        )
+    return out
+
+
+def _dump_json(obj: Any) -> None:
+    json.dump(obj, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
 
 
 def _norm_ext(x: str) -> str:
@@ -964,6 +1058,18 @@ def list_contents(input_path: Path, prefer_exts: Sequence[str] = DEFAULT_PREFER)
     return out
 
 
+def list_contents_jsonable(
+    input_path: Path, prefer_exts: Sequence[str] = DEFAULT_PREFER
+) -> List[Dict[str, Any]]:
+    """JSON-friendly variant of list_contents().
+
+    This is useful for GUIs and scripts that want a stable, machine-readable
+    candidate listing (mtime is converted to an ISO string).
+    """
+
+    return candidates_to_jsonable(list_contents(input_path, prefer_exts=prefer_exts))
+
+
 def extract_best_export(
     input_path: Path,
     outdir: Path,
@@ -1152,7 +1258,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=",".join(DEFAULT_PREFER),
         help="Comma-separated extension preference order (default: EDF,BDF,BrainVision,CSV)",
     )
-    ap.add_argument("--list", action="store_true", help="List candidate recordings and exit")
+
+    list_group = ap.add_mutually_exclusive_group()
+    list_group.add_argument("--list", action="store_true", help="List candidate recordings and exit")
+    list_group.add_argument("--list-json", action="store_true", help="List candidate recordings as JSON and exit")
+
     ap.add_argument("--all", action="store_true", help="Extract all candidate recordings (default: extract best only)")
     ap.add_argument(
         "--select",
@@ -1162,7 +1272,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Accepts 1-based index from --list, exact member name, substring, or glob pattern (case-insensitive)."
         ),
     )
-    ap.add_argument("--print", dest="print_paths", action="store_true", help="Print extracted path(s) to stdout")
+
+    print_group = ap.add_mutually_exclusive_group()
+    print_group.add_argument("--print", dest="print_paths", action="store_true", help="Print extracted path(s) to stdout")
+    print_group.add_argument(
+        "--print-json",
+        dest="print_json",
+        action="store_true",
+        help="Print extracted path(s) as JSON to stdout (machine-friendly)",
+    )
+
     args = ap.parse_args(list(argv) if argv is not None else None)
 
     in_path = Path(args.input if getattr(args, "input", None) else args.container)
@@ -1173,22 +1292,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit(f"Input not found: {in_path}")
 
     # List mode: show candidate recordings only.
-    if args.list:
+    if args.list or getattr(args, "list_json", False):
         items = list_contents(in_path, prefer_exts=prefer_exts)
+
         if not items:
             if in_path.is_dir():
-                print("No recognized recordings found.")
-                return 1
-            if not zipfile.is_zipfile(str(in_path)):
-                print(
+                msg = "No recognized recordings found."
+                rc = 1
+            elif not zipfile.is_zipfile(str(in_path)):
+                msg = (
                     "Input is not a ZIP container (or is an unsupported container type).\n"
                     "BioTrace+/NeXus session containers can be proprietary; if this extractor cannot open it,\n"
                     "please export your session from BioTrace+ to an open format (EDF/BDF/ASCII) first.\n"
                     f"Input: {in_path}"
                 )
-                return 2
-            print("No recognized recordings found inside the container.")
-            return 1
+                rc = 2
+            else:
+                msg = "No recognized recordings found inside the container."
+                rc = 1
+
+            if getattr(args, "list_json", False):
+                _dump_json(
+                    {
+                        "$schema": SCHEMA_LIST_ID,
+                        "input": str(in_path),
+                        "prefer_exts": list(prefer_exts),
+                        "candidates": [],
+                        "error": msg,
+                    }
+                )
+            else:
+                print(msg)
+            return rc
+
+        if getattr(args, "list_json", False):
+            _dump_json(
+                {
+                    "$schema": SCHEMA_LIST_ID,
+                    "input": str(in_path),
+                    "prefer_exts": list(prefer_exts),
+                    "candidates": candidates_to_jsonable(items),
+                }
+            )
+            return 0
 
         for i, it in enumerate(items):
             print(f"{i+1:02d}. {int(it.get('size', 0)):>10}  {it.get('name', '')}")
@@ -1196,12 +1342,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Extract mode.
     if (not in_path.is_dir()) and (not zipfile.is_zipfile(str(in_path))):
-        print(
+        msg = (
             "Input is not a ZIP container (or is an unsupported container type).\n"
             "BioTrace+/NeXus session containers can be proprietary; if this extractor cannot open it,\n"
             "please export your session from BioTrace+ to an open format (EDF/BDF/ASCII) first.\n"
             f"Input: {in_path}"
         )
+        if getattr(args, "print_json", False):
+            _dump_json(
+                {
+                    "$schema": SCHEMA_MANIFEST_ID,
+                    "input": str(in_path),
+                    "outdir": str(outdir),
+                    "extracted": [],
+                    "main": None,
+                    "error": msg,
+                }
+            )
+        else:
+            print(msg)
         return 2
 
     if args.all and args.select:
@@ -1221,17 +1380,55 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Distinguish "no candidates" from "unsafe candidates only".
         candidates = list_contents(in_path, prefer_exts=prefer_exts)
         if candidates:
-            print(
+            msg = (
                 "No safe recordings could be extracted (all candidates had unsafe paths).\n"
                 "Refused to write outside --outdir.\n"
                 f"Input: {in_path}"
             )
+            if getattr(args, "print_json", False):
+                _dump_json(
+                    {
+                        "$schema": SCHEMA_MANIFEST_ID,
+                        "input": str(in_path),
+                        "outdir": str(outdir),
+                        "extracted": [],
+                        "main": None,
+                        "error": msg,
+                    }
+                )
+            else:
+                print(msg)
             return 3
         if in_path.is_dir():
-            print("No recognized recordings found.")
+            msg = "No recognized recordings found."
         else:
-            print("No recognized recordings found inside the container.")
+            msg = "No recognized recordings found inside the container."
+        if getattr(args, "print_json", False):
+            _dump_json(
+                {
+                    "$schema": SCHEMA_MANIFEST_ID,
+                    "input": str(in_path),
+                    "outdir": str(outdir),
+                    "extracted": [],
+                    "main": None,
+                    "error": msg,
+                }
+            )
+        else:
+            print(msg)
         return 1
+
+    if getattr(args, "print_json", False):
+        _dump_json(
+            {
+                "$schema": SCHEMA_MANIFEST_ID,
+                "input": str(in_path),
+                "outdir": str(outdir),
+                "main": str(extracted[0]) if extracted else None,
+                "extracted": [str(p) for p in extracted],
+            }
+        )
+        return 0
 
     if args.print_paths:
         for p in extracted:

@@ -25,6 +25,12 @@
   const runMetaRefresh = qs('runMetaRefresh');
   const statsKv = qs('statsKv');
 
+  const downloadsDetails = qs('downloadsDetails');
+  const bundleDownload = qs('bundleDownload');
+  const filesRefresh = qs('filesRefresh');
+  const filesList = qs('filesList');
+  const filesHint = qs('filesHint');
+
   const winSel = qs('winSel');
   const pauseBtn = qs('pauseBtn');
 
@@ -93,6 +99,18 @@
     const m = Math.floor(age/60); const s = Math.round(age - 60*m);
     return `${m}m ${s}s`;
   }
+
+  function fmtBytes(n){
+    if(n===null || n===undefined || !Number.isFinite(n)) return '—';
+    const units = ['B','KiB','MiB','GiB','TiB'];
+    let v = Math.max(0, n);
+    let u = 0;
+    while(v >= 1024 && u < units.length-1){ v /= 1024; u++; }
+    if(u === 0) return `${Math.round(v)} ${units[u]}`;
+    const digs = (v >= 10) ? 1 : 2;
+    return `${v.toFixed(digs)} ${units[u]}`;
+  }
+
 
   function escHtml(s){
     return String(s).replace(/[&<>"']/g, (ch)=>({
@@ -1650,6 +1668,91 @@ if(Array.isArray(arts) && arts.length){
 
   // ------------------------ run meta + stats ------------------------
 
+  let filesLastLoad_utc = 0;
+
+  function clearEl(el){
+    if(!el) return;
+    while(el.firstChild) el.removeChild(el.firstChild);
+  }
+
+  function renderFilesList(obj){
+    if(!filesList) return;
+    clearEl(filesList);
+
+    const files = (obj && Array.isArray(obj.files)) ? obj.files : [];
+    const now = Date.now()/1000;
+
+    if(filesHint){
+      if(files.length === 0){
+        filesHint.textContent = 'No downloadable files found in outdir.';
+      } else {
+        filesHint.textContent = '';
+      }
+    }
+
+    for(const f of files){
+      const name = (f && f.name) ? String(f.name) : '';
+      if(!name) continue;
+
+      const row = document.createElement('div');
+      row.className = 'fileRow';
+
+      const a = document.createElement('a');
+      a.textContent = name;
+      a.target = '_blank';
+      a.rel = 'noopener';
+
+      const baseUrl = (f && (f.download_url || f.url)) ? String(f.download_url || f.url) : (`/api/file?name=${encodeURIComponent(name)}&download=1`);
+      const href = baseUrl + (baseUrl.indexOf('?')>=0 ? '&' : '?') + `token=${encodeURIComponent(TOKEN)}`;
+      const downloadable = (f && typeof f.downloadable === 'boolean') ? f.downloadable : true;
+      if(downloadable){
+        a.href = href;
+      } else {
+        a.href = '#';
+        a.style.opacity = '0.6';
+        a.addEventListener('click', (ev)=>ev.preventDefault());
+      }
+      row.appendChild(a);
+
+      const meta = document.createElement('span');
+      meta.className = 'fileMeta';
+      const st = (f && f.stat && typeof f.stat === 'object') ? f.stat : {};
+      const size = (st && Number.isFinite(st.size_bytes)) ? st.size_bytes : null;
+      const mtime = (st && Number.isFinite(st.mtime_utc)) ? st.mtime_utc : null;
+      const parts = [];
+      if(size !== null) parts.push(fmtBytes(size));
+      if(mtime !== null) parts.push('age ' + fmtAgeSec(now - mtime));
+      if(f && f.category) parts.push(String(f.category));
+      if(downloadable === false) parts.push('too large');
+      meta.textContent = parts.join(' · ');
+      row.appendChild(meta);
+
+      filesList.appendChild(row);
+    }
+  }
+
+  async function loadFiles(force=false){
+    if(!TOKEN) return;
+    if(!filesList) return;
+    const now = Date.now()/1000;
+    if(!force && (now - filesLastLoad_utc) < 1.0 && filesList.childElementCount > 0){
+      return;
+    }
+    filesLastLoad_utc = now;
+    if(filesHint) filesHint.textContent = 'Loading…';
+    try{
+      const r = await fetch(`/api/files?token=${encodeURIComponent(TOKEN)}`, {cache: 'no-store'});
+      if(!r.ok){
+        throw new Error(`HTTP ${r.status}`);
+      }
+      const obj = await r.json();
+      renderFilesList(obj);
+    }catch(e){
+      if(filesHint) filesHint.textContent = 'Failed to load file list.';
+    }
+  }
+
+
   async function loadRunMeta(force=false){
     if(!TOKEN) return;
     if(!runMetaRaw && !runMetaKv && !runMetaStatus) return;
@@ -1801,6 +1904,20 @@ if(Array.isArray(arts) && arts.length){
         if(runMetaDetails.open) loadRunMeta(false);
       });
     }
+
+    if(bundleDownload){
+      bundleDownload.href = `/api/bundle?token=${encodeURIComponent(TOKEN)}`;
+    }
+    if(filesRefresh){
+      filesRefresh.addEventListener('click', ()=>{ loadFiles(true); });
+    }
+    if(downloadsDetails){
+      downloadsDetails.addEventListener('toggle', ()=>{
+        if(downloadsDetails.open) loadFiles(false);
+      });
+    }
+    // Prefetch once so the list is ready when the user opens the panel.
+    loadFiles(false);
 
     ensureUiBindings();
     markAllReconnect('…');

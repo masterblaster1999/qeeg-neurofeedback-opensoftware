@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/biotrace_extract_manifest.schema.json",
+  "title": "biotrace_extract_container.py --print-json output",
+  "description": "Schema for the JSON emitted by scripts/biotrace_extract_container.py --print-json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "input",
+    "outdir",
+    "main",
+    "extracted"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/biotrace_extract_manifest.schema.json"
+    },
+    "input": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to the container or directory that was extracted."
+    },
+    "outdir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Output directory where files were extracted."
+    },
+    "main": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Primary extracted file path (the one you usually pass as --input). Null on error."
+    },
+    "extracted": {
+      "type": "array",
+      "description": "All extracted/copied file paths. The first entry is usually the same as 'main'.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "error": {
+      "type": "string",
+      "description": "Present when extraction failed (best effort)."
+    }
+  }
+}

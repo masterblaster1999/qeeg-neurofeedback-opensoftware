@@ -1,0 +1,3 @@
+# Python dependencies used by CI/selftests.
+# Keep this minimal to reduce CI startup time.
+jsonschema

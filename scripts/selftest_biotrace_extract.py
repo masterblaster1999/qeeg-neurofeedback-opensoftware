@@ -15,11 +15,22 @@ No third-party dependencies.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
+
+
+SCHEMA_LIST_ID = (
+    "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/"
+    "biotrace_extract_list.schema.json"
+)
+SCHEMA_MANIFEST_ID = (
+    "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/"
+    "biotrace_extract_manifest.schema.json"
+)
 
 
 def _run(args, cwd: Path) -> subprocess.CompletedProcess:
@@ -75,6 +86,20 @@ def main() -> int:
             print(r.stdout)
             raise AssertionError("--list did not include expected member")
 
+        # --list-json should be machine-readable and include the payload.
+        rj = _run(["--input", str(container_path), "--list-json"], repo_root)
+        if rj.returncode != 0:
+            print(rj.stdout)
+            raise AssertionError("--list-json failed")
+        data = json.loads(rj.stdout)
+        if data.get("$schema") != SCHEMA_LIST_ID:
+            print(rj.stdout)
+            raise AssertionError("--list-json missing/incorrect $schema")
+        cands = data.get("candidates", [])
+        if not cands or "session_001.edf" not in str(cands[0].get("name", "")):
+            print(rj.stdout)
+            raise AssertionError("--list-json did not include expected member")
+
         # --container is an alias for --input.
         r2 = _run(["--container", str(container_path), "--list"], repo_root)
         if r2.returncode != 0:
@@ -96,6 +121,23 @@ def main() -> int:
         if extracted_path.read_bytes() != payload_bytes:
             raise AssertionError("extracted bytes mismatch")
 
+        # Extraction with --print-json should also work and return JSON.
+        outdir_json = td_path / "out_edf_json"
+        r = _run(["--container", str(container_path), "--outdir", str(outdir_json), "--print-json"], repo_root)
+        if r.returncode != 0:
+            print(r.stdout)
+            raise AssertionError("extract --print-json failed")
+        d = json.loads(r.stdout)
+        if d.get("$schema") != SCHEMA_MANIFEST_ID:
+            print(r.stdout)
+            raise AssertionError("--print-json missing/incorrect $schema")
+        main_p = Path(d.get("main", ""))
+        extracted_ps = [Path(x) for x in d.get("extracted", [])]
+        if not main_p.exists() or main_p not in extracted_ps:
+            raise AssertionError("--print-json did not include a valid main path")
+        if main_p.read_bytes() != payload_bytes:
+            raise AssertionError("--print-json extracted bytes mismatch")
+
         # 2) BrainVision triplet in a .m2k (ZIP)
         bv_container = td_path / "session.brainvision.m2k"
         bv_dir = "exports"
@@ -115,6 +157,21 @@ def main() -> int:
         if f"{base}.vhdr" not in r.stdout:
             print(r.stdout)
             raise AssertionError("BrainVision --list did not include expected .vhdr member")
+
+        # --list-json should include the .vhdr candidate.
+        rj = _run(["--input", str(bv_container), "--list-json"], repo_root)
+        if rj.returncode != 0:
+            print(rj.stdout)
+            raise AssertionError("BrainVision --list-json failed")
+        dj = json.loads(rj.stdout)
+        if dj.get("$schema") != SCHEMA_LIST_ID:
+            print(rj.stdout)
+            raise AssertionError("BrainVision --list-json missing/incorrect $schema")
+        cands = dj.get("candidates", [])
+        names = [str(x.get("name", "")) for x in cands]
+        if not any(f"{base}.vhdr" in n for n in names):
+            print(rj.stdout)
+            raise AssertionError("BrainVision --list-json missing expected .vhdr member")
 
         # Extract should include the triplet.
         outdir_bv = td_path / "out_bv"
@@ -146,6 +203,27 @@ def main() -> int:
             raise AssertionError("BrainVision .eeg bytes mismatch")
         if exp_vmrk.read_text(encoding="utf-8") != vmrk_text:
             raise AssertionError("BrainVision .vmrk text mismatch")
+
+        # Also verify --print-json returns the expected multi-file extraction.
+        outdir_bv_json = td_path / "out_bv_json"
+        rj = _run(["--container", str(bv_container), "--outdir", str(outdir_bv_json), "--print-json"], repo_root)
+        if rj.returncode != 0:
+            print(rj.stdout)
+            raise AssertionError("BrainVision extract --print-json failed")
+        dj = json.loads(rj.stdout)
+        if dj.get("$schema") != SCHEMA_MANIFEST_ID:
+            print(rj.stdout)
+            raise AssertionError("BrainVision --print-json missing/incorrect $schema")
+        main_bv = Path(dj.get("main", ""))
+        extracted_bv = [Path(x) for x in dj.get("extracted", [])]
+        if not main_bv.name.endswith(".vhdr"):
+            raise AssertionError("BrainVision --print-json main should be a .vhdr")
+        if len(extracted_bv) < 3:
+            raise AssertionError("BrainVision --print-json expected >=3 extracted paths")
+        # Ensure the extracted files exist.
+        for p in extracted_bv:
+            if not p.exists():
+                raise AssertionError(f"BrainVision --print-json extracted file missing: {p}")
 
         
         # 2c) BrainVision triplet with mismatched casing (vhdr references upper-case, members are lower-case).

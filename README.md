@@ -303,6 +303,35 @@ cmake --preset tidy
 cmake --build --preset tidy
 ```
 
+### CI (GitHub Actions)
+
+The repository includes GitHub Actions workflows that:
+
+- build + run tests on Ubuntu / macOS / Windows (CMake presets)
+- run CodeQL code scanning on `main`
+
+To reproduce the CI build locally (recommended):
+
+```bash
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+```
+
+Or use the helper scripts (they mirror the workflow + also try optional validation / smoke-test targets when available):
+
+```bash
+./scripts/ci/run_ci.sh
+./scripts/ci/run_ci.sh debug
+```
+
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\ci\run_ci.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\ci\run_ci.ps1 debug
+```
+
 ### Useful build options
 
 ```bash
@@ -934,7 +963,11 @@ This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral chan
   
   ```bash
   python3 scripts/biotrace_extract_container.py --input session.m2k --list
+  # Machine-friendly JSON listing (includes a $schema hint for validation):
+  python3 scripts/biotrace_extract_container.py --input session.m2k --list-json > candidates.json
   python3 scripts/biotrace_extract_container.py --input session.m2k --outdir extracted --print
+  # Machine-friendly JSON extraction manifest (includes a $schema hint for validation):
+  python3 scripts/biotrace_extract_container.py --input session.m2k --outdir extracted --print-json > extracted.json
   # Alias for --input:
   python3 scripts/biotrace_extract_container.py --container session.m2k --outdir extracted --print
 
@@ -951,17 +984,34 @@ This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral chan
   If your end goal is to run **qeeg_nf_cli** on a ZIP-like container in one step (when it happens to be a ZIP container with an embedded export), there is also a small wrapper that extracts + launches the CLI:
 
   ```bash
+  # Machine-friendly JSON listing (includes a $schema hint for validation):
+  python3 scripts/biotrace_run_nf.py --container session.m2k --list-json > candidates.json
+
+  # qeeg_nf_cli resolution (best effort):
+  #   - env QEEG_NF_CLI
+  #   - common build outputs (e.g. build/release/qeeg_nf_cli from CMakePresets.json)
+  #   - PATH
+  # If needed, pass: --nf-cli /path/to/qeeg_nf_cli
+
+  # Note: you can optionally insert a `--` separator before the forwarded qeeg_nf_cli arguments; it is not required.
   # Optional: if the container includes multiple exports (e.g., EDF + ASCII),
   # you can control which one gets picked with --prefer, or choose one with --select.
-  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --prefer .edf,.bdf,.csv -- \
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --prefer .edf,.bdf,.csv \
     --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
     --realtime --export-bandpowers --flush-csv
 
   # Choose the 2nd candidate shown by --list (for example, a BrainVision export):
-  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --select 2 -- \
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --select 2 \
     --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
     --realtime --export-bandpowers --flush-csv
   ```
+
+  **Optional: validate JSON outputs** (for CI/dev sanity checks):
+
+  ```bash
+  python3 scripts/validate_biotrace_json_outputs.py --schemas-dir schemas
+  ```
+
 
 - BioTrace+ ASCII exports are often saved as `.txt` / `.tsv` / `.asc` (and sometimes `.m2k`); these are treated like CSV inputs in this project.
   - Headerless exports (no column names) are supported: the loader infers the delimiter and synthesizes channel names (`Ch1`, `Ch2`, ...).
@@ -1390,6 +1440,17 @@ python3 scripts/rt_qeeg_dashboard.py --outdir out_nf --open
 python3 scripts/rt_qeeg_dashboard.py --outdir out_nf --open --max-hz 10 --history-rows 2000
 ```
 
+Quick demo (no C++ build required): you can generate synthetic CSV streams that are compatible with the dashboard
+(these are **not** scientifically meaningful; they are for UI testing/demo only):
+
+```bash
+# Terminal A: generate fake nf_feedback.csv (+ optional bandpower/artifact) continuously
+python3 scripts/rt_dashboard_simulate_output.py --outdir out_nf --with-bandpower --with-artifact --seconds 0
+
+# Terminal B: run the dashboard
+python3 scripts/rt_qeeg_dashboard.py --outdir out_nf --open
+```
+
 View from another device on the same network (e.g., a Nexus/Android tablet):
 
 ```bash
@@ -1417,6 +1478,8 @@ Notes:
 - The dashboard frontend now prefers a **single multiplexed SSE connection** (`/api/sse/stream`) that
   carries `nf/meta/bandpower/artifact/state` updates as **named SSE events**. This improves compatibility
   with browsers that enforce low per-origin connection limits. The legacy per-topic SSE endpoints remain.
+
+- SSE streams include `id:` fields so EventSource can automatically resume after transient disconnects (via the `Last-Event-ID` header). This helps on flaky Wi‑Fi/tablet connections.
 - If `EventSource` is unavailable (or you want a simpler transport), the server also exposes a polling endpoint
   (`/api/snapshot`) that returns incremental batches using cursors (sequence numbers). The UI can fall back to it.
 - The main dashboard page now uses a modern `<script type="module">` for `/app.js` plus a legacy `<script nomodule>`
@@ -1424,6 +1487,8 @@ Notes:
 - The Bandpower panel supports optional linear/log10/dB transforms (handy when your pipeline writes raw power).
 - Live file status uses a meta SSE stream (with a polling fallback if EventSource is unavailable).
 - Dashboard UI state (window/band/channel/transform/pause) is shared across clients via `/api/state` and persisted to `<outdir>/rt_dashboard_state.json`.
+- The dashboard also exposes read-only download endpoints: `/api/files` (list), `/api/file?name=...` (single file), and `/api/bundle` (zip bundle). These are token-protected and only serve safe file types from the chosen `--outdir`.
+  - `/api/file` supports HTTP caching (ETag/Last-Modified) and single-range downloads (Range/If-Range) for resumable transfers.
 - The HTML/CSS/JS frontend lives in `scripts/rt_dashboard_frontend/` (override with `--frontend-dir` if you want to customize/skin the UI).
 
 Optional: smooth the metric with an **exponential moving average** before thresholding/feedback:

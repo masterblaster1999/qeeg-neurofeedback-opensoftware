@@ -24,16 +24,16 @@ List embedded items:
 
   python3 scripts/biotrace_run_nf.py --container session.m2k --list
 
-Run neurofeedback from a container (note the `--`):
+Run neurofeedback from a container:
 
-  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf -- \
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf \
     --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
     --realtime --export-bandpowers --flush-csv
 
 If the container has multiple embedded recordings, you can pick one explicitly:
 
   # Use the 2nd candidate shown by --list
-  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --select 2 -- \
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --select 2 \
     --metric alpha:Pz --window 2.0
 
 Tips
@@ -49,6 +49,7 @@ Tips
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -57,6 +58,51 @@ import tempfile
 import zipfile
 from pathlib import Path
 from typing import List, Optional
+
+
+# Best-effort: avoid polluting the source tree with __pycache__ when this script
+# is invoked from CI/CTest.
+sys.dont_write_bytecode = True
+
+
+# JSON Schema identifier for --list-json output (matches schemas/biotrace_run_nf_list.schema.json).
+SCHEMA_LIST_ID = (
+    "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/"
+    "biotrace_run_nf_list.schema.json"
+)
+
+
+def _cleanup_stale_pycache() -> None:
+    """Remove bytecode cache files for this script (best effort)."""
+
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        pycache = os.path.join(here, "__pycache__")
+        if not os.path.isdir(pycache):
+            return
+
+        removed_any = False
+        for fn in os.listdir(pycache):
+            # Typical filename:
+            #   biotrace_run_nf.cpython-311.pyc
+            if fn.startswith("biotrace_run_nf.") and fn.endswith(".pyc"):
+                try:
+                    os.remove(os.path.join(pycache, fn))
+                    removed_any = True
+                except Exception:
+                    pass
+
+        if removed_any:
+            try:
+                if not os.listdir(pycache):
+                    os.rmdir(pycache)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_cleanup_stale_pycache()
 
 
 def _repo_root() -> Path:
@@ -78,19 +124,82 @@ def _import_biotrace_extract():
 
 
 def _default_nf_cli_path() -> Optional[str]:
-    root = _repo_root()
-    # Common build locations in this repo.
-    candidates = [
-        root / "build" / "qeeg_nf_cli",
-        root / "build" / "Release" / "qeeg_nf_cli",
-        root / "build" / "Debug" / "qeeg_nf_cli",
-    ]
-    if os.name == "nt":
-        candidates = [Path(str(p) + ".exe") for p in candidates] + candidates
-    for p in candidates:
+    """Try to locate a built qeeg_nf_cli binary (best effort).
+
+    Priority:
+      1) QEEG_NF_CLI env var (if set to an existing file)
+      2) Common build folders in this repo (including CMake preset build dirs)
+      3) PATH lookup (shutil.which)
+
+    Note: CMakePresets.json in this repo uses build/* subdirectories (e.g. build/release),
+    so we check those explicitly in addition to legacy build/ locations.
+    """
+
+    # Allow callers / CI wrappers to override the lookup in a stable way.
+    env_path = os.environ.get("QEEG_NF_CLI", "").strip()
+    if env_path:
+        p = Path(env_path)
         if p.exists() and p.is_file():
             return str(p)
-    # Fall back to PATH
+
+    root = _repo_root()
+
+    # Executable name varies by platform.
+    exe = "qeeg_nf_cli.exe" if os.name == "nt" else "qeeg_nf_cli"
+
+    # Common build locations in this repo (ordered by usefulness / typical presets).
+    build_root = root / "build"
+    build_dirs = [
+        build_root,  # legacy / manual builds
+        build_root / "release",
+        build_root / "lto-release",
+        build_root / "debug",
+        build_root / "asan",
+        build_root / "shared-release",
+        build_root / "shared-debug",
+        build_root / "package-release",
+    ]
+
+    # Multi-config generators (MSVC) may place binaries under <dir>/<Config>/.
+    configs = ["Release", "Debug", "RelWithDebInfo", "MinSizeRel"]
+
+    candidates: List[Path] = []
+    for d in build_dirs:
+        candidates.append(d / exe)
+        for cfg in configs:
+            candidates.append(d / cfg / exe)
+
+    # Legacy capitalized dirs sometimes used by IDE builds.
+    for cfg in configs:
+        candidates.append(build_root / cfg / exe)
+
+    # Windows convenience: if we didn't find an .exe, allow a .cmd/.bat wrapper with the same base name.
+    if os.name == "nt":
+        for d in build_dirs + [build_root]:
+            for ext in (".cmd", ".bat"):
+                candidates.append(d / ("qeeg_nf_cli" + ext))
+                for cfg in configs:
+                    candidates.append(d / cfg / ("qeeg_nf_cli" + ext))
+
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                return str(p)
+        except Exception:
+            # Defensive: ignore permission/path errors and keep searching.
+            pass
+
+    # Last resort: scan build/ for the binary name (can help when the build dir is custom).
+    try:
+        if build_root.exists():
+            # Prefer deterministic ordering (string sort).
+            matches = sorted([p for p in build_root.rglob(exe) if p.is_file()], key=lambda x: str(x))
+            if matches:
+                return str(matches[0])
+    except Exception:
+        pass
+
+    # Fall back to PATH.
     return shutil.which("qeeg_nf_cli")
 
 
@@ -122,15 +231,32 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Extract a ZIP-like BioTrace+/NeXus container (.bcd/.mbd/.m2k/.zip) and run qeeg_nf_cli in one step.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
+        epilog=(
+            "Any additional arguments not recognized by this wrapper are forwarded to qeeg_nf_cli. "
+            "You may optionally insert a `--` separator before the forwarded arguments."
+        ),
     )
-    ap.add_argument("--container", required=True, help="Path to a ZIP-like BioTrace+/NeXus session container (.bcd/.mbd/.m2k/.zip) or a directory")
-    ap.add_argument("--outdir", default="", help="Output directory for qeeg_nf_cli (required unless --list)")
+    ap.add_argument(
+        "--container",
+        required=True,
+        help="Path to a ZIP-like BioTrace+/NeXus session container (.bcd/.mbd/.m2k/.zip) or a directory",
+    )
+    ap.add_argument(
+        "--outdir",
+        default="",
+        help="Output directory for qeeg_nf_cli (required unless --list/--list-json)",
+    )
     ap.add_argument(
         "--extract-dir",
         default="",
         help="Directory to place extracted export (default: a temporary folder that is deleted after qeeg_nf_cli exits)",
     )
-    ap.add_argument("--keep-extracted", action="store_true", help="Do not delete temporary extracted export folder")
+    ap.add_argument(
+        "--keep-extracted",
+        action="store_true",
+        help="Do not delete temporary extracted export folder",
+    )
     ap.add_argument(
         "--prefer",
         default="",
@@ -147,14 +273,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "Accepts 1-based index from --list, exact name, substring, or glob pattern (case-insensitive)."
         ),
     )
-    ap.add_argument("--nf-cli", default="", help="Path to qeeg_nf_cli (default: try ./build/qeeg_nf_cli, then PATH)")
-    ap.add_argument("--list", action="store_true", help="List container contents and exit")
     ap.add_argument(
-        "nf_args",
-        nargs=argparse.REMAINDER,
-        help="Arguments forwarded to qeeg_nf_cli (prefix with --; use a -- separator before them)",
+        "--nf-cli",
+        default="",
+        help="Path to qeeg_nf_cli (default: auto-detect in ./build/* preset dirs, env QEEG_NF_CLI, then PATH)",
     )
-    return ap.parse_args(argv)
+
+    list_group = ap.add_mutually_exclusive_group()
+    list_group.add_argument("--list", action="store_true", help="List container contents and exit")
+    list_group.add_argument("--list-json", action="store_true", help="List container contents as JSON and exit")
+
+    # parse_known_args() lets callers pass qeeg_nf_cli flags directly without requiring a '--' separator.
+    ns, unknown = ap.parse_known_args(argv)
+    setattr(ns, "nf_args", list(unknown))
+    return ns
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -166,17 +298,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     bt = _import_biotrace_extract()
 
-    # Validate container type early for clearer errors.
-    if not container.is_dir() and not zipfile.is_zipfile(str(container)):
-        msg = (
-            'Error: container is not a ZIP-like session container.\n'
-            'Some BioTrace+/NeXus exports are proprietary (e.g., BCD/MBD/M2K session backups) and cannot be opened here.\n'
-            'Please export an open format from BioTrace+ (EDF/BDF/ASCII) and run qeeg_nf_cli on that file.\n'
-            f'Container: {container}'
-        )
-        print(msg, file=sys.stderr)
-        return 2
-
     # Optional preference override.
     prefer_exts = getattr(bt, "DEFAULT_PREFER", None)
     if ns.prefer:
@@ -185,6 +306,72 @@ def main(argv: Optional[List[str]] = None) -> int:
             prefer_exts = parse_fn(ns.prefer)
         else:
             prefer_exts = [p.strip().lower() for p in ns.prefer.split(",") if p.strip()]
+
+    # Validate container type early for clearer errors.
+    #
+    # For --list-json, we still emit a machine-readable JSON object on error
+    # (matching the extractor script's behavior), so GUIs and wrappers can
+    # handle failures without scraping stderr.
+    if not container.is_dir() and not zipfile.is_zipfile(str(container)):
+        msg = (
+            'Error: container is not a ZIP-like session container.\n'
+            'Some BioTrace+/NeXus exports are proprietary (e.g., BCD/MBD/M2K session backups) and cannot be opened here.\n'
+            'Please export an open format from BioTrace+ (EDF/BDF/ASCII) and run qeeg_nf_cli on that file.\n'
+            f'Container: {container}'
+        )
+        if getattr(ns, "list_json", False):
+            json.dump(
+                {
+                    "$schema": SCHEMA_LIST_ID,
+                    "input": str(container),
+                    "prefer_exts": list(prefer_exts) if prefer_exts else [],
+                    "candidates": [],
+                    "error": msg,
+                },
+                sys.stdout,
+                indent=2,
+                sort_keys=True,
+            )
+            sys.stdout.write("\n")
+        else:
+            print(msg, file=sys.stderr)
+        return 2
+
+
+    if getattr(ns, "list_json", False):
+        # Machine-friendly listing (stable JSON).
+        try:
+            if hasattr(bt, "list_contents_jsonable") and callable(getattr(bt, "list_contents_jsonable")):
+                cand = bt.list_contents_jsonable(container, prefer_exts=prefer_exts) if prefer_exts else bt.list_contents_jsonable(container)
+            else:
+                raw = bt.list_contents(container, prefer_exts=prefer_exts) if prefer_exts else bt.list_contents(container)
+                conv = getattr(bt, "candidates_to_jsonable", None)
+                cand = conv(raw) if callable(conv) else raw
+
+            obj = {
+                "$schema": SCHEMA_LIST_ID,
+                "input": str(container),
+                "prefer_exts": list(prefer_exts) if prefer_exts else [],
+                "candidates": cand,
+            }
+            json.dump(obj, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+        except Exception as e:
+            json.dump(
+                {
+                    "$schema": SCHEMA_LIST_ID,
+                    "input": str(container),
+                    "prefer_exts": list(prefer_exts) if prefer_exts else [],
+                    "candidates": [],
+                    "error": str(e),
+                },
+                sys.stdout,
+                indent=2,
+                sort_keys=True,
+            )
+            sys.stdout.write("\n")
+            return 2
 
     if ns.list:
         # Print a friendly listing and exit.
@@ -210,7 +397,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if not ns.outdir:
-        print("Error: --outdir is required unless --list is used", file=sys.stderr)
+        print("Error: --outdir is required unless --list/--list-json is used", file=sys.stderr)
         return 2
 
     outdir = Path(ns.outdir)

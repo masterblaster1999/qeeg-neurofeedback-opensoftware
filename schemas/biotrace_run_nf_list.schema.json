@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/biotrace_run_nf_list.schema.json",
+  "title": "biotrace_run_nf.py --list-json output",
+  "description": "Schema for the JSON emitted by scripts/biotrace_run_nf.py --list-json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "input",
+    "prefer_exts",
+    "candidates"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/biotrace_run_nf_list.schema.json"
+    },
+    "input": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to the container or directory that was inspected."
+    },
+    "prefer_exts": {
+      "type": "array",
+      "description": "Extension preference list used to rank candidates.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "description": "Ranked list of candidate recordings found inside the container.",
+      "items": {
+        "$ref": "#/$defs/candidate"
+      }
+    },
+    "error": {
+      "type": "string",
+      "description": "Present when the tool could not list candidates (e.g. not ZIP-like or no recognized recordings)."
+    }
+  },
+  "$defs": {
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "name",
+        "ext",
+        "size",
+        "mtime"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based candidate index (matches the human --list ordering)."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Member path (ZIP) or relative path (directory) of the candidate."
+        },
+        "ext": {
+          "type": "string",
+          "description": "Effective file type/extension used for ranking (best effort)."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Uncompressed size in bytes (best effort)."
+        },
+        "mtime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Modification time as ISO 8601 string when available (best effort)."
+        }
+      }
+    }
+  }
+}

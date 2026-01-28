@@ -23,6 +23,12 @@ import zipfile
 from pathlib import Path
 
 
+SCHEMA_LIST_ID = (
+    "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/"
+    "biotrace_run_nf_list.schema.json"
+)
+
+
 def _run(args, cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "scripts/biotrace_run_nf.py"] + args,
@@ -34,9 +40,21 @@ def _run(args, cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
-def _make_fake_nf_cli(path: Path) -> None:
-    """Create a tiny executable that logs argv to QEEG_FAKE_NF_LOG."""
-    path.write_text(
+def _make_fake_nf_cli(dir_path: Path) -> Path:
+    """Create a tiny *executable* fake qeeg_nf_cli.
+
+    The wrapper script (biotrace_run_nf.py) launches qeeg_nf_cli via subprocess.
+
+    - On POSIX, we can use a shebang Python script and mark it executable.
+    - On Windows, shebangs are not honored, so we generate a .cmd launcher that
+      invokes the Python implementation with the current interpreter.
+
+    The fake CLI logs argv to the JSON file pointed to by QEEG_FAKE_NF_LOG.
+    """
+
+    impl = dir_path / "qeeg_nf_cli_fake.py"
+
+    impl.write_text(
         """#!/usr/bin/env python3
 import json
 import os
@@ -71,7 +89,20 @@ sys.exit(0)
 """,
         encoding="utf-8",
     )
-    os.chmod(path, 0o755)
+
+    if os.name == "nt":
+        launcher = dir_path / "qeeg_nf_cli_fake.cmd"
+        # Use the *current* Python interpreter, quoted for spaces.
+        # Write the .cmd file with explicit newlines (no reliance on shebang on Windows).
+        launcher.write_text(
+            f'@echo off\n"{sys.executable}" "{impl}" %*\n',
+            encoding='utf-8',
+        )
+        return launcher
+
+    # POSIX: mark the Python file executable and return it.
+    os.chmod(impl, 0o755)
+    return impl
 
 
 def _make_brainvision_triplet(base_name: str) -> tuple[str, bytes, str]:
@@ -108,8 +139,7 @@ def main() -> int:
         td_path = Path(td)
 
         # Prepare fake nf cli once.
-        fake_nf = td_path / "qeeg_nf_cli_fake"
-        _make_fake_nf_cli(fake_nf)
+        fake_nf = _make_fake_nf_cli(td_path)
 
         # ------------------------------------------------------------------
         # Case 1: EDF payload
@@ -129,6 +159,20 @@ def main() -> int:
         if "session_001.edf" not in r.stdout:
             print(r.stdout)
             raise AssertionError("--list did not include expected member")
+
+        # --list-json should emit machine-readable JSON.
+        rj = _run(["--container", str(container_path), "--list-json"], repo_root)
+        if rj.returncode != 0:
+            print(rj.stdout)
+            raise AssertionError("--list-json failed")
+        dj = json.loads(rj.stdout)
+        if dj.get("$schema") != SCHEMA_LIST_ID:
+            print(rj.stdout)
+            raise AssertionError("--list-json missing/incorrect $schema")
+        cands = dj.get("candidates", [])
+        if not cands or "session_001.edf" not in str(cands[0].get("name", "")):
+            print(rj.stdout)
+            raise AssertionError("--list-json did not include expected member")
 
         outdir = td_path / "out_nf_edf"
         extract_dir = td_path / "extracted_edf"
@@ -185,6 +229,51 @@ def main() -> int:
         if "alpha/beta:Pz" not in log_argv:
             raise AssertionError("expected passthrough args in forwarded args (EDF)")
 
+        # Also ensure the wrapper forwards qeeg_nf_cli args even *without* a '--' separator.
+        outdir_nd = td_path / "out_nf_edf_no_delim"
+        extract_dir_nd = td_path / "extracted_edf_no_delim"
+        outdir_nd.mkdir(parents=True, exist_ok=True)
+        extract_dir_nd.mkdir(parents=True, exist_ok=True)
+        log_path_nd = td_path / "nf_args_edf_no_delim.json"
+
+        env_nd = os.environ.copy()
+        env_nd["QEEG_FAKE_NF_LOG"] = str(log_path_nd)
+
+        r = subprocess.run(
+            [
+                sys.executable,
+                "scripts/biotrace_run_nf.py",
+                "--container",
+                str(container_path),
+                "--outdir",
+                str(outdir_nd),
+                "--extract-dir",
+                str(extract_dir_nd),
+                "--nf-cli",
+                str(fake_nf),
+                "--metric",
+                "alpha/beta:Pz",
+                "--window",
+                "2.0",
+            ],
+            cwd=str(repo_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env_nd,
+            check=False,
+        )
+        if r.returncode != 0:
+            print(r.stdout)
+            raise AssertionError("run mode (EDF, no-delimiter) failed")
+
+        if not log_path_nd.exists():
+            raise AssertionError("fake nf cli did not write log (EDF, no-delimiter)")
+
+        log_argv_nd = _read_logged_argv(log_path_nd)
+        if "alpha/beta:Pz" not in log_argv_nd:
+            raise AssertionError("expected passthrough args in forwarded args (EDF, no-delimiter)")
+
         # ------------------------------------------------------------------
         # Case 2: BrainVision triplet payload
         # ------------------------------------------------------------------
@@ -206,6 +295,20 @@ def main() -> int:
         if f"{base}.vhdr" not in r.stdout:
             print(r.stdout)
             raise AssertionError("--list did not include expected .vhdr member (BrainVision)")
+
+        # --list-json should include the .vhdr candidate.
+        rj = _run(["--container", str(bv_container), "--list-json"], repo_root)
+        if rj.returncode != 0:
+            print(rj.stdout)
+            raise AssertionError("--list-json failed (BrainVision)")
+        dj = json.loads(rj.stdout)
+        if dj.get("$schema") != SCHEMA_LIST_ID:
+            print(rj.stdout)
+            raise AssertionError("--list-json missing/incorrect $schema (BrainVision)")
+        names = [str(x.get("name", "")) for x in dj.get("candidates", [])]
+        if not any(f"{base}.vhdr" in n for n in names):
+            print(rj.stdout)
+            raise AssertionError("--list-json missing expected .vhdr member (BrainVision)")
 
         outdir_bv = td_path / "out_nf_bv"
         extract_dir_bv = td_path / "extracted_bv"

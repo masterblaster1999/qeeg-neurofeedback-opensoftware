@@ -55,6 +55,12 @@ Transport strategy:
   var runMetaRefresh = $('runMetaRefresh');
   var statsKv = $('statsKv');
 
+  var downloadsDetails = $('downloadsDetails');
+  var bundleDownload = $('bundleDownload');
+  var filesRefresh = $('filesRefresh');
+  var filesList = $('filesList');
+  var filesHint = $('filesHint');
+
   var winSel = $('winSel');
   var pauseBtn = $('pauseBtn');
 
@@ -132,6 +138,17 @@ Transport strategy:
       if(window.localStorage){ window.localStorage.setItem('qeeg_dash_client_id', CLIENT_ID); }
     } catch(e){}
   }
+  function fmtBytes(n){
+    if(n === null || n === undefined || !isFinite(n)) return '—';
+    var units = ['B','KiB','MiB','GiB','TiB'];
+    var v = Math.max(0, n);
+    var u = 0;
+    while(v >= 1024 && u < units.length-1){ v = v / 1024; u++; }
+    if(u === 0) return String(Math.round(v)) + ' ' + units[u];
+    var digs = (v >= 10) ? 1 : 2;
+    return v.toFixed(digs) + ' ' + units[u];
+  }
+
 
   var state = {
     winSec: 60,
@@ -1229,6 +1246,91 @@ Transport strategy:
 
   // ------------------------ run meta + stats (legacy) ------------------------
 
+  // ------------------------ files/downloads (legacy) ------------------------
+
+  var filesLastLoad_utc = 0;
+
+  function clearEl(el){
+    if(!el) return;
+    while(el.firstChild) el.removeChild(el.firstChild);
+  }
+
+  function renderFilesList(obj){
+    if(!filesList) return;
+    clearEl(filesList);
+
+    if(bundleDownload && TOKEN){
+      bundleDownload.href = '/api/bundle?token=' + encodeURIComponent(TOKEN);
+    }
+
+    var files = (obj && obj.files && obj.files.length) ? obj.files : [];
+    var now = nowSec();
+
+    if(filesHint){
+      filesHint.textContent = (files.length === 0) ? 'No downloadable files found in outdir.' : '';
+    }
+
+    for(var i=0;i<files.length;i++){
+      var f = files[i];
+      if(!f || !f.name) continue;
+      var name = String(f.name);
+
+      var row = document.createElement('div');
+      row.className = 'fileRow';
+
+      var a = document.createElement('a');
+      a.textContent = name;
+      a.target = '_blank';
+      a.rel = 'noopener';
+
+      var baseUrl = (f.download_url || f.url) ? String(f.download_url || f.url) : ('/api/file?name=' + encodeURIComponent(name) + '&download=1');
+      var href = baseUrl + (baseUrl.indexOf('?')>=0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+      var downloadable = (typeof f.downloadable === 'boolean') ? f.downloadable : true;
+
+      if(downloadable){
+        a.href = href;
+      } else {
+        a.href = '#';
+        a.style.opacity = '0.6';
+        a.onclick = function(ev){ try{ if(ev && ev.preventDefault) ev.preventDefault(); }catch(e){} return false; };
+      }
+      row.appendChild(a);
+
+      var meta = document.createElement('span');
+      meta.className = 'fileMeta';
+      var st = (f.stat && typeof f.stat === 'object') ? f.stat : {};
+      var size = (st && isFinite(st.size_bytes)) ? st.size_bytes : null;
+      var mtime = (st && isFinite(st.mtime_utc)) ? st.mtime_utc : null;
+      var parts = [];
+      if(size !== null) parts.push(fmtBytes(size));
+      if(mtime !== null) parts.push('age ' + fmtAgeSec(now - mtime));
+      if(f.category) parts.push(String(f.category));
+      if(downloadable === false) parts.push('too large');
+      meta.textContent = parts.join(' · ');
+      row.appendChild(meta);
+
+      filesList.appendChild(row);
+    }
+  }
+
+  function loadFiles(force){
+    if(!TOKEN) return;
+    if(!filesList) return;
+    var now = nowSec();
+    if(!force && (now - filesLastLoad_utc) < 1.0 && filesList.childNodes && filesList.childNodes.length){
+      return;
+    }
+    filesLastLoad_utc = now;
+    if(filesHint) filesHint.textContent = 'Loading…';
+    xhrJson('GET', '/api/files?token=' + encodeURIComponent(TOKEN), null, function(err, obj){
+      if(err){
+        if(filesHint) filesHint.textContent = 'Failed to load file list.';
+        return;
+      }
+      renderFilesList(obj);
+    });
+  }
+
   function loadRunMeta(force){
     if(!TOKEN) return;
     if(!runMetaRaw && !runMetaKv && !runMetaStatus) return;
@@ -1329,6 +1431,20 @@ Transport strategy:
         if(runMetaDetails.open) loadRunMeta(false);
       });
     }
+
+    if(bundleDownload){
+      bundleDownload.href = '/api/bundle?token=' + encodeURIComponent(TOKEN);
+    }
+    if(filesRefresh){
+      filesRefresh.onclick = function(){ loadFiles(true); };
+    }
+    if(downloadsDetails && downloadsDetails.addEventListener){
+      downloadsDetails.addEventListener('toggle', function(){
+        if(downloadsDetails.open) loadFiles(false);
+      });
+    }
+    // Prefetch once so the list is ready when the user opens the panel.
+    loadFiles(false);
 
     ensureUiBindings();
 

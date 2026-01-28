@@ -890,6 +890,41 @@ if(QEEG_BUILD_TESTS)
       set_tests_properties(qeeg_test_report_renderers_selftest
                            PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
+
+      # Smoke test the dependency-free real-time qEEG dashboard server.
+      add_test(NAME qeeg_test_rt_dashboard_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_rt_dashboard.py)
+
+      set_tests_properties(qeeg_test_rt_dashboard_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+                                      TIMEOUT 60)
+
+
+      # Smoke test the dependency-free BioTrace container helper scripts.
+      add_test(NAME qeeg_test_biotrace_extract_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_biotrace_extract.py)
+
+      set_tests_properties(qeeg_test_biotrace_extract_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+      add_test(NAME qeeg_test_biotrace_run_nf_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_biotrace_run_nf.py)
+
+      set_tests_properties(qeeg_test_biotrace_run_nf_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+      # Validate machine-readable BioTrace helper outputs against the JSON Schemas in schemas/.
+      add_test(NAME qeeg_test_biotrace_json_schema_validation
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/validate_biotrace_json_outputs.py
+                 --schemas-dir ${CMAKE_CURRENT_SOURCE_DIR}/schemas)
+
+      set_tests_properties(qeeg_test_biotrace_json_schema_validation
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
       # Developer convenience: allow running the same JSON output validation from the
       # build system, e.g. `cmake --build build --target qeeg_validate_nf_cli_json`.
       add_custom_target(qeeg_validate_nf_cli_json
@@ -905,6 +940,27 @@ if(QEEG_BUILD_TESTS)
                         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
                         COMMENT "Validate qeeg_nf_cli JSON outputs against schemas"
                         VERBATIM)
+
+      # Developer convenience: validate BioTrace helper JSON outputs against their schemas.
+      add_custom_target(qeeg_validate_biotrace_json
+                        COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+                          ${Python3_EXECUTABLE} -B
+                          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/validate_biotrace_json_outputs.py
+                          --schemas-dir ${CMAKE_CURRENT_SOURCE_DIR}/schemas
+                          --verbose
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                        COMMENT "Validate BioTrace helper JSON outputs against schemas"
+                        VERBATIM)
+
+      # Developer convenience: smoke test the real-time dashboard server.
+      add_custom_target(qeeg_selftest_rt_dashboard
+                        COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+                          ${Python3_EXECUTABLE} -B
+                          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_rt_dashboard.py
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                        COMMENT "Smoke test the real-time dashboard server"
+                        VERBATIM)
+
     else()
       message(STATUS "Python3 interpreter not found; skipping qeeg_nf_cli JSON schema validation test")
     endif()
