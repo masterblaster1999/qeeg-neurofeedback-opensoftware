@@ -446,6 +446,314 @@ def build_reference_info(outdir: Path) -> Dict[str, object]:
     return resp
 
 
+
+# ---------------------------------------------------------------------------
+# Baseline (within-session) robust z-score support
+# ---------------------------------------------------------------------------
+
+_BASELINE_CACHE_LOCK = threading.Lock()
+_BASELINE_CACHE_KEY: Optional[Tuple[float, int, float, int, float]] = None  # (bp_mtime, bp_size, art_mtime, art_size, baseline_sec)
+_BASELINE_CACHE: Optional[Dict[str, object]] = None
+
+# MAD -> SD scaling constant under a Normal assumption.
+_MAD_TO_SD = 1.4826
+
+
+def _median(xs: List[float]) -> Optional[float]:
+    if not xs:
+        return None
+    ys = sorted(xs)
+    n = len(ys)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(ys[mid])
+    return 0.5 * (float(ys[mid - 1]) + float(ys[mid]))
+
+
+def _mean_std(xs: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    if not xs:
+        return None, None
+    n = len(xs)
+    if n < 2:
+        return float(xs[0]), None
+    m = float(sum(xs)) / float(n)
+    var = 0.0
+    for v in xs:
+        d = float(v) - m
+        var += d * d
+    var /= float(n - 1)
+    return m, math.sqrt(var) if var >= 0.0 else None
+
+
+def _robust_scale_mad(xs: List[float], med: float) -> Optional[float]:
+    if not xs or not math.isfinite(med):
+        return None
+    dev = [abs(float(v) - float(med)) for v in xs if math.isfinite(float(v))]
+    mad = _median(dev)
+    if mad is None:
+        return None
+    sc = float(mad) * float(_MAD_TO_SD)
+    if math.isfinite(sc) and sc > 0.0:
+        return sc
+    # Fallback: sample stddev.
+    _, sd = _mean_std(xs)
+    if sd is not None and math.isfinite(sd) and sd > 0.0:
+        return float(sd)
+    return None
+
+
+def _baseline_seconds_from_run_meta(outdir: Path) -> float:
+    """Best-effort: baseline_seconds from nf_run_meta.json (summary)."""
+    try:
+        info = _run_meta_summary_info(outdir)
+        summ = info.get('summary') if isinstance(info, dict) else None
+        if isinstance(summ, dict):
+            v = summ.get('baseline_seconds')
+            if isinstance(v, (int, float)):
+                return float(v)
+            if isinstance(v, str):
+                try:
+                    return float(v)
+                except Exception:
+                    return 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def build_baseline_info(outdir: Path, *, baseline_sec_override: Optional[float] = None) -> Dict[str, object]:
+    """Compute a robust per-column baseline (median + MAD-derived scale).
+
+    This supports z-score mapping (zbase) in the real-time dashboard even after a
+    page reload. The baseline is recomputed from the first baseline_seconds of
+    bandpower_timeseries.csv and cached by file stat.
+
+    Artifacts: if artifact_gate_timeseries.csv is present, frames marked as
+    artifact are excluded from baseline accumulation (requires ready==1 when the
+    column is present).
+    """
+
+    bp_path = outdir / "bandpower_timeseries.csv"
+    art_path = outdir / "artifact_gate_timeseries.csv"
+    rm_path = outdir / "nf_run_meta.json"
+
+    st_bp = _stat_dict(bp_path)
+    st_art = _stat_dict(art_path)
+    st_rm = _stat_dict(rm_path)
+
+    # Baseline duration: prefer an explicit override (API query param), otherwise fall
+    # back to nf_run_meta.json (if present).
+    baseline_sec = 0.0
+    if baseline_sec_override is not None:
+        try:
+            baseline_sec = float(baseline_sec_override)
+        except Exception:
+            baseline_sec = 0.0
+    if not (baseline_sec and baseline_sec > 0.0 and math.isfinite(float(baseline_sec))):
+        baseline_sec = float(_baseline_seconds_from_run_meta(outdir) or 0.0)
+
+    resp: Dict[str, object] = {
+        "schema_version": 1,
+        "server_time_utc": float(time.time()),
+        "baseline": {
+            "seconds": float(baseline_sec),
+            "method": "median_mad",
+            "mad_to_sd": float(_MAD_TO_SD),
+            "min_samples_per_col": 5,
+            "complete": False,
+            "frames_total": 0,
+            "frames_used": 0,
+            "frames_skipped_artifact": 0,
+            "gated_artifacts": bool(st_art.get("exists")),
+            "gating_requires_ready": True,
+            "last_t_end_sec": None,
+        },
+        "bandpower": {"path": str(bp_path), "stat": st_bp},
+        "artifact": {"path": str(art_path), "stat": st_art},
+        "run_meta": {"path": str(rm_path), "stat": st_rm},
+        "aligned": None,
+    }
+
+    if not st_bp.get("exists"):
+        return resp
+
+    if not (baseline_sec and baseline_sec > 0.0 and math.isfinite(float(baseline_sec))):
+        # No baseline window defined (e.g., user supplied --initial-threshold).
+        return resp
+
+    hdr = _read_csv_header_line(bp_path)
+    bp = parse_bandpower_timeseries_header(hdr) if hdr else None
+    if not bp:
+        return resp
+
+    # Cache keyed by file stats (mtime+size) + baseline seconds.
+    key = (
+        float(st_bp.get("mtime_utc", 0.0) or 0.0),
+        int(st_bp.get("size_bytes", 0) or 0),
+        float(st_art.get("mtime_utc", 0.0) or 0.0),
+        int(st_art.get("size_bytes", 0) or 0),
+        float(baseline_sec),
+    )
+    global _BASELINE_CACHE_KEY, _BASELINE_CACHE
+    with _BASELINE_CACHE_LOCK:
+        if _BASELINE_CACHE_KEY == key and _BASELINE_CACHE is not None:
+            return dict(_BASELINE_CACHE)
+
+    # Load artifact states (t_end_sec, ready, bad) up to baseline_sec (if present).
+    # If no "ready" column exists, we treat frames as ready by default.
+    art_states: List[Tuple[float, int, int]] = []
+    if st_art.get("exists"):
+        try:
+            with art_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                r = csv.reader(f)
+                header = next(r, None)
+                hm: Dict[str, int] = {}
+                if header:
+                    hm = {(h or "").strip().lower(): i for i, h in enumerate(header)}
+                t_idx = hm.get("t_end_sec", hm.get("t", 0))
+                ready_idx = hm.get("ready", hm.get("baseline_ready", -1))
+                bad_idx = hm.get("bad", hm.get("artifact", -1))
+                for row in r:
+                    if not row:
+                        continue
+                    if t_idx >= len(row):
+                        continue
+                    t = _safe_float(row[t_idx])
+                    if t is None or not math.isfinite(float(t)):
+                        continue
+                    tt = float(t)
+                    if tt > float(baseline_sec):
+                        break
+                    ready = 1
+                    if 0 <= ready_idx < len(row):
+                        rv = _safe_float(row[ready_idx])
+                        if rv is not None:
+                            ready = int(rv) != 0
+                    bad = 0
+                    if 0 <= bad_idx < len(row):
+                        bv = _safe_float(row[bad_idx])
+                        if bv is not None:
+                            bad = int(bv) != 0
+                    art_states.append((tt, 1 if ready else 0, 1 if bad else 0))
+        except Exception:
+            art_states = []
+
+    # Helper: last-known artifact state at time t.
+    art_i = 0
+
+    def _artifact_hit_at(t: float) -> bool:
+        nonlocal art_i
+        if not art_states:
+            return False
+        if art_i < 0:
+            art_i = 0
+        # Advance cursor while next timestamp <= t.
+        while art_i + 1 < len(art_states) and art_states[art_i + 1][0] <= t:
+            art_i += 1
+        _, ready, bad = art_states[art_i]
+        return bool(ready and bad)
+
+    n_cols = len(bp.col_indices)
+    samples: List[List[float]] = [[] for _ in range(n_cols)]
+    total_frames = 0
+    used_frames = 0
+    skipped_art = 0
+    saw_past_end = False
+    last_t: Optional[float] = None
+
+    try:
+        with bp_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            r = csv.reader(f)
+            _ = next(r, None)  # header
+            for row in r:
+                if not row:
+                    continue
+                if bp.time_idx >= len(row):
+                    continue
+                t = _safe_float(row[bp.time_idx])
+                if t is None or not math.isfinite(float(t)):
+                    continue
+                tt = float(t)
+                last_t = tt
+                if tt > float(baseline_sec):
+                    saw_past_end = True
+                    break
+                total_frames += 1
+                if _artifact_hit_at(tt):
+                    skipped_art += 1
+                    continue
+                used_frames += 1
+                for j, idx in enumerate(bp.col_indices):
+                    if idx < 0 or idx >= len(row):
+                        continue
+                    v = _safe_float(row[idx])
+                    if v is None:
+                        continue
+                    fv = float(v)
+                    if not math.isfinite(fv):
+                        continue
+                    samples[j].append(fv)
+    except Exception:
+        pass
+
+    # Baseline completeness: true if we've observed at least one post-baseline frame (tt > baseline_sec),
+    # or if the latest observed frame hits the baseline end exactly.
+    complete = bool(
+        saw_past_end
+        or (last_t is not None and math.isfinite(float(last_t)) and float(last_t) >= float(baseline_sec) - 1e-6)
+    )
+
+    resp["baseline"]["complete"] = bool(complete)
+    resp["baseline"]["frames_total"] = int(total_frames)
+    resp["baseline"]["frames_used"] = int(used_frames)
+    resp["baseline"]["frames_skipped_artifact"] = int(skipped_art)
+    resp["baseline"]["last_t_end_sec"] = float(last_t) if (last_t is not None and math.isfinite(float(last_t))) else None
+
+    medians: List[Optional[float]] = []
+    scales: List[Optional[float]] = []
+    present: List[int] = []
+    ok = 0
+    min_samples = int(resp["baseline"]["min_samples_per_col"])
+    for j in range(n_cols):
+        xs = samples[j]
+        if len(xs) < min_samples:
+            medians.append(None)
+            scales.append(None)
+            present.append(0)
+            continue
+        med = _median(xs)
+        if med is None or not math.isfinite(float(med)):
+            medians.append(None)
+            scales.append(None)
+            present.append(0)
+            continue
+        sc = _robust_scale_mad(xs, float(med))
+        if sc is None or not math.isfinite(float(sc)) or not (float(sc) > 0.0):
+            medians.append(None)
+            scales.append(None)
+            present.append(0)
+            continue
+        medians.append(float(med))
+        scales.append(float(sc))
+        present.append(1)
+        ok += 1
+
+    resp["aligned"] = {
+        "bands": bp.bands,
+        "channels": bp.channels,
+        "median": medians,
+        "scale": scales,
+        "present": present,
+        "ok_cols": int(ok),
+    }
+
+    with _BASELINE_CACHE_LOCK:
+        _BASELINE_CACHE_KEY = key
+        _BASELINE_CACHE = dict(resp)
+
+    return resp
+
+
 class CsvTailer:
 
     """Incrementally tails a CSV file that is appended over time."""
@@ -693,6 +1001,15 @@ def _summarize_run_meta_obj(obj: object) -> Optional[Dict[str, object]]:
         "window_seconds",
         "update_seconds",
         "metric_smooth_seconds",
+        # Live visualization (optional).
+        "topomap_latest",
+        "topomap_band",
+        "topomap_mode",
+        "topomap_every",
+        "topomap_grid",
+        "topomap_annotate",
+        "topomap_vmin",
+        "topomap_vmax",
         "artifact_gate",
         "qc_bad_channel_count",
         "qc_bad_channels",
@@ -772,6 +1089,7 @@ def compute_meta(outdir: Path) -> Dict[str, object]:
             "artifact_gate_timeseries": str(outdir / "artifact_gate_timeseries.csv"),
             "nf_run_meta": str(run_meta_path),
             "reference_used": str(outdir / "reference_used.csv"),
+            "nf_topomap_latest": str(outdir / "nf_topomap_latest.bmp"),
         },
         "files_stat": {
             "nf_feedback": _stat_dict(outdir / "nf_feedback.csv"),
@@ -779,6 +1097,7 @@ def compute_meta(outdir: Path) -> Dict[str, object]:
             "artifact_gate_timeseries": _stat_dict(outdir / "artifact_gate_timeseries.csv"),
             "nf_run_meta": _stat_dict(run_meta_path),
             "reference_used": _stat_dict(outdir / "reference_used.csv"),
+            "nf_topomap_latest": _stat_dict(outdir / "nf_topomap_latest.bmp"),
         },
         # Compact run meta summary (full JSON via /api/run_meta).
         "run_meta": _run_meta_summary_info(outdir),
@@ -917,6 +1236,11 @@ class LiveHub:
                 idx_thr_z = hmap.get("threshold_z", -1)
                 idx_metric_z_ref = hmap.get("metric_z_ref", -1)
                 idx_thr_z_ref = hmap.get("threshold_z_ref", -1)
+                idx_raw_reward = hmap.get("raw_reward", -1)
+                idx_thr_desired = hmap.get("threshold_desired", -1)
+                idx_metric_raw = hmap.get("metric_raw", -1)
+                idx_feedback_raw = hmap.get("feedback_raw", -1)
+                idx_reward_value = hmap.get("reward_value", -1)
 
                 def emit_row(row: List[str]) -> Optional[Dict[str, object]]:
                     if not row:
@@ -941,6 +1265,16 @@ class LiveHub:
                         obj["metric_z_ref"] = _safe_float(row[idx_metric_z_ref])
                     if 0 <= idx_thr_z_ref < len(row):
                         obj["threshold_z_ref"] = _safe_float(row[idx_thr_z_ref])
+                    if 0 <= idx_metric_raw < len(row):
+                        obj["metric_raw"] = _safe_float(row[idx_metric_raw])
+                    if 0 <= idx_feedback_raw < len(row):
+                        obj["feedback_raw"] = _safe_float(row[idx_feedback_raw])
+                    if 0 <= idx_reward_value < len(row):
+                        obj["reward_value"] = _safe_float(row[idx_reward_value])
+                    if 0 <= idx_raw_reward < len(row):
+                        obj["raw_reward"] = int(_safe_float(row[idx_raw_reward]) or 0)
+                    if 0 <= idx_thr_desired < len(row):
+                        obj["threshold_desired"] = _safe_float(row[idx_thr_desired])
                     if 0 <= idx_art_ready < len(row):
                         obj["artifact_ready"] = int(_safe_float(row[idx_art_ready]) or 0)
                     if 0 <= idx_art < len(row):
@@ -2465,7 +2799,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(HTTPStatus.OK, self.server.build_reference())
                 return
-
+            if path == "/api/baseline":
+                if not self._require_token():
+                    return
+                q = parse_qs(u.query)
+                bs_s = (q.get("baseline_sec") or q.get("baseline") or q.get("baseline_seconds") or [""])[0]
+                bs: Optional[float] = None
+                if bs_s:
+                    try:
+                        bs = float(bs_s)
+                    except Exception:
+                        bs = None
+                self._send_json(HTTPStatus.OK, self.server.build_baseline(baseline_sec_override=bs))
+                return
             if path == "/api/run_meta":
                 if not self._require_token():
                     return
@@ -2526,6 +2872,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "parse_error": parse_error,
                 }
                 self._send_json(HTTPStatus.OK, resp, cache_control="no-cache", etag=etag, last_modified=last_mod)
+                return
+
+            if path == "/api/topomap_latest":
+                if not self._require_token():
+                    return
+
+                bmp_path = self.server.config.outdir / "nf_topomap_latest.bmp"
+                st = _stat_dict(bmp_path)
+
+                etag: Optional[str] = None
+                last_mod: Optional[str] = None
+                if st.get("exists"):
+                    try:
+                        etag = _weak_etag_from_stat(int(st.get("size_bytes", 0) or 0), float(st.get("mtime_utc", 0.0) or 0.0))
+                        last_mod = _http_date(float(st.get("mtime_utc", 0.0) or 0.0))
+                    except Exception:
+                        etag = None
+                        last_mod = None
+
+                if etag and _if_none_match_matches(self.headers.get("If-None-Match", ""), etag):
+                    self._send_not_modified(cache_control="no-cache", etag=etag, last_modified=last_mod)
+                    return
+
+                data = _safe_read_file(bmp_path, max_bytes=10_000_000)
+                if data is None:
+                    self._send_json_error(HTTPStatus.NOT_FOUND, "nf_topomap_latest.bmp not found", error_code="not_found")
+                    return
+
+                self._send(
+                    HTTPStatus.OK,
+                    data,
+                    "image/bmp",
+                    cache_control="no-cache",
+                    etag=etag,
+                    last_modified=last_mod,
+                )
                 return
 
             if path == "/api/stats":
@@ -2798,6 +3180,7 @@ class DashboardServer(ThreadingHTTPServer):
                 "run_meta": True,
                 "stats": True,
                 "reference": True,
+                "baseline": True,
                 "asset_etag": True,
             },
         }
@@ -2807,6 +3190,11 @@ class DashboardServer(ThreadingHTTPServer):
     def build_reference(self) -> Dict[str, object]:
         """Normative reference stats aligned to bandpower columns (if available)."""
         return build_reference_info(self.config.outdir)
+
+
+    def build_baseline(self, *, baseline_sec_override: Optional[float] = None) -> Dict[str, object]:
+        """Robust baseline stats aligned to bandpower columns (if available)."""
+        return build_baseline_info(self.config.outdir, baseline_sec_override=baseline_sec_override)
 
 
     # ------------------------ snapshot (polling) API ------------------------
@@ -2986,6 +3374,7 @@ class DashboardServer(ThreadingHTTPServer):
             "labels": "on",
             "nf_mode": "raw",
             "map_mode": "raw",
+            "topo_source": "auto",
             "updated_utc": float(time.time()),
             "updated_by": None,
         }
@@ -3071,6 +3460,11 @@ class DashboardServer(ThreadingHTTPServer):
             map_mode = "raw"
         out["map_mode"] = map_mode
 
+        topo_source = st.get("topo_source", out.get("topo_source", "auto"))
+        if topo_source not in ("auto", "browser", "cli"):
+            topo_source = "auto"
+        out["topo_source"] = topo_source
+
         out["updated_utc"] = _num(st.get("updated_utc", time.time()), 0.0, 1e12, float(time.time()))
         out["updated_by"] = _s(st.get("updated_by"), 96)
         return out
@@ -3083,7 +3477,7 @@ class DashboardServer(ThreadingHTTPServer):
 
     def update_ui_state(self, patch: Dict[str, object]) -> Dict[str, object]:
         # Only allow specific keys.
-        allowed = {"win_sec", "paused", "band", "channel", "transform", "scale", "labels", "nf_mode", "map_mode", "client_id"}
+        allowed = {"win_sec", "paused", "band", "channel", "transform", "scale", "labels", "nf_mode", "map_mode", "topo_source", "client_id"}
         clean_patch: Dict[str, object] = {k: patch[k] for k in patch.keys() if k in allowed}
         client_id = clean_patch.get("client_id")
         updated_by = None

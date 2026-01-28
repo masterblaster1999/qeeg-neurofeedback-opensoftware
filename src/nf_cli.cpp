@@ -1,5 +1,7 @@
 #include "qeeg/bandpower.hpp"
+#include "qeeg/bmp_writer.hpp"
 #include "qeeg/montage.hpp"
+#include "qeeg/topomap.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/online_bandpower.hpp"
 #include "qeeg/online_coherence.hpp"
@@ -136,6 +138,31 @@ struct Args {
   // When provided, qeeg_nf_cli can compute reference-based z-scores for bandpower metrics
   // and makes the file available to real-time dashboards by copying it into --outdir.
   std::string reference_csv;
+
+  // Optional lightweight live dashboard export.
+  // Writes 'nf_live_ui.html' into --outdir. This dashboard is designed to be served
+  // via qeeg_ui_server_cli so it can tail nf_feedback.csv while the run is in progress.
+  bool live_ui{false};
+
+  // Optional: write a continuously-updated scalp topomap BMP ('nf_topomap_latest.bmp').
+  // Designed for real-time-ish neurofeedback dashboards.
+  //
+  // Notes:
+  // - Requires a bandpower engine (band/ratio/asymmetry metrics). Not supported for coherence/PAC.
+  // - When topomap_mode=zref, z-scores are computed per channel using --reference-csv.
+  // - When topomap_mode=zbase, z-scores are computed per channel using robust
+  //   baseline stats (median + MAD scale) from the first --baseline seconds.
+  bool topomap_latest{false};
+  std::string topomap_band;           // optional override; default inferred from metric
+  std::string topomap_mode{"auto"}; // auto|raw|zbase|zref
+  int topomap_every{1};              // update every N NF frames
+  int topomap_grid{256};
+  bool topomap_annotate{true};
+  double topomap_vmin{std::numeric_limits<double>::quiet_NaN()};
+  double topomap_vmax{std::numeric_limits<double>::quiet_NaN()};
+  // Montage selection for topomaps.
+  std::string montage_csv;            // optional custom montage CSV: name,x,y
+  std::string montage_builtin{"1010"}; // 1010 (default) or 1020
 
   // Neurofeedback threshold params
   // Initial threshold is estimated from the first --baseline seconds unless overridden by --threshold.
@@ -882,6 +909,21 @@ static void print_nf_config_json(const Args& args,
   std::cout << "  \"export_coherence\": " << (args.export_coherence ? "true" : "false") << ",\n";
   std::cout << "  \"flush_csv\": " << (args.flush_csv ? "true" : "false") << ",\n";
   std::cout << "  \"export_artifacts\": " << (args.export_artifacts ? "true" : "false") << ",\n";
+  std::cout << "  \"live_ui\": " << (args.live_ui ? "true" : "false") << ",\n";
+  std::cout << "  \"topomap_latest\": " << (args.topomap_latest ? "true" : "false") << ",\n";
+  std::cout << "  \"topomap_band\": ";
+  if (!args.topomap_band.empty()) std::cout << "\"" << json_escape(args.topomap_band) << "\"";
+  else std::cout << "null";
+  std::cout << ",\n";
+  std::cout << "  \"topomap_mode\": \"" << json_escape(args.topomap_mode) << "\",\n";
+  std::cout << "  \"topomap_every\": " << args.topomap_every << ",\n";
+  std::cout << "  \"topomap_grid\": " << args.topomap_grid << ",\n";
+  std::cout << "  \"topomap_annotate\": " << (args.topomap_annotate ? "true" : "false") << ",\n";
+  std::cout << "  \"montage_csv\": ";
+  if (!args.montage_csv.empty()) std::cout << "\"" << json_escape(args.montage_csv) << "\"";
+  else std::cout << "null";
+  std::cout << ",\n";
+  std::cout << "  \"montage_builtin\": \"" << json_escape(args.montage_builtin) << "\",\n";
   std::cout << "  \"biotrace_ui\": " << (args.biotrace_ui ? "true" : "false") << ",\n";
   std::cout << "  \"export_derived_events\": " << (args.export_derived_events ? "true" : "false") << ",\n";
 
@@ -1021,6 +1063,19 @@ static void print_help() {
     << "  --export-bandpowers        Write bandpower_timeseries.csv (bandpower/ratio modes)\n"
     << "  --export-coherence         Write coherence_timeseries.csv or imcoh_timeseries.csv (coherence mode)\n"
     << "  --flush-csv               Flush CSV outputs after each row (useful for real-time dashboards / tail -f)\n"
+    << "  --live-ui                 Write a lightweight live dashboard HTML (nf_live_ui.html) that tails nf_feedback.csv\n"
+    << "                           Designed to be served by qeeg_ui_server_cli while the run is in progress. Implies --flush-csv.\n"
+    << "  --topomap-latest           Write/update a scalp topomap BMP (nf_topomap_latest.bmp) during the run (bandpower metrics only). Implies --flush-csv.\n"
+    << "  --topomap-band NAME        Topomap band name (default: inferred from --metric; ratio defaults to numerator).\n"
+    << "  --topomap-mode MODE        Topomap values: auto|raw|zbase|zref (default: auto). zbase uses per-channel baseline z-scores from the initial --baseline window; zref uses per-channel reference z-scores from --reference-csv.\n"
+    << "  --topomap-every N          Update topomap every N NF frames (default: 1).\n"
+    << "  --topomap-grid N           Topomap grid size in pixels (default: 256).\n"
+    << "  --topomap-vmin X           Topomap color scale minimum (optional; set both vmin and vmax).\n"
+    << "  --topomap-vmax X           Topomap color scale maximum (optional; set both vmin and vmax).\n"
+    << "  --topomap-no-annotate      Disable head/electrode overlay + colorbar in topomap BMP.\n"
+    << "  --montage PATH             Optional montage CSV for topomaps: name,x,y (unit circle).\n"
+    << "  --montage-1010             Use built-in 10-10 montage (61 channels; default for topomaps).\n"
+    << "  --montage-1020             Use built-in 10-20 montage (19 channels).\n"
     << "  --artifact-gate            Suppress reward/adaptation during detected artifacts\n"
     << "  --artifact-ptp-z Z         Artifact threshold: peak-to-peak robust z (<=0 disables; default: 6)\n"
     << "  --artifact-rms-z Z         Artifact threshold: RMS robust z (<=0 disables; default: 6)\n"
@@ -1228,6 +1283,32 @@ static Args parse_args(int argc, char** argv) {
       a.export_coherence = true;
     } else if (arg == "--flush-csv") {
       a.flush_csv = true;
+    } else if (arg == "--live-ui") {
+      a.live_ui = true;
+      a.flush_csv = true;
+    } else if (arg == "--topomap-latest") {
+      a.topomap_latest = true;
+      a.flush_csv = true;
+    } else if (arg == "--topomap-band" && i + 1 < argc) {
+      a.topomap_band = argv[++i];
+    } else if (arg == "--topomap-mode" && i + 1 < argc) {
+      a.topomap_mode = argv[++i];
+    } else if (arg == "--topomap-every" && i + 1 < argc) {
+      a.topomap_every = to_int(argv[++i]);
+    } else if (arg == "--topomap-grid" && i + 1 < argc) {
+      a.topomap_grid = to_int(argv[++i]);
+    } else if (arg == "--topomap-vmin" && i + 1 < argc) {
+      a.topomap_vmin = to_double(argv[++i]);
+    } else if (arg == "--topomap-vmax" && i + 1 < argc) {
+      a.topomap_vmax = to_double(argv[++i]);
+    } else if (arg == "--topomap-no-annotate") {
+      a.topomap_annotate = false;
+    } else if (arg == "--montage" && i + 1 < argc) {
+      a.montage_csv = argv[++i];
+    } else if (arg == "--montage-1010") {
+      a.montage_builtin = "1010";
+    } else if (arg == "--montage-1020") {
+      a.montage_builtin = "1020";
     } else if (arg == "--artifact-gate") {
       a.artifact_gate = true;
     } else if (arg == "--artifact-ptp-z" && i + 1 < argc) {
@@ -1294,6 +1375,348 @@ static std::string resolve_out_path(const std::string& outdir, const std::string
     return outdir + "/" + path_or_name;
   }
   return path_or_name;
+}
+
+static Montage default_topomap_montage(const Args& args) {
+  if (!args.montage_csv.empty()) {
+    return Montage::load_csv(args.montage_csv);
+  }
+  const std::string which = to_lower(trim(args.montage_builtin));
+  if (which == "1020" || which == "10-20") {
+    return Montage::builtin_standard_1020_19();
+  }
+  // Default: a larger 10-10 montage.
+  return Montage::builtin_standard_1010_61();
+}
+
+static void atomic_replace_file(const std::string& tmp_path, const std::string& dst_path) {
+  std::error_code ec;
+  // Best-effort atomic-ish replace: remove + rename.
+  std::filesystem::remove(std::filesystem::u8path(dst_path), ec);
+  ec.clear();
+  std::filesystem::rename(std::filesystem::u8path(tmp_path), std::filesystem::u8path(dst_path), ec);
+  if (!ec) return;
+
+  // Fallback for cross-filesystem or Windows rename semantics.
+  ec.clear();
+  std::filesystem::copy_file(std::filesystem::u8path(tmp_path), std::filesystem::u8path(dst_path),
+                             std::filesystem::copy_options::overwrite_existing, ec);
+  std::filesystem::remove(std::filesystem::u8path(tmp_path), ec);
+}
+
+static void write_nf_live_ui_html_if_requested(const Args& args,
+                                               const EEGRecording& rec,
+                                               const NfMetricSpec& metric,
+                                               bool have_reference,
+                                               const std::string& reference_csv_out,
+                                               bool topomap_enabled,
+                                               const std::string& topomap_band,
+                                               const std::string& topomap_mode) {
+  if (!args.live_ui) return;
+
+  const std::string outpath = args.outdir + "/nf_live_ui.html";
+  std::ofstream out(outpath);
+  if (!out) throw std::runtime_error("Failed to write " + outpath);
+
+  const std::string metric_label = args.metric_spec;
+  const std::string proto = args.protocol;
+  const std::string topo_label = topomap_enabled ? ("Topomap: " + topomap_band + " (" + topomap_mode + ")") : std::string();
+
+  out << "<!doctype html>\n"
+      << "<html lang=\"en\">\n"
+      << "<head>\n"
+      << "  <meta charset=\"utf-8\"/>\n"
+      << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\n"
+      << "  <title>QEEG NF Live</title>\n"
+      << "  <style>\n"
+      << "    :root { --bg:#0b1020; --panel:#111a33; --panel2:#0f172a; --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; --reward:#34d399; --warn:#f97316; --bad:#ef4444; }\n"
+      << "    html, body { height:100%; margin:0; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }\n"
+      << "    .topbar { height:52px; display:flex; align-items:center; gap:12px; padding:0 14px; background:linear-gradient(90deg,var(--panel),var(--panel2)); border-bottom:1px solid rgba(255,255,255,0.08); }\n"
+      << "    .brand { font-weight:700; letter-spacing:0.2px; }\n"
+      << "    .pill { padding:4px 10px; border:1px solid rgba(255,255,255,0.12); border-radius:999px; color:var(--muted); font-size:12px; white-space:nowrap; }\n"
+      << "    .layout { display:grid; grid-template-columns: 340px 1fr; height: calc(100% - 52px); }\n"
+      << "    .side { padding:14px; background:var(--panel2); border-right:1px solid rgba(255,255,255,0.08); overflow:auto; }\n"
+      << "    .main { padding:14px; overflow:hidden; }\n"
+      << "    .card { background:rgba(17,26,51,0.6); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:12px; margin-bottom:12px; }\n"
+      << "    .row { display:flex; justify-content:space-between; gap:10px; }\n"
+      << "    .k { color:var(--muted); font-size:12px; }\n"
+      << "    .v { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:12px; }\n"
+      << "    .big { font-size:22px; font-weight:800; }\n"
+      << "    canvas { width:100%; height:420px; background:rgba(0,0,0,0.18); border:1px solid rgba(255,255,255,0.08); border-radius:12px; }\n"
+      << "    .topo { width:100%; border:1px solid rgba(255,255,255,0.08); border-radius:12px; background:rgba(0,0,0,0.18); }\n"
+      << "    .hint { color:var(--muted); font-size:12px; }\n"
+      << "    button { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); color:var(--text); border-radius:10px; padding:10px 12px; cursor:pointer; }\n"
+      << "    button:hover { border-color:rgba(255,255,255,0.22); }\n"
+      << "    select { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); color:var(--text); border-radius:10px; padding:8px 10px; }\n"
+      << "  </style>\n"
+      << "</head>\n"
+      << "<body>\n"
+      << "  <div class=\"topbar\">\n"
+      << "    <div class=\"brand\">QEEG Neurofeedback — Live</div>\n"
+      << "    <div class=\"pill\">" << (proto.empty() ? "" : ("Protocol: " + json_escape(proto) + " | ")) << "Metric: " << json_escape(metric_label) << "</div>\n"
+      << "    <div class=\"pill\">Fs: " << std::fixed << std::setprecision(3) << rec.fs_hz << " Hz</div>\n"
+      << "    <div class=\"pill\">Update: " << std::fixed << std::setprecision(3) << args.update_seconds << " s</div>\n";
+  if (have_reference && !reference_csv_out.empty()) {
+    out << "    <div class=\"pill\">Reference: reference_used.csv</div>\n";
+  }
+  if (topomap_enabled) {
+    out << "    <div class=\"pill\">" << json_escape(topo_label) << "</div>\n";
+  }
+  out << "  </div>\n"
+      << "  <div class=\"layout\">\n"
+      << "    <div class=\"side\">\n"
+      << "      <div class=\"card\">\n"
+      << "        <div class=\"k\">Current</div>\n"
+      << "        <div class=\"big\" id=\"curMetric\">—</div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Threshold</div><div class=\"v\" id=\"curThreshold\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">metric_raw</div><div class=\"v\" id=\"curMetricRaw\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Reward</div><div class=\"v\" id=\"curReward\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">feedback_raw</div><div class=\"v\" id=\"curFbRaw\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">reward_value</div><div class=\"v\" id=\"curRewardVal\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">Reward rate</div><div class=\"v\" id=\"curRR\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">metric_z (baseline)</div><div class=\"v\" id=\"curMz\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">metric_z_ref</div><div class=\"v\" id=\"curMzRef\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">threshold_z (baseline)</div><div class=\"v\" id=\"curTz\">—</div></div>\n"
+      << "        <div class=\"row\"><div class=\"k\">threshold_z_ref</div><div class=\"v\" id=\"curTzRef\">—</div></div>\n"
+      << "      </div>\n";
+  if (topomap_enabled) {
+    out << "      <div class=\"card\">\n"
+        << "        <div class=\"k\">Topomap</div>\n"
+        << "        <img class=\"topo\" id=\"topoImg\" alt=\"topomap\" src=\"nf_topomap_latest.bmp\"/>\n"
+        << "        <div class=\"hint\" style=\"margin-top:8px\">This image is overwritten while the run is in progress. If it looks stuck, the browser might be caching — keep the dashboard served by qeeg_ui_server_cli.</div>\n"
+        << "      </div>\n";
+  }
+  out << "      <div class=\"card\">\n"
+      << "        <div class=\"k\">View</div>\n"
+      << "        <div class=\"row\" style=\"margin-top:8px\"><div class=\"k\">Time window</div><div><select id=\"winSec\">\n"
+      << "          <option value=\"5\">5 s</option>\n"
+      << "          <option value=\"10\">10 s</option>\n"
+      << "          <option value=\"20\">20 s</option>\n"
+      << "          <option value=\"30\" selected>30 s</option>\n"
+      << "          <option value=\"60\">60 s</option>\n"
+      << "          <option value=\"120\">120 s</option>\n"
+      << "        </select></div></div>\n"
+      << "        <div class=\"row\" style=\"margin-top:8px\"><div class=\"k\">Refresh</div><div><select id=\"pollMs\">\n"
+      << "          <option value=\"100\">100 ms</option>\n"
+      << "          <option value=\"250\" selected>250 ms</option>\n"
+      << "          <option value=\"500\">500 ms</option>\n"
+      << "          <option value=\"1000\">1 s</option>\n"
+      << "        </select></div></div>\n"
+      << "        <div class=\"hint\" style=\"margin-top:8px\">This dashboard tails <span class=\"v\">nf_feedback.csv</span>. For best results run with <span class=\"v\">--flush-csv</span> (implied by <span class=\"v\">--live-ui</span>).</div>\n"
+      << "      </div>\n"
+      << "    </div>\n"
+      << "    <div class=\"main\">\n"
+      << "      <canvas id=\"plot\"></canvas>\n"
+      << "      <div class=\"hint\" style=\"margin-top:10px\">Metric (cyan) and Threshold (gray). Reward frames are highlighted green.</div>\n"
+      << "      <div style=\"margin-top:10px; display:flex; gap:10px; align-items:center\">\n"
+      << "        <button id=\"btnClear\" title=\"Clear cached data\">Clear</button>\n"
+      << "        <span class=\"hint\">If the chart does not update, ensure you opened this through qeeg_ui_server_cli (not file://).</span>\n"
+      << "      </div>\n"
+      << "    </div>\n"
+      << "  </div>\n"
+      << "  <script>\n"
+      << "  const csvUrl = 'nf_feedback.csv';\n"
+      << "  const topoEnabled = " << (topomap_enabled ? "true" : "false") << ";\n"
+      << "  const topoUrl = 'nf_topomap_latest.bmp';\n"
+      << "  let byteOffset = 0;\n"
+      << "  let header = null;\n"
+      << "  let partial = '';\n"
+      << "  const data = []; // rows: {t,metric,metric_raw,thr,reward,fbraw,reward_value,rr,mz,tz,mzref,tzref}\n"
+      << "  const plot = document.getElementById('plot');\n"
+      << "  const ctx = plot.getContext('2d');\n"
+      << "  const curMetric = document.getElementById('curMetric');\n"
+      << "  const curThreshold = document.getElementById('curThreshold');\n  const curMetricRaw = document.getElementById('curMetricRaw');\n"
+      << "  const curReward = document.getElementById('curReward');\n  const curFbRaw = document.getElementById('curFbRaw');\n  const curRewardVal = document.getElementById('curRewardVal');\n"
+      << "  const curRR = document.getElementById('curRR');\n"
+      << "  const curMz = document.getElementById('curMz');\n"
+      << "  const curMzRef = document.getElementById('curMzRef');\n  const curTz = document.getElementById('curTz');\n  const curTzRef = document.getElementById('curTzRef');\n"
+      << "  const winSecSel = document.getElementById('winSec');\n"
+      << "  const pollSel = document.getElementById('pollMs');\n"
+      << "  const btnClear = document.getElementById('btnClear');\n"
+      << "  const topoImg = document.getElementById('topoImg');\n"
+      << "\n"
+      << "  function resizeCanvas() {\n"
+      << "    const dpr = window.devicePixelRatio || 1;\n"
+      << "    const rect = plot.getBoundingClientRect();\n"
+      << "    plot.width = Math.max(1, Math.floor(rect.width * dpr));\n"
+      << "    plot.height = Math.max(1, Math.floor(rect.height * dpr));\n"
+      << "  }\n"
+      << "  window.addEventListener('resize', () => { resizeCanvas(); draw(); });\n"
+      << "  resizeCanvas();\n"
+      << "\n"
+      << "  function parseLine(line) {\n"
+      << "    if (!line) return;\n"
+      << "    if (!header) {\n"
+      << "      header = line.split(',');\n"
+      << "      return;\n"
+      << "    }\n"
+      << "    const cols = line.split(',');\n"
+      << "    if (cols.length < 5) return;\n"
+      << "    const idx = (name) => header.indexOf(name);\n"
+      << "    const getf = (name) => { const i = idx(name); if (i < 0 || i >= cols.length) return NaN; const s = cols[i]; return s === '' ? NaN : Number(s); };\n"
+      << "    const geti = (name) => { const i = idx(name); if (i < 0 || i >= cols.length) return 0; const s = cols[i]; return s === '' ? 0 : Number(s)|0; };\n"
+      << "    const t = getf('t_end_sec');\n"
+      << "    const metric = getf('metric');\n"
+      << "    const metric_raw = getf('metric_raw');\n"
+      << "    const thr = getf('threshold');\n"
+      << "    const reward = geti('reward');\n"
+      << "    const fbraw = getf('feedback_raw');\n"
+      << "    const reward_value = getf('reward_value');\n"
+      << "    const rr = getf('reward_rate');\n"
+      << "    const mz = getf('metric_z');\n"
+      << "    const tz = getf('threshold_z');\n"
+      << "    const mzref = getf('metric_z_ref');\n"
+      << "    const tzref = getf('threshold_z_ref');\n"
+      << "    if (!Number.isFinite(t)) return;\n"
+      << "    data.push({t, metric, metric_raw, thr, reward, fbraw, reward_value, rr, mz, tz, mzref, tzref});\n"
+      << "  }\n"
+      << "\n"
+      << "  async function pollCsv() {\n"
+      << "    try {\n"
+      << "      const headers = byteOffset > 0 ? { 'Range': `bytes=${byteOffset}-` } : {};\n"
+      << "      const res = await fetch(csvUrl, { cache: 'no-store', headers });\n"
+      << "      if (!res.ok) return;\n"
+      << "      const text = await res.text();\n"
+      << "      // If Range was ignored, reset and parse the whole file.\n"
+      << "      if (byteOffset > 0 && res.status === 200) {\n"
+      << "        byteOffset = 0; header = null; partial = ''; data.length = 0;\n"
+      << "      }\n"
+      << "      byteOffset += text.length;\n"
+      << "      let chunk = partial + text;\n"
+      << "      const lines = chunk.split(/\r?\n/);\n"
+      << "      partial = lines.pop() || '';\n"
+      << "      for (const ln of lines) parseLine(ln.trim());\n"
+      << "      updateCurrent();\n"
+      << "      draw();\n"
+      << "    } catch (e) { /* ignore */ }\n"
+      << "  }\n"
+      << "\n"
+      << "  function updateCurrent() {\n"
+      << "    const f = (x) => Number.isFinite(x) ? x.toFixed(6) : '—';\n"
+      << "    const fi = (x) => (x|0).toString();\n"
+      << "    if (data.length < 1) {\n"
+      << "      curMetric.textContent = '—';\n"
+      << "      curMetricRaw.textContent = '—';\n"
+      << "      curThreshold.textContent = '—';\n"
+      << "      curReward.textContent = '—';\n"
+      << "      curFbRaw.textContent = '—';\n"
+      << "      curRewardVal.textContent = '—';\n"
+      << "      curRR.textContent = '—';\n"
+      << "      curMz.textContent = '—';\n"
+      << "      curMzRef.textContent = '—';\n"
+      << "      curTz.textContent = '—';\n"
+      << "      curTzRef.textContent = '—';\n"
+      << "      return;\n"
+      << "    }\n"
+      << "    const r = data[data.length - 1];\n"
+      << "    curMetric.textContent = f(r.metric);\n"
+      << "    curMetricRaw.textContent = f(r.metric_raw);\n"
+      << "    curThreshold.textContent = f(r.thr);\n"
+      << "    curReward.textContent = fi(r.reward);\n"
+      << "    curFbRaw.textContent = f(r.fbraw);\n"
+      << "    curRewardVal.textContent = f(r.reward_value);\n"
+      << "    curRR.textContent = Number.isFinite(r.rr) ? (r.rr*100).toFixed(1) + '%' : '—';\n"
+      << "    curMz.textContent = f(r.mz);\n"
+      << "    curMzRef.textContent = f(r.mzref);\n"
+      << "    curTz.textContent = f(r.tz);\n"
+      << "    curTzRef.textContent = f(r.tzref);\n"
+      << "  }\n"
+      << "\n"
+      << "  function draw() {\n"
+      << "    const dpr = window.devicePixelRatio || 1;\n"
+      << "    const w = plot.width;\n"
+      << "    const h = plot.height;\n"
+      << "    ctx.clearRect(0, 0, w, h);\n"
+      << "    if (data.length < 2) return;\n"
+      << "    const winSec = Number(winSecSel.value) || 30;\n"
+      << "    const tMax = data[data.length - 1].t;\n"
+      << "    const tMin = Math.max(0, tMax - winSec);\n"
+      << "    const view = data.filter(r => r.t >= tMin);\n"
+      << "    if (view.length < 2) return;\n"
+      << "    let ymin = Infinity, ymax = -Infinity;\n"
+      << "    for (const r of view) {\n"
+      << "      if (Number.isFinite(r.metric)) { ymin = Math.min(ymin, r.metric); ymax = Math.max(ymax, r.metric); }\n"
+      << "      if (Number.isFinite(r.thr)) { ymin = Math.min(ymin, r.thr); ymax = Math.max(ymax, r.thr); }\n"
+      << "    }\n"
+      << "    if (!(ymax > ymin)) { ymax = ymin + 1.0; }\n"
+      << "    const pad = 0.10 * (ymax - ymin);\n"
+      << "    ymin -= pad; ymax += pad;\n"
+      << "    const x = (t) => (t - tMin) / (tMax - tMin) * (w - 30) + 15;\n"
+      << "    const y = (v) => (1 - (v - ymin) / (ymax - ymin)) * (h - 30) + 15;\n"
+      << "\n"
+      << "    // Reward highlights\n"
+      << "    for (let i = 0; i < view.length; ++i) {\n"
+      << "      const r = view[i];\n"
+      << "      if (!r.reward) continue;\n"
+      << "      const x0 = x(r.t);\n"
+      << "      const x1 = (i+1 < view.length) ? x(view[i+1].t) : x0 + 2;\n"
+      << "      ctx.fillStyle = 'rgba(52,211,153,0.12)';\n"
+      << "      ctx.fillRect(x0, 15, Math.max(1, x1 - x0), h - 30);\n"
+      << "    }\n"
+      << "\n"
+      << "    // Axis\n"
+      << "    ctx.strokeStyle = 'rgba(255,255,255,0.12)';\n"
+      << "    ctx.lineWidth = 1;\n"
+      << "    ctx.beginPath();\n"
+      << "    ctx.moveTo(15, 15); ctx.lineTo(15, h-15); ctx.lineTo(w-15, h-15);\n"
+      << "    ctx.stroke();\n"
+      << "\n"
+      << "    // Threshold\n"
+      << "    ctx.strokeStyle = 'rgba(148,163,184,0.8)';\n"
+      << "    ctx.beginPath();\n"
+      << "    for (let i = 0; i < view.length; ++i) {\n"
+      << "      const r = view[i];\n"
+      << "      if (!Number.isFinite(r.thr)) continue;\n"
+      << "      const px = x(r.t), py = y(r.thr);\n"
+      << "      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);\n"
+      << "    }\n"
+      << "    ctx.stroke();\n"
+      << "\n"
+      << "    // Metric\n"
+      << "    ctx.strokeStyle = 'rgba(56,189,248,0.95)';\n"
+      << "    ctx.beginPath();\n"
+      << "    let moved = false;\n"
+      << "    for (const r of view) {\n"
+      << "      if (!Number.isFinite(r.metric)) continue;\n"
+      << "      const px = x(r.t), py = y(r.metric);\n"
+      << "      if (!moved) { ctx.moveTo(px, py); moved = true; } else ctx.lineTo(px, py);\n"
+      << "    }\n"
+      << "    ctx.stroke();\n"
+      << "  }\n"
+      << "\n"
+      << "  function pollTopomap() {\n"
+      << "    if (!topoEnabled || !topoImg) return;\n"
+      << "    topoImg.src = topoUrl + '?t=' + Date.now();\n"
+      << "  }\n"
+      << "\n"
+      << "  let timer = null;\n"
+      << "  function start() {\n"
+      << "    if (timer) clearInterval(timer);\n"
+      << "    const ms = Number(pollSel.value) || 250;\n"
+      << "    timer = setInterval(() => { pollCsv(); pollTopomap(); }, ms);\n"
+      << "  }\n"
+      << "  pollSel.addEventListener('change', start);\n"
+      << "  winSecSel.addEventListener('change', draw);\n"
+      << "  btnClear.addEventListener('click', () => { byteOffset = 0; header = null; partial = ''; data.length = 0; updateCurrent(); draw(); });\n"
+      << "  start();\n"
+      << "  </script>\n"
+      << "</body>\n"
+      << "</html>\n";
+}
+
+static void write_topomap_latest_bmp(const std::string& out_path,
+                                    const qeeg::Grid2D& grid,
+                                    double vmin,
+                                    double vmax,
+                                    const std::vector<Vec2>& electrodes_unit,
+                                    bool annotate) {
+  const std::string tmp = out_path + ".tmp";
+  if (annotate) {
+    render_grid_to_bmp_annotated(tmp, grid.size, grid.values, vmin, vmax, electrodes_unit);
+  } else {
+    render_grid_to_bmp(tmp, grid.size, grid.values, vmin, vmax);
+  }
+  atomic_replace_file(tmp, out_path);
 }
 
 
@@ -2689,6 +3112,61 @@ static void osc_send_reward_value(OscUdpClient* osc,
   }
 }
 
+
+static void osc_send_zscores(OscUdpClient* osc,
+                             const std::string& prefix,
+                             double t_end_sec,
+                             double metric_z,
+                             double threshold_z,
+                             double metric_z_ref,
+                             double threshold_z_ref) {
+  if (!osc) return;
+  try {
+    if (std::isfinite(metric_z)) {
+      OscMessage m(prefix + "/metric_z");
+      m.add_float32(static_cast<float>(t_end_sec));
+      m.add_float32(static_cast<float>(metric_z));
+      osc->send(m);
+    }
+    if (std::isfinite(threshold_z)) {
+      OscMessage m(prefix + "/threshold_z");
+      m.add_float32(static_cast<float>(t_end_sec));
+      m.add_float32(static_cast<float>(threshold_z));
+      osc->send(m);
+    }
+    if (std::isfinite(metric_z_ref)) {
+      OscMessage m(prefix + "/metric_z_ref");
+      m.add_float32(static_cast<float>(t_end_sec));
+      m.add_float32(static_cast<float>(metric_z_ref));
+      osc->send(m);
+    }
+    if (std::isfinite(threshold_z_ref)) {
+      OscMessage m(prefix + "/threshold_z_ref");
+      m.add_float32(static_cast<float>(t_end_sec));
+      m.add_float32(static_cast<float>(threshold_z_ref));
+      osc->send(m);
+    }
+  } catch (...) {
+    // best-effort
+  }
+}
+
+static void osc_send_phase(OscUdpClient* osc,
+                           const std::string& prefix,
+                           double t_end_sec,
+                           const char* phase) {
+  if (!osc) return;
+  if (!phase) return;
+  try {
+    OscMessage m(prefix + "/phase");
+    m.add_float32(static_cast<float>(t_end_sec));
+    m.add_string(phase);
+    osc->send(m);
+  } catch (...) {
+    // best-effort
+  }
+}
+
 static OnlineArtifactFrame take_artifact_frame(std::deque<OnlineArtifactFrame>* q,
                                                double t_end_sec,
                                                double eps_sec) {
@@ -3029,6 +3507,21 @@ if (args.list_channels || args.list_channels_json) {
       throw std::runtime_error("--metric-smooth must be a finite value >= 0");
     }
 
+    if (args.topomap_every < 1) {
+      throw std::runtime_error("--topomap-every must be >= 1");
+    }
+    if (args.topomap_grid < 32) {
+      throw std::runtime_error("--topomap-grid must be >= 32");
+    }
+    const bool vmin_set = std::isfinite(args.topomap_vmin);
+    const bool vmax_set = std::isfinite(args.topomap_vmax);
+    if (vmin_set != vmax_set) {
+      throw std::runtime_error("--topomap-vmin and --topomap-vmax must be set together");
+    }
+    if (vmin_set && !(args.topomap_vmax > args.topomap_vmin)) {
+      throw std::runtime_error("--topomap-vmax must be greater than --topomap-vmin");
+    }
+
     // Playback pacing is opt-in: 0 => disabled. Any non-zero value must be > 0.
     if (args.playback_speed != 0.0) {
       if (!std::isfinite(args.playback_speed) || args.playback_speed <= 0.0) {
@@ -3282,6 +3775,8 @@ if (args.list_channels || args.list_channels_json) {
           emit_out("coherence_timeseries.csv");
           emit_out("imcoh_timeseries.csv");
         }
+        if (args.live_ui) emit_out("nf_live_ui.html");
+        if (args.topomap_latest) emit_out("nf_topomap_latest.bmp");
         if (derived_events_written) {
           emit_out("nf_derived_events.csv");
           emit_out("nf_derived_events.tsv");
@@ -3323,7 +3818,7 @@ if (args.list_channels || args.list_channels_json) {
         meta << "  \"metric_spec\": \"" << json_escape(args.metric_spec) << "\",\n";
         meta << "  \"band_spec\": \"" << json_escape(args.band_spec) << "\",\n";
         meta << "  \"reference_csv\": ";
-        if (!args.reference_csv.empty()) meta << "\"" << json_escape(args.reference_csv) << "\""
+        if (!args.reference_csv.empty()) meta << "\"" << json_escape(args.reference_csv) << "\"";
         else meta << "null";
         meta << ",\n";
         meta << "  \"reference_csv_out\": ";
@@ -3382,6 +3877,29 @@ if (args.list_channels || args.list_channels_json) {
           meta << "\"" << json_escape(artifact_ignore[i]) << "\"";
         }
         meta << "],\n";
+        meta << "  \"live_ui\": " << (args.live_ui ? "true" : "false") << ",\n";
+        meta << "  \"topomap_latest\": " << (args.topomap_latest ? "true" : "false") << ",\n";
+        meta << "  \"topomap_band\": ";
+        if (!args.topomap_band.empty()) meta << "\"" << json_escape(args.topomap_band) << "\"";
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"topomap_mode\": \"" << json_escape(args.topomap_mode) << "\",\n";
+        meta << "  \"topomap_every\": " << args.topomap_every << ",\n";
+        meta << "  \"topomap_grid\": " << args.topomap_grid << ",\n";
+        meta << "  \"topomap_annotate\": " << (args.topomap_annotate ? "true" : "false") << ",\n";
+        meta << "  \"topomap_vmin\": ";
+        if (std::isfinite(args.topomap_vmin)) meta << args.topomap_vmin;
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"topomap_vmax\": ";
+        if (std::isfinite(args.topomap_vmax)) meta << args.topomap_vmax;
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"montage_csv\": ";
+        if (!args.montage_csv.empty()) meta << "\"" << json_escape(args.montage_csv) << "\"";
+        else meta << "null";
+        meta << ",\n";
+        meta << "  \"montage_builtin\": \"" << json_escape(args.montage_builtin) << "\",\n";
         meta << "  \"biotrace_ui\": " << (args.biotrace_ui ? "true" : "false") << ",\n";
         meta << "  \"export_derived_events\": " << (args.export_derived_events ? "true" : "false") << ",\n";
         meta << "  \"derived_events_written\": " << (derived_events_written ? "true" : "false") << ",\n";
@@ -3487,6 +4005,83 @@ if (args.list_channels || args.list_channels_json) {
       throw std::runtime_error("--log10 / --relative are only supported for bandpower, ratio, and asymmetry metrics");
     }
 
+    // Resolve live-ui + topomap options early so we can write dashboards that work while the run is in progress.
+    const bool topomap_enabled = args.topomap_latest;
+    if (topomap_enabled &&
+        (metric.type != NfMetricSpec::Type::Band && metric.type != NfMetricSpec::Type::Ratio && metric.type != NfMetricSpec::Type::Asymmetry)) {
+      throw std::runtime_error("--topomap-latest is only supported for bandpower/ratio/asymmetry metrics (it uses the bandpower engine)");
+    }
+
+    std::string topomap_band = trim(args.topomap_band);
+    if (topomap_band.empty()) {
+      if (metric.type == NfMetricSpec::Type::Band || metric.type == NfMetricSpec::Type::Asymmetry) topomap_band = metric.band;
+      else if (metric.type == NfMetricSpec::Type::Ratio) topomap_band = metric.band_num;
+    }
+
+    std::string topomap_mode = to_lower(trim(args.topomap_mode));
+    if (topomap_mode.empty()) topomap_mode = "auto";
+    if (topomap_mode == "auto") {
+      // Prefer reference-based z-scores when a reference CSV is available.
+      // Otherwise, fall back to baseline z-scores when a baseline window exists.
+      if (have_reference) topomap_mode = "zref";
+      else if (args.baseline_seconds > 0.0) topomap_mode = "zbase";
+      else topomap_mode = "raw";
+    }
+    if (topomap_mode != "raw" && topomap_mode != "zbase" && topomap_mode != "zref") {
+      throw std::runtime_error("--topomap-mode must be auto|raw|zbase|zref");
+    }
+    if (topomap_mode == "zref" && !have_reference) {
+      std::cerr << "Warning: --topomap-mode zref requested but no --reference-csv loaded; falling back to raw values\n";
+      topomap_mode = "raw";
+    }
+    if (topomap_mode == "zbase" && !(args.baseline_seconds > 0.0)) {
+      std::cerr << "Warning: --topomap-mode zbase requested but --baseline <= 0; falling back to raw values\n";
+      topomap_mode = "raw";
+    }
+
+    // Validate that the requested topomap band exists in the band list.
+    if (topomap_enabled) {
+      const int b = find_band_index(bands, topomap_band);
+      if (b < 0) {
+        throw std::runtime_error("Topomap band not found in --bands: " + topomap_band);
+      }
+    }
+
+    if (have_reference) {
+      if (reference.meta_log10_power_present && reference.meta_log10_power != args.log10_power) {
+        std::cerr << "Warning: reference CSV meta indicates log10_power=" << (reference.meta_log10_power ? 1 : 0)
+                  << " but this run uses --log10=" << (args.log10_power ? 1 : 0) << "\n";
+      }
+      if (reference.meta_relative_power_present && reference.meta_relative_power != args.relative_power) {
+        std::cerr << "Warning: reference CSV meta indicates relative_power=" << (reference.meta_relative_power ? 1 : 0)
+                  << " but this run uses --relative=" << (args.relative_power ? 1 : 0) << "\n";
+      }
+      if (args.relative_power && reference.meta_relative_fmin_hz_present && reference.meta_relative_fmax_hz_present) {
+        if (reference.meta_relative_fmin_hz != args.relative_fmin_hz || reference.meta_relative_fmax_hz != args.relative_fmax_hz) {
+          std::cerr << "Warning: reference CSV meta relative range is " << reference.meta_relative_fmin_hz << ".." << reference.meta_relative_fmax_hz
+                    << " Hz but this run uses " << args.relative_fmin_hz << ".." << args.relative_fmax_hz << " Hz\n";
+        }
+      }
+    }
+
+    // If requested, write a lightweight live dashboard into --outdir.
+    write_nf_live_ui_html_if_requested(args, rec, metric, have_reference, reference_csv_out,
+                                       topomap_enabled, topomap_band, topomap_mode);
+
+    // Prepare topomap montage/electrodes (used later inside the bandpower loop).
+    Montage topomap_montage;
+    std::vector<Vec2> topomap_electrodes;
+    if (topomap_enabled) {
+      topomap_montage = default_topomap_montage(args);
+      for (const auto& ch : rec.channel_names) {
+        Vec2 p;
+        if (topomap_montage.get(ch, &p)) topomap_electrodes.push_back(p);
+      }
+      if (topomap_electrodes.empty()) {
+        std::cerr << "Warning: topomap montage has no matching channel positions for this recording; no topomap will be written\n";
+      }
+    }
+
     // Output
     std::ofstream out(args.outdir + "/nf_feedback.csv");
     if (!out) throw std::runtime_error("Failed to write nf_feedback.csv");
@@ -3534,7 +4129,20 @@ if (args.list_channels || args.list_channels_json) {
       return (mm < args.train_block_seconds) ? NfPhase::Train : NfPhase::Rest;
     };
 
-    auto derived_update = [&](double t_end_sec, bool reward_on, bool artifact_on, NfPhase phase) {
+    
+// Emit phase transitions over OSC (best-effort) for easier external UI integration.
+NfPhase osc_last_phase = NfPhase::Baseline;
+bool osc_phase_ready = false;
+auto osc_maybe_send_phase = [&](double t_end_sec, NfPhase phase) {
+  if (!osc) return;
+  if (!osc_phase_ready || phase != osc_last_phase) {
+    osc_last_phase = phase;
+    osc_phase_ready = true;
+    osc_send_phase(osc, osc_prefix, t_end_sec, phase_name(phase));
+  }
+};
+
+auto derived_update = [&](double t_end_sec, bool reward_on, bool artifact_on, NfPhase phase) {
       if (!want_derived_events) return;
       double frame_end = t_end_sec;
       double frame_start = std::isfinite(prev_frame_end_sec) ? prev_frame_end_sec : (frame_end - args.update_seconds);
@@ -3667,6 +4275,7 @@ if (args.list_channels || args.list_channels_json) {
 
     // Baseline-derived robust stats (median + scale) used for z-scores.
     bool baseline_stats_ready = false;
+    bool baseline_stats_finalized = false;
     double baseline_median = std::numeric_limits<double>::quiet_NaN();
     double baseline_scale = std::numeric_limits<double>::quiet_NaN();
 
@@ -3798,6 +4407,40 @@ if (args.list_channels || args.list_channels_json) {
       summary.feedback_span_used_set = true;
     }
 
+auto finalize_baseline_stats = [&](const std::vector<double>& vals) {
+      baseline_stats_finalized = true;
+  // Compute robust baseline stats for z-scores (median + MAD scale).
+  double sc = std::numeric_limits<double>::quiet_NaN();
+  if (!vals.empty()) {
+    std::vector<double> tmp = vals;
+    const double med = median_inplace(&tmp);
+    sc = robust_scale(vals, med);
+    if (std::isfinite(med) && std::isfinite(sc) && sc > 0.0) {
+      baseline_median = med;
+      baseline_scale = sc;
+      baseline_stats_ready = true;
+    } else {
+      std::cerr << "Warning: baseline stats were non-finite or <= 0; z-score columns will be blank\n";
+    }
+  }
+
+  // If continuous feedback was requested and --feedback-span not provided, derive it from robust baseline scale.
+  if (continuous_feedback && !feedback_span_ready) {
+    if (std::isfinite(sc) && sc > 0.0) {
+      feedback_span_used = sc;
+      std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
+    } else {
+      feedback_span_used = 1.0;
+      std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
+      std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
+    }
+    feedback_span_ready = true;
+    summary.feedback_span_used = feedback_span_used;
+    summary.feedback_span_used_set = true;
+    osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
+  }
+};
+
     auto smooth_metric = [&](double raw, double t_end_sec, bool freeze) -> double {
       // Track dt between updates for proper time-constant behavior.
       double dt = args.update_seconds;
@@ -3835,7 +4478,7 @@ if (args.list_channels || args.list_channels_json) {
       }
     };
 
-    auto append_zscore_cols = [&](double metric_val, double thr, bool thr_ready) {
+    auto append_zscore_cols = [&](double t_end_sec, double metric_val, double thr, bool thr_ready) {
       double metric_z = std::numeric_limits<double>::quiet_NaN();
       double thr_z = std::numeric_limits<double>::quiet_NaN();
       if (thr_ready && baseline_stats_ready && std::isfinite(baseline_scale) && baseline_scale > 0.0) {
@@ -3853,6 +4496,11 @@ if (args.list_channels || args.list_channels_json) {
           thr_z_ref = z;
         }
       }
+
+      if (osc && thr_ready) {
+        osc_send_zscores(osc, osc_prefix, t_end_sec, metric_z, thr_z, metric_z_ref, thr_z_ref);
+      }
+
       out << ",";
       if (std::isfinite(metric_z)) out << metric_z;
       out << ",";
@@ -3861,7 +4509,7 @@ if (args.list_channels || args.list_channels_json) {
       if (std::isfinite(metric_z_ref)) out << metric_z_ref;
       out << ",";
       if (std::isfinite(thr_z_ref)) out << thr_z_ref;
-    };
+    };;
 
     if (metric.type == NfMetricSpec::Type::Coherence) {
       // Resolve pair indices from the recording.
@@ -3946,6 +4594,7 @@ if (args.list_channels || args.list_channels_json) {
           const double val = smooth_metric(val_raw, fr.t_end_sec, artifact_hit);
 
           const NfPhase phase = phase_of(fr.t_end_sec);
+          osc_maybe_send_phase(fr.t_end_sec, phase);
 
           // Optional pacing for interactive offline runs (OSC / UI watchers).
           pacer.wait_until(fr.t_end_sec);
@@ -3979,47 +4628,8 @@ if (args.list_channels || args.list_channels_json) {
                 summary.threshold_init_set = true;
               }
 
-              // Compute robust baseline stats for z-scores (and feedback span if needed).
-            if (!baseline_values.empty()) {
-              std::vector<double> tmp = baseline_values;
-              const double med = median_inplace(&tmp);
-              const double sc = robust_scale(baseline_values, med);
-              if (std::isfinite(med) && std::isfinite(sc) && sc > 0.0) {
-                baseline_median = med;
-                baseline_scale = sc;
-                baseline_stats_ready = true;
-              }
-              if (continuous_feedback && !feedback_span_ready) {
-                if (std::isfinite(sc) && sc > 0.0) {
-                  feedback_span_used = sc;
-                } else {
-                  feedback_span_used = 1.0;
-                  std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
-                }
-                feedback_span_ready = true;
-                summary.feedback_span_used = feedback_span_used;
-                summary.feedback_span_used_set = true;
-                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-                std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
-              }
-            } else if (continuous_feedback && !feedback_span_ready) {
-              feedback_span_used = 1.0;
-              std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
-              feedback_span_ready = true;
-              summary.feedback_span_used = feedback_span_used;
-              summary.feedback_span_used_set = true;
-              osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-              std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
-            } else if (continuous_feedback && !feedback_span_ready) {
-                feedback_span_used = 1.0;
-                std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
-                feedback_span_ready = true;
-                summary.feedback_span_used = feedback_span_used;
-                summary.feedback_span_used_set = true;
-                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-                std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
-              }
-              std::cout << "Initial threshold set to: " << threshold
+              finalize_baseline_stats(baseline_values);
+std::cout << "Initial threshold set to: " << threshold
                         << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
                         << ", n=" << baseline_values.size() << ")\n";
             }
@@ -4055,10 +4665,24 @@ if (args.list_channels || args.list_channels_json) {
             }
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
-            append_zscore_cols(val, threshold, /*thr_ready=*/have_threshold);
+            append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/have_threshold);
             out << "\n";
             if (args.flush_csv) out.flush();
             continue;
+          }
+
+          // If an explicit threshold was provided (skipping baseline threshold estimation), we may still
+          // compute baseline stats for z-scores / feedback-span during the first --baseline-seconds window.
+          if (!baseline_stats_finalized && args.baseline_seconds > 0.0) {
+            if (fr.t_end_sec <= args.baseline_seconds) {
+              ++summary.baseline_frames;
+              // If artifact gating is enabled, avoid contaminating the baseline estimate.
+              if (!artifact_hit) {
+                baseline_values.push_back(val);
+              }
+            } else {
+              finalize_baseline_stats(baseline_values);
+            }
           }
 
           if (artifact_hit) {
@@ -4091,7 +4715,7 @@ if (args.list_channels || args.list_channels_json) {
                 << "," << coherence_measure_name(metric.coherence_measure);
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
-            append_zscore_cols(val, threshold, /*thr_ready=*/true);
+            append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
             out << "\n";
             ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
@@ -4128,7 +4752,7 @@ if (args.list_channels || args.list_channels_json) {
                 << "," << coherence_measure_name(metric.coherence_measure);
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
-            append_zscore_cols(val, threshold, /*thr_ready=*/true);
+            append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
             out << "\n";
             ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
@@ -4188,7 +4812,7 @@ if (args.list_channels || args.list_channels_json) {
               << "," << coherence_measure_name(metric.coherence_measure);
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(feedback_raw, reward_value);
-          append_zscore_cols(val, threshold, /*thr_ready=*/true);
+          append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
           out << "\n";
           if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
@@ -4259,6 +4883,7 @@ if (args.list_channels || args.list_channels_json) {
           const double val = smooth_metric(val_raw, fr.t_end_sec, artifact_hit);
 
           const NfPhase phase = phase_of(fr.t_end_sec);
+          osc_maybe_send_phase(fr.t_end_sec, phase);
 
           pacer.wait_until(fr.t_end_sec);
 
@@ -4289,47 +4914,8 @@ if (args.list_channels || args.list_channels_json) {
                 summary.threshold_init = threshold;
                 summary.threshold_init_set = true;
               }
-              // Compute robust baseline stats for z-scores (and feedback span if needed).
-            if (!baseline_values.empty()) {
-              std::vector<double> tmp = baseline_values;
-              const double med = median_inplace(&tmp);
-              const double sc = robust_scale(baseline_values, med);
-              if (std::isfinite(med) && std::isfinite(sc) && sc > 0.0) {
-                baseline_median = med;
-                baseline_scale = sc;
-                baseline_stats_ready = true;
-              }
-              if (continuous_feedback && !feedback_span_ready) {
-                if (std::isfinite(sc) && sc > 0.0) {
-                  feedback_span_used = sc;
-                } else {
-                  feedback_span_used = 1.0;
-                  std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
-                }
-                feedback_span_ready = true;
-                summary.feedback_span_used = feedback_span_used;
-                summary.feedback_span_used_set = true;
-                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-                std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
-              }
-            } else if (continuous_feedback && !feedback_span_ready) {
-              feedback_span_used = 1.0;
-              std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
-              feedback_span_ready = true;
-              summary.feedback_span_used = feedback_span_used;
-              summary.feedback_span_used_set = true;
-              osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-              std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
-            } else if (continuous_feedback && !feedback_span_ready) {
-                feedback_span_used = 1.0;
-                std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
-                feedback_span_ready = true;
-                summary.feedback_span_used = feedback_span_used;
-                summary.feedback_span_used_set = true;
-                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-                std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
-              }
-              std::cout << "Initial threshold set to: " << threshold
+              finalize_baseline_stats(baseline_values);
+std::cout << "Initial threshold set to: " << threshold
                         << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
                         << ", n=" << baseline_values.size() << ")\n";
             }
@@ -4365,10 +4951,24 @@ if (args.list_channels || args.list_channels_json) {
             }
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
-            append_zscore_cols(val, threshold, /*thr_ready=*/have_threshold);
+            append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/have_threshold);
             out << "\n";
             if (args.flush_csv) out.flush();
             continue;
+          }
+
+          // If an explicit threshold was provided (skipping baseline threshold estimation), we may still
+          // compute baseline stats for z-scores / feedback-span during the first --baseline-seconds window.
+          if (!baseline_stats_finalized && args.baseline_seconds > 0.0) {
+            if (fr.t_end_sec <= args.baseline_seconds) {
+              ++summary.baseline_frames;
+              // If artifact gating is enabled, avoid contaminating the baseline estimate.
+              if (!artifact_hit) {
+                baseline_values.push_back(val);
+              }
+            } else {
+              finalize_baseline_stats(baseline_values);
+            }
           }
 
           if (artifact_hit) {
@@ -4401,7 +5001,7 @@ if (args.list_channels || args.list_channels_json) {
             out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
-            append_zscore_cols(val, threshold, /*thr_ready=*/true);
+            append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
             out << "\n";
             ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
@@ -4438,7 +5038,7 @@ if (args.list_channels || args.list_channels_json) {
             out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
             append_feedback_optional_cols(val_raw);
             append_reward_value_cols(0.0, 0.0);
-            append_zscore_cols(val, threshold, /*thr_ready=*/true);
+            append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
             out << "\n";
             ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
             continue;
@@ -4498,7 +5098,7 @@ if (args.list_channels || args.list_channels_json) {
           out << "," << (metric.pac_method == PacMethod::ModulationIndex ? "mi" : "mvl");
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(feedback_raw, reward_value);
-          append_zscore_cols(val, threshold, /*thr_ready=*/true);
+          append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
           out << "\n";
           if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, thr_used, /*thr_ready=*/true, feedback_raw, reward_value, /*reward=*/(reward ? 1 : 0), rr, af);
@@ -4529,6 +5129,141 @@ if (args.list_channels || args.list_channels_json) {
     opt.log10_power = args.log10_power;
 
     OnlineWelchBandpower eng(rec.channel_names, rec.fs_hz, bands, opt);
+
+    // Optional: live topomap rendering (writes nf_topomap_latest.bmp periodically).
+    const std::string topomap_out_path = args.outdir + "/nf_topomap_latest.bmp";
+    const bool topo_v_fixed = std::isfinite(args.topomap_vmin) && std::isfinite(args.topomap_vmax);
+    TopomapOptions topo_opt;
+    topo_opt.grid_size = args.topomap_grid;
+    topo_opt.method = TopomapInterpolation::SPHERICAL_SPLINE;
+    std::vector<double> topo_values(rec.n_channels(), std::numeric_limits<double>::quiet_NaN());
+
+    // Optional: per-channel baseline stats for topomap_mode=zbase.
+    // We collect raw per-channel values for the selected band during the initial
+    // --baseline window, skipping artifact-gated frames when enabled.
+    const bool topo_want_zbase = (topomap_mode == "zbase" && args.baseline_seconds > 0.0);
+    bool topo_baseline_finalized = false;
+    bool topo_baseline_ready = false;
+    std::vector<std::vector<double>> topo_baseline_samples;
+    std::vector<double> topo_baseline_median(rec.n_channels(), std::numeric_limits<double>::quiet_NaN());
+    std::vector<double> topo_baseline_scale(rec.n_channels(), std::numeric_limits<double>::quiet_NaN());
+    if (topo_want_zbase) {
+      topo_baseline_samples.resize(rec.n_channels());
+      const double approx_fs = (args.update_seconds > 0.0) ? (1.0 / args.update_seconds) : 4.0;
+      const size_t expect_frames = std::max<size_t>(8, sec_to_samples(args.baseline_seconds, approx_fs));
+      for (auto& v : topo_baseline_samples) v.reserve(expect_frames);
+    }
+    int topo_band_idx = -1;
+    bool topo_band_resolved = false;
+    std::size_t topo_frame_count = 0;
+    auto maybe_write_topomap = [&](const OnlineBandpowerFrame& fr, bool artifact_detected, bool freeze) {
+      if (!topomap_enabled) return;
+      if (topomap_electrodes.empty()) return;
+      if (!topo_band_resolved) {
+        topo_band_idx = find_band_index(fr.bands, topomap_band);
+        if (topo_band_idx < 0) {
+          std::cerr << "Warning: topomap band not found in frames: " << topomap_band << "\n";
+          return;
+        }
+        topo_band_resolved = true;
+      }
+
+      // Collect baseline samples for zbase before any downsampling.
+      if (topo_want_zbase && !topo_baseline_finalized) {
+        const double t = fr.t_end_sec;
+        if (std::isfinite(t) && t <= args.baseline_seconds) {
+          if (!artifact_detected) {
+            for (size_t c = 0; c < fr.channel_names.size(); ++c) {
+              if (have_qc && c < qc_bad.size() && qc_bad[c]) continue;
+              const double raw = fr.powers[static_cast<size_t>(topo_band_idx)][c];
+              if (std::isfinite(raw)) topo_baseline_samples[c].push_back(raw);
+            }
+          }
+        } else {
+          // Baseline window complete: finalize robust stats.
+          topo_baseline_finalized = true;
+          size_t ok = 0;
+          for (size_t c = 0; c < topo_baseline_samples.size(); ++c) {
+            auto& samp = topo_baseline_samples[c];
+            if (samp.size() < 5) continue;
+            std::vector<double> tmp = samp;
+            const double med = median_inplace(&tmp);
+            const double sc = robust_scale(samp, med);
+            if (std::isfinite(sc) && sc > 0.0) {
+              topo_baseline_median[c] = med;
+              topo_baseline_scale[c] = sc;
+              ++ok;
+            }
+          }
+          topo_baseline_samples.clear();
+          topo_baseline_samples.shrink_to_fit();
+          topo_baseline_ready = (ok > 0);
+          if (!topo_baseline_ready) {
+            std::cerr << "Warning: topomap_mode=zbase requested but baseline stats could not be estimated (insufficient clean samples); using raw topomap values\n";
+          }
+        }
+      }
+
+      ++topo_frame_count;
+
+      // Freeze the map (hold the last image) on artifact-gated frames.
+      // Note: we still finalize baseline stats above, so zbase can become ready.
+      if (freeze) {
+        return;
+      }
+
+      if (args.topomap_every > 1 && (topo_frame_count % static_cast<std::size_t>(args.topomap_every) != 0)) {
+        return;
+      }
+      // Compute per-channel values.
+      for (size_t c = 0; c < fr.channel_names.size(); ++c) {
+        if (have_qc && c < qc_bad.size() && qc_bad[c]) {
+          topo_values[c] = std::numeric_limits<double>::quiet_NaN();
+          continue;
+        }
+        const double raw = fr.powers[static_cast<size_t>(topo_band_idx)][c];
+        if (topomap_mode == "zref") {
+          double z = 0.0;
+          if (compute_zscore(reference, fr.channel_names[c], topomap_band, raw, &z)) {
+            topo_values[c] = z;
+          } else {
+            topo_values[c] = std::numeric_limits<double>::quiet_NaN();
+          }
+        } else if (topomap_mode == "zbase" && topo_baseline_ready &&
+                   std::isfinite(topo_baseline_scale[c]) && topo_baseline_scale[c] > 0.0) {
+          topo_values[c] = (raw - topo_baseline_median[c]) / topo_baseline_scale[c];
+        } else {
+          topo_values[c] = raw;
+        }
+      }
+
+      // Determine display range.
+      double vmin = args.topomap_vmin;
+      double vmax = args.topomap_vmax;
+      if (!topo_v_fixed) {
+        if (topomap_mode == "zref" || (topomap_mode == "zbase" && topo_baseline_ready)) {
+          vmin = -3.0;
+          vmax = 3.0;
+        } else {
+          vmin = std::numeric_limits<double>::infinity();
+          vmax = -std::numeric_limits<double>::infinity();
+          for (double v : topo_values) {
+            if (!std::isfinite(v)) continue;
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+          }
+          if (!(vmax > vmin)) {
+            if (!std::isfinite(vmin)) return;
+            vmin -= 1.0;
+            vmax += 1.0;
+          }
+        }
+      }
+
+      const Grid2D grid = make_topomap(topomap_montage, fr.channel_names, topo_values, topo_opt);
+      if (grid.values.empty()) return;
+      write_topomap_latest_bmp(topomap_out_path, grid, vmin, vmax, topomap_electrodes, args.topomap_annotate);
+    };
 
     // We'll resolve band/channel indices once the first frame is emitted.
     bool metric_resolved = false;
@@ -4616,8 +5351,13 @@ if (args.list_channels || args.list_channels_json) {
         const double val = smooth_metric(val_raw, fr.t_end_sec, artifact_hit);
 
         const NfPhase phase = phase_of(fr.t_end_sec);
+        osc_maybe_send_phase(fr.t_end_sec, phase);
 
         pacer.wait_until(fr.t_end_sec);
+
+        // Live scalp map update (independent of metric validity / reward gating).
+        // Pass artifact detection + gating state so the map can optionally freeze during gated artifacts.
+        maybe_write_topomap(fr, artifact_state, artifact_hit);
 
         if (!std::isfinite(val)) {
           (void)shape_reward(false, fr.t_end_sec, /*freeze=*/true);
@@ -4646,47 +5386,8 @@ if (args.list_channels || args.list_channels_json) {
               summary.threshold_init = threshold;
               summary.threshold_init_set = true;
             }
-            // Compute robust baseline stats for z-scores (and feedback span if needed).
-            if (!baseline_values.empty()) {
-              std::vector<double> tmp = baseline_values;
-              const double med = median_inplace(&tmp);
-              const double sc = robust_scale(baseline_values, med);
-              if (std::isfinite(med) && std::isfinite(sc) && sc > 0.0) {
-                baseline_median = med;
-                baseline_scale = sc;
-                baseline_stats_ready = true;
-              }
-              if (continuous_feedback && !feedback_span_ready) {
-                if (std::isfinite(sc) && sc > 0.0) {
-                  feedback_span_used = sc;
-                } else {
-                  feedback_span_used = 1.0;
-                  std::cerr << "Warning: baseline scale was non-finite or <= 0; using feedback_span_used=1.0\n";
-                }
-                feedback_span_ready = true;
-                summary.feedback_span_used = feedback_span_used;
-                summary.feedback_span_used_set = true;
-                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-                std::cout << "Feedback span used: " << feedback_span_used << " (robust baseline scale)\n";
-              }
-            } else if (continuous_feedback && !feedback_span_ready) {
-              feedback_span_used = 1.0;
-              std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
-              feedback_span_ready = true;
-              summary.feedback_span_used = feedback_span_used;
-              summary.feedback_span_used_set = true;
-              osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-              std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
-            } else if (continuous_feedback && !feedback_span_ready) {
-                feedback_span_used = 1.0;
-                std::cerr << "Warning: no baseline samples available; using feedback_span_used=1.0\n";
-                feedback_span_ready = true;
-                summary.feedback_span_used = feedback_span_used;
-                summary.feedback_span_used_set = true;
-                osc_send_feedback_span_used(osc, osc_prefix, feedback_span_used);
-                std::cout << "Feedback span used: " << feedback_span_used << " (fallback)\n";
-              }
-            std::cout << "Initial threshold set to: " << threshold
+            finalize_baseline_stats(baseline_values);
+std::cout << "Initial threshold set to: " << threshold
                       << " (baseline=" << args.baseline_seconds << "s, q=" << q_used
                       << ", n=" << baseline_values.size() << ")\n";
           }
@@ -4722,10 +5423,24 @@ if (args.list_channels || args.list_channels_json) {
           }
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
-          append_zscore_cols(val, threshold, /*thr_ready=*/have_threshold);
+          append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/have_threshold);
           out << "\n";
           if (args.flush_csv) out.flush();
           continue;
+        }
+
+        // If an explicit threshold was provided (skipping baseline threshold estimation), we may still
+        // compute baseline stats for z-scores / feedback-span during the first --baseline-seconds window.
+        if (!baseline_stats_finalized && args.baseline_seconds > 0.0) {
+          if (fr.t_end_sec <= args.baseline_seconds) {
+            ++summary.baseline_frames;
+            // If artifact gating is enabled, avoid contaminating the baseline estimate.
+            if (!artifact_hit) {
+              baseline_values.push_back(val);
+            }
+          } else {
+            finalize_baseline_stats(baseline_values);
+          }
         }
 
         if (artifact_hit) {
@@ -4764,7 +5479,7 @@ if (args.list_channels || args.list_channels_json) {
           }
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
-          append_zscore_cols(val, threshold, /*thr_ready=*/true);
+          append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
           out << "\n";
           if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
@@ -4808,7 +5523,7 @@ if (args.list_channels || args.list_channels_json) {
           }
           append_feedback_optional_cols(val_raw);
           append_reward_value_cols(0.0, 0.0);
-          append_zscore_cols(val, threshold, /*thr_ready=*/true);
+          append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
           out << "\n";
           if (args.flush_csv) out.flush();
           ui_push(fr.t_end_sec, val, threshold, /*thr_ready=*/true, /*feedback_raw=*/0.0, /*reward_value=*/0.0, /*reward=*/0, rr, af);
@@ -4875,7 +5590,7 @@ if (args.list_channels || args.list_channels_json) {
         }
         append_feedback_optional_cols(val_raw);
         append_reward_value_cols(feedback_raw, reward_value);
-        append_zscore_cols(val, threshold, /*thr_ready=*/true);
+        append_zscore_cols(fr.t_end_sec, val, threshold, /*thr_ready=*/true);
         out << "\n";
         if (args.flush_csv) out.flush();
 

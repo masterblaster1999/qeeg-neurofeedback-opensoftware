@@ -36,6 +36,7 @@
   const chSel = qs('chSel');
   const xformSel = qs('xformSel');
   const mapSel = qs('mapSel');
+  const topoSrcSel = qs('topoSrcSel');
   const nfModeSel = qs('nfModeSel');
   const scaleSel = qs('scaleSel');
   const lblSel = qs('lblSel');
@@ -68,13 +69,15 @@
     winSec: 60,
     pendingUi: null,
     applyingRemote: false,
+    serverMeta: null,
     nf: {frames: [], lastT: -Infinity},
-    bp: {meta: null, frames: [], lastT: -Infinity, rollingMin: null, rollingMax: null, tmpCanvas: null, tmpW: 0, tmpH: 0, electrodesPx: [], baseline: null, reference: null, baselineSec: 10.0},
+    bp: {meta: null, frames: [], lastT: -Infinity, rollingMin: null, rollingMax: null, tmpCanvas: null, tmpW: 0, tmpH: 0, electrodesPx: [], baseline: null, reference: null, baselineSec: 10.0, topomapCfg: null, cliTopomap: {etag: null, url: null, img: null, inflight: false, lastOk_utc: 0}},
     art: {frames: [], latest: null, lastT: -Infinity},
   };
 
   let runMetaETag = null;
   let statsTimer = null;
+  let topoPollTimer = null;
 
   function fmt(x){
     if(x===null || x===undefined || !Number.isFinite(x)) return '—';
@@ -122,9 +125,9 @@
     const rows = [];
     let anyMissing = false;
     let anyStale = false;
-    const add = (label, st) => {
+    const add = (label, st, optional=false) => {
       const ok = !!(st && st.exists);
-      if(!ok) anyMissing = true;
+      if(!ok && !optional) anyMissing = true;
       const age = (ok && st.mtime_utc) ? (now - st.mtime_utc) : null;
       if(ok && age !== null && age > 5) anyStale = true;
       const cls = ok ? (age !== null && age > 5 ? 'warn' : 'good') : 'bad';
@@ -135,7 +138,8 @@
     };
     add('nf_feedback.csv', fs.nf_feedback);
     add('bandpower_timeseries.csv', fs.bandpower_timeseries);
-    add('artifact_gate_timeseries.csv', fs.artifact_gate_timeseries);
+    add('artifact_gate_timeseries.csv', fs.artifact_gate_timeseries, true);
+    add('nf_topomap_latest.bmp', fs.nf_topomap_latest, true);
 
     if(anyMissing){
       showStatus(`<div style="margin-bottom:6px"><b>Waiting on outputs…</b> (start qeeg_nf_cli, and consider <code>--flush-csv</code> for live updates)</div>${rows.join('')}`);
@@ -158,13 +162,29 @@
       if(rm && rm.summary){
         const order = [
           'Tool','Version','GitDescribe','TimestampLocal','protocol','metric_spec','band_spec','reward_direction',
-          'fs_hz','window_seconds','update_seconds','baseline_seconds','target_reward_rate','artifact_gate',
+          'fs_hz','window_seconds','update_seconds','baseline_seconds','baseline_quantile_used','target_reward_rate','artifact_gate',
+          'topomap_latest','topomap_mode','topomap_band','topomap_every','topomap_grid','topomap_annotate','topomap_vmin','topomap_vmax',
           'qc_bad_channel_count','qc_bad_channels','biotrace_ui','export_derived_events'
         ];
         renderKvGrid(runMetaKv, rm.summary, order);
         // Cache baseline duration for client-side z-scoring.
         const bs = rm.summary.baseline_seconds;
         if(typeof bs === 'number' && Number.isFinite(bs) && bs > 0){ state.bp.baselineSec = bs; }
+        // Try to load server-computed baseline (if available) so zbase works across reloads.
+        if(typeof bs === 'number' && Number.isFinite(bs) && bs > 0){
+          if(!state.bp.baseline || !state.bp.baseline.ready){ loadBaseline(); }
+        }
+        // Cache topomap config (if qeeg_nf_cli is writing nf_topomap_latest.bmp).
+        state.bp.topomapCfg = {
+          latest: rm.summary.topomap_latest,
+          band: rm.summary.topomap_band,
+          mode: rm.summary.topomap_mode,
+          every: rm.summary.topomap_every,
+          grid: rm.summary.topomap_grid,
+          annotate: rm.summary.topomap_annotate,
+          vmin: rm.summary.topomap_vmin,
+          vmax: rm.summary.topomap_vmax,
+        };
       }
       if(rm && rm.parse_error){
         if(runMetaRaw) runMetaRaw.textContent = `Parse error: ${rm.parse_error}`;
@@ -215,36 +235,167 @@
     return (mapSel && mapSel.value) ? mapSel.value : 'raw';
   }
 
+  function topoSourceSel(){
+    return (topoSrcSel && topoSrcSel.value) ? topoSrcSel.value : 'auto';
+  }
+
+  function resolveTopoSource(fullMeta){
+    const sel = topoSourceSel();
+    if(sel === 'browser') return 'browser';
+    if(sel === 'cli') return 'cli';
+    // auto: use CLI-rendered BMP if present; otherwise fallback to browser-rendered topomap
+    const fs = (fullMeta && fullMeta.files_stat) ? fullMeta.files_stat : null;
+    const st = fs ? (fs.nf_topomap_latest || fs.topomap_latest || null) : null;
+    if(st && st.exists && (st.size_bytes || 0) > 0) return 'cli';
+    return 'browser';
+  }
+
+  function updateTopoPolling(){
+    const want = resolveTopoSource(state.serverMeta);
+    const enabled = (want === 'cli') && !state.paused && !!TOKEN;
+    if(!enabled){
+      if(topoPollTimer){
+        clearInterval(topoPollTimer);
+        topoPollTimer = null;
+      }
+      return;
+    }
+    if(!topoPollTimer){
+      topoPollTimer = setInterval(() => { pollCliTopomapOnce(); }, 500);
+    }
+    // kick immediately
+    pollCliTopomapOnce();
+  }
+
+  async function pollCliTopomapOnce(){
+    if(!TOKEN) return;
+    const cli = state.bp.cliTopomap || (state.bp.cliTopomap = {etag:null,url:null,img:null,inflight:false,lastOk_utc:0});
+    if(cli.inflight) return;
+    cli.inflight = true;
+    try{
+      const url = `/api/topomap_latest?token=${encodeURIComponent(TOKEN)}`;
+      const headers = {};
+      if(cli.etag) headers['If-None-Match'] = cli.etag;
+      const r = await fetch(url, {headers, cache: 'no-cache'});
+      if(r.status === 304){ return; }
+      if(!r.ok){ return; }
+      const et = r.headers.get('ETag');
+      const blob = await r.blob();
+      if(!blob || blob.size <= 0) return;
+      const objUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        if(cli.url) URL.revokeObjectURL(cli.url);
+        cli.url = objUrl;
+        cli.img = img;
+        if(et) cli.etag = et;
+        cli.lastOk_utc = Date.now()/1000;
+        dirtyBp = true;
+        scheduleRender();
+      };
+      img.onerror = () => { try{ URL.revokeObjectURL(objUrl); }catch(e){} };
+      img.src = objUrl;
+    }catch(e){
+      // ignore
+    }finally{
+      cli.inflight = false;
+    }
+  }
+
   function ensureBaselineStats(nCols){
-    if(state.bp.baseline && state.bp.baseline.n && state.bp.baseline.n.length === nCols) return;
-    state.bp.baseline = {n: new Array(nCols).fill(0), mean: new Array(nCols).fill(0), m2: new Array(nCols).fill(0)};
+    const b = state.bp.baseline;
+    if(b && b.nCols === nCols) return;
+    const samples = new Array(nCols);
+    for(let i=0;i<nCols;i++) samples[i] = [];
+    state.bp.baseline = {
+      method: 'median_mad',
+      nCols,
+      samples,
+      median: new Array(nCols).fill(NaN),
+      scale: new Array(nCols).fill(NaN),
+      finalized: false,
+      ready: false,
+      nFrames: 0,
+    };
+  }
+
+  function _median(arr){
+    if(!Array.isArray(arr) || !arr.length) return NaN;
+    const tmp = arr.slice().sort((a,b)=>a-b);
+    const m = Math.floor(tmp.length/2);
+    if(tmp.length % 2) return tmp[m];
+    return 0.5*(tmp[m-1] + tmp[m]);
+  }
+
+  function _meanStd(arr){
+    let n=0, mean=0, m2=0;
+    for(const x of arr){
+      if(x === null || x === undefined || !Number.isFinite(x)) continue;
+      n++;
+      const d = x - mean;
+      mean += d / n;
+      const d2 = x - mean;
+      m2 += d * d2;
+    }
+    if(n < 2) return {mean: mean, sd: NaN};
+    const var_ = m2 / Math.max(1, (n - 1));
+    const sd = Math.sqrt(var_);
+    return {mean, sd};
   }
 
   function baselineUpdate(vals){
     if(!Array.isArray(vals)) return;
     ensureBaselineStats(vals.length);
     const b = state.bp.baseline;
+    if(!b || b.finalized) return;
+    b.nFrames = (b.nFrames||0) + 1;
     for(let i=0;i<vals.length;i++){
       const x = vals[i];
       if(x === null || x === undefined || !Number.isFinite(x)) continue;
-      const n1 = b.n[i] + 1;
-      b.n[i] = n1;
-      const delta = x - b.mean[i];
-      b.mean[i] += delta / n1;
-      const delta2 = x - b.mean[i];
-      b.m2[i] += delta * delta2;
+      b.samples[i].push(x);
     }
+  }
+
+  function finalizeBaselineStats(){
+    const b = state.bp.baseline;
+    if(!b || b.finalized) return;
+    b.finalized = true;
+
+    // MAD -> SD scaling constant under a Normal assumption.
+    const MAD_TO_SD = 1.4826;
+
+    let ok = 0;
+    for(let i=0;i<b.nCols;i++){
+      const samp = b.samples[i];
+      if(!samp || samp.length < 5) continue;
+      const med = _median(samp);
+      if(!Number.isFinite(med)) continue;
+      const dev = samp.map(v => Math.abs(v - med));
+      const mad = _median(dev);
+      let sc = mad * MAD_TO_SD;
+      if(!(sc > 0) || !Number.isFinite(sc)){
+        // Fallback to sample standard deviation if MAD collapses.
+        sc = _meanStd(samp).sd;
+      }
+      if(sc > 0 && Number.isFinite(sc)){
+        b.median[i] = med;
+        b.scale[i] = sc;
+        ok++;
+      }
+    }
+
+    b.ready = ok > 0;
+    // Free raw samples to keep memory bounded.
+    b.samples = null;
   }
 
   function baselineZ(i, x){
     const b = state.bp.baseline;
-    if(!b || !b.n || i<0 || i>=b.n.length) return null;
-    const n = b.n[i];
-    if(n < 5) return null;
-    const var_ = b.m2[i] / Math.max(1, (n - 1));
-    const sd = Math.sqrt(var_);
-    if(!(sd > 0) || !Number.isFinite(sd)) return null;
-    return (x - b.mean[i]) / sd;
+    if(!b || !b.ready || !b.scale || i<0 || i>=b.scale.length) return null;
+    const med = b.median[i];
+    const sc = b.scale[i];
+    if(!Number.isFinite(med) || !Number.isFinite(sc) || !(sc > 0)) return null;
+    return (x - med) / sc;
   }
 
   function referenceZ(i, x){
@@ -288,6 +439,47 @@
     }catch(e){}
   }
 
+  async function loadBaseline(){
+  if(!TOKEN) return;
+  if(state.bp._baselineInFlight) return;
+  state.bp._baselineInFlight = true;
+  try{
+    const bs = (typeof state.bp.baselineSec === 'number' && Number.isFinite(state.bp.baselineSec) && state.bp.baselineSec > 0)
+      ? state.bp.baselineSec : null;
+    const bsQ = bs ? `&baseline_sec=${encodeURIComponent(String(bs))}` : '';
+    const r = await fetch(`/api/baseline?token=${encodeURIComponent(TOKEN)}${bsQ}`);
+    if(!r.ok) return;
+    const obj = await r.json();
+    const aligned = obj && obj.aligned ? obj.aligned : null;
+    const base = obj && obj.baseline ? obj.baseline : null;
+    if(aligned && Array.isArray(aligned.median) && Array.isArray(aligned.scale)){
+      const nCols = aligned.median.length;
+      const okCols = aligned.ok_cols || 0;
+      const complete = !!(base && base.complete);
+      const bsSrv = (base && typeof base.seconds === 'number' && Number.isFinite(base.seconds)) ? base.seconds : null;
+      if(bsSrv && bsSrv > 0){ state.bp.baselineSec = bsSrv; }
+      if(nCols > 0 && okCols > 0 && complete){
+        state.bp.baseline = {
+          method: (base && base.method) ? base.method : 'median_mad',
+          nCols,
+          samples: null,
+          median: aligned.median,
+          scale: aligned.scale,
+          present: aligned.present || null,
+          finalized: true,
+          ready: true,
+          nFrames: (base && typeof base.frames_used === 'number') ? base.frames_used : 0,
+          source: 'server',
+          baselineSec: bsSrv,
+        };
+        dirtyBp = true;
+        scheduleRender();
+      }
+    }
+  }catch(e){}
+  finally{ state.bp._baselineInFlight = false; }
+}
+
   function updateStats(){
     const f = state.nf.frames.length ? state.nf.frames[state.nf.frames.length-1] : null;
     const a = state.art.latest;
@@ -301,6 +493,11 @@
       add('threshold', fmt(picked.threshold));
       add('reward', (f.reward? '1':'0'));
       add('reward_rate', fmt(f.reward_rate));
+      if(f.metric_raw!==null && f.metric_raw!==undefined) add('metric_raw', fmt(f.metric_raw));
+      if(f.threshold_desired!==null && f.threshold_desired!==undefined) add('thr_desired', fmt(f.threshold_desired));
+      if(f.feedback_raw!==null && f.feedback_raw!==undefined) add('feedback_raw', fmt(f.feedback_raw));
+      if(f.reward_value!==null && f.reward_value!==undefined) add('reward_value', fmt(f.reward_value));
+      if(f.raw_reward!==null && f.raw_reward!==undefined) add('raw_reward', String(f.raw_reward));
       if(f.artifact_ready!==null && f.artifact_ready!==undefined) add('artifact_ready', String(f.artifact_ready));
       if(f.phase) add('phase', String(f.phase));
       if(f.bad_channels!==null && f.bad_channels!==undefined) add('bad_ch', String(f.bad_channels));
@@ -372,6 +569,59 @@
 
     const x = (t) => (t - tMin) / (tNow - tMin) * (w-20) + 10;
     const y = (v) => (h-20) - (v - yMin)/(yMax-yMin) * (h-30);
+
+// Shade artifact periods on the bandpower plot (requires ready==1 when available).
+const arts = state.art.frames;
+if(Array.isArray(arts) && arts.length){
+  // Find the last artifact frame with t <= tMin.
+  let lo=0, hi=arts.length-1, idx0=-1;
+  while(lo<=hi){
+    const mid = (lo+hi)>>1;
+    const mt = (arts[mid] && typeof arts[mid].t === 'number') ? arts[mid].t : null;
+    if(mt === null || !Number.isFinite(mt)){ lo = mid+1; continue; }
+    if(mt <= tMin){ idx0 = mid; lo = mid+1; } else { hi = mid-1; }
+  }
+  if(idx0 < 0) idx0 = 0;
+
+  bpCtx.fillStyle = 'rgba(255, 92, 92, 0.14)';
+
+  let curT = tMin;
+  let cur = arts[idx0];
+  let curReady = (cur && cur.ready !== null && cur.ready !== undefined) ? !!cur.ready : true;
+  let curBad = !!(cur && cur.bad);
+  curBad = curReady && curBad;
+
+  for(let i=idx0+1; i<arts.length; i++){
+    const a = arts[i];
+    if(!a || typeof a.t !== 'number' || !Number.isFinite(a.t)) continue;
+    if(a.t < tMin) continue;
+    if(a.t > tNow) break;
+
+    if(curBad){
+      const x0 = x(curT);
+      const x1 = x(a.t);
+      const ww = x1 - x0;
+      if(ww > 0.5){
+        bpCtx.fillRect(x0, 10, ww, h-30);
+      }
+    }
+
+    curT = a.t;
+    curReady = (a.ready !== null && a.ready !== undefined) ? !!a.ready : true;
+    curBad = !!a.bad;
+    curBad = curReady && curBad;
+  }
+
+  if(curBad){
+    const x0 = x(curT);
+    const x1 = x(tNow);
+    const ww = x1 - x0;
+    if(ww > 0.5){
+      bpCtx.fillRect(x0, 10, ww, h-30);
+    }
+  }
+}
+
 
     // Grid
     ctx.strokeStyle = 'rgba(255,255,255,0.06)';
@@ -490,7 +740,66 @@
     return hslToRgb(hue, 0.90, 0.55);
   }
 
+  function drawTopoCli(){
+    resizeCanvasTo(topoCanvas);
+    const w = topoCanvas.width, h = topoCanvas.height;
+    topoCtx.clearRect(0,0,w,h);
+    topoCtx.fillStyle = '#071018';
+    topoCtx.fillRect(0,0,w,h);
+
+    // Legend values in CLI mode come from nf_run_meta.json (if available).
+    const cfg = state.bp.topomapCfg || null;
+    const mode = (cfg && typeof cfg.mode === 'string') ? cfg.mode : '';
+    let vmin = (cfg && Number.isFinite(cfg.vmin)) ? cfg.vmin : null;
+    let vmax = (cfg && Number.isFinite(cfg.vmax)) ? cfg.vmax : null;
+
+    // For z-score maps, qeeg_nf_cli defaults to roughly [-3, 3] unless overridden.
+    if((vmin === null || vmax === null) && (mode === 'zbase' || mode === 'zref')){
+      if(vmin === null) vmin = -3;
+      if(vmax === null) vmax = 3;
+    }
+
+    const vminStr = (vmin === null) ? 'auto' : vmin.toFixed(3);
+    const vmaxStr = (vmax === null) ? 'auto' : vmax.toFixed(3);
+    vminEl.textContent = `min: ${vminStr}`;
+    vmaxEl.textContent = `max: ${vmaxStr}`;
+
+    // In CLI-BMP mode the click-to-select overlay isn't aligned; disable it.
+    state.bp.electrodesPx = [];
+
+    const cli = state.bp.cliTopomap;
+    const img = (cli && cli.img) ? cli.img : null;
+    const dpr = window.devicePixelRatio || 1;
+
+    if(img && img.naturalWidth > 0 && img.naturalHeight > 0){
+      const iw = img.naturalWidth;
+      const ih = img.naturalHeight;
+      const scale = Math.min(w/iw, h/ih);
+      const dw = iw * scale;
+      const dh = ih * scale;
+      const dx = (w - dw) / 2;
+      const dy = (h - dh) / 2;
+      topoCtx.imageSmoothingEnabled = true;
+      topoCtx.drawImage(img, dx, dy, dw, dh);
+
+      topoCtx.fillStyle = 'rgba(255,255,255,0.78)';
+      topoCtx.font = `${Math.round(11*dpr)}px system-ui`;
+      const label = mode ? `CLI topomap (${mode})` : 'CLI topomap';
+      topoCtx.fillText(label, 14*dpr, 18*dpr);
+    } else {
+      topoCtx.fillStyle = '#9fb0c3';
+      topoCtx.font = `${Math.round(12*dpr)}px system-ui`;
+      topoCtx.fillText('Waiting for nf_topomap_latest.bmp …', 14*dpr, 24*dpr);
+    }
+  }
+
   function drawTopo(){
+    const topoSrc = resolveTopoSource(state.serverMeta);
+    if(topoSrc === 'cli'){
+      drawTopoCli();
+      return;
+    }
+
     const meta = state.bp.meta;
     if(!meta){
       resizeCanvasTo(topoCanvas);
@@ -508,12 +817,24 @@
     const nCh = meta.channels.length;
     const latest = state.bp.frames.length ? state.bp.frames[state.bp.frames.length-1] : null;
 
+    // If an artifact is active for the latest timestamp, hold the last clean frame.
+    let useFrame = latest;
+    let holdingArtifact = false;
+    if(latest && typeof latest.t === 'number' && Number.isFinite(latest.t)){
+      const aNow = artifactAtTime(latest.t);
+      const aReady = (aNow && aNow.ready !== null && aNow.ready !== undefined) ? !!aNow.ready : true;
+      holdingArtifact = !!(aNow && aReady && aNow.bad);
+      if(holdingArtifact && state.bp.lastClean){
+        useFrame = state.bp.lastClean;
+      }
+    }
+
     let vals = null;
-    if(latest && Array.isArray(latest.values) && latest.values.length >= (meta.bands.length*nCh)){
+    if(useFrame && Array.isArray(useFrame.values) && useFrame.values.length >= (meta.bands.length*nCh)){
       vals = [];
       for(let c=0;c<nCh;c++){
         const col = bIdx*nCh + c;
-        vals.push(bpDisplayValue(col, latest.values[col]));
+        vals.push(bpDisplayValue(col, useFrame.values[col]));
       }
     }
 
@@ -532,6 +853,13 @@
       }
       vmin = state.bp.rollingMin;
       vmax = state.bp.rollingMax;
+    }
+
+    // In z-score modes, default to a symmetric fixed range in auto-scale for interpretability.
+    const mm = mapMode();
+    if((mm === 'zbase' || mm === 'zref') && scaleSel.value !== 'fixed'){
+      vmin = -3;
+      vmax = 3;
     }
 
     vminEl.textContent = `min: ${Number.isFinite(vmin)?vmin.toFixed(3):'—'}`;
@@ -651,6 +979,14 @@
         topoCtx.fillStyle = 'rgba(255,255,255,0.78)';
         topoCtx.fillText(meta.channels[i], ex, ey);
       }
+    }
+
+    if(holdingArtifact){
+      topoCtx.fillStyle = 'rgba(255, 92, 92, 0.85)';
+      topoCtx.font = `${Math.round(12*dpr)}px system-ui`;
+      topoCtx.textAlign = 'left';
+      topoCtx.textBaseline = 'top';
+      topoCtx.fillText('artifact hold', 12*dpr, 12*dpr);
     }
   }
 
@@ -774,6 +1110,7 @@
       labels: (lblSel && lblSel.value) ? lblSel.value : 'on',
       nf_mode: (nfModeSel && nfModeSel.value) ? nfModeSel.value : 'raw',
       map_mode: (mapSel && mapSel.value) ? mapSel.value : 'raw',
+      topo_source: (topoSrcSel && topoSrcSel.value) ? topoSrcSel.value : 'auto',
       client_id: CLIENT_ID,
     };
   }
@@ -823,6 +1160,9 @@
       if(typeof st.map_mode === 'string'){
         if(mapSel && ['raw','zbase','zref'].includes(st.map_mode)) mapSel.value = st.map_mode;
       }
+      if(typeof st.topo_source === 'string'){
+        if(topoSrcSel && ['auto','browser','cli'].includes(st.topo_source)) topoSrcSel.value = st.topo_source;
+      }
       // band/channel depend on meta; stash if not yet available.
       state.pendingUi = state.pendingUi || {};
       if(typeof st.band === 'string' && st.band) state.pendingUi.band = st.band;
@@ -830,6 +1170,7 @@
       dirtyNf = true;
       dirtyBp = true;
       scheduleRender();
+      updateTopoPolling();
     } finally {
       state.applyingRemote = false;
     }
@@ -863,6 +1204,7 @@
     dirtyNf = true;
     dirtyBp = true;
     scheduleRender();
+    updateTopoPolling();
   };
 
   winSel.onchange = () => {
@@ -876,10 +1218,14 @@
   chSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); };
   lblSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); };
   xformSel.onchange = () => { state.bp.rollingMin = null; state.bp.rollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
+  if(topoSrcSel){
+    topoSrcSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); updateTopoPolling(); };
+  }
   if(mapSel){
     mapSel.onchange = () => {
       state.bp.rollingMin = null; state.bp.rollingMax = null;
       if(mapSel.value === 'zref' && !state.bp.reference){ loadReference(); }
+      if(mapSel.value === 'zbase' && (!state.bp.baseline || !state.bp.baseline.ready)){ loadBaseline(); }
       dirtyBp = true; scheduleRender(); schedulePushUiState();
     };
   }
@@ -890,6 +1236,7 @@
 
   function applyMeta(meta){
     if(!meta || typeof meta !== 'object') return;
+    state.serverMeta = meta;
     updateFileStatus(meta);
     updateRunMetaStatus(meta);
     if(meta.bandpower && meta.bandpower.bands && meta.bandpower.channels){
@@ -926,6 +1273,13 @@
     // Load normative reference (if provided by qeeg_nf_cli).
     const refStat = meta.files_stat && meta.files_stat.reference_used;
     if(refStat && refStat.exists && !state.bp.reference){ loadReference(); }
+
+    // Load server-computed baseline (if available) so zbase works across reloads.
+    const bs = (state.bp.baselineSec || 0);
+    if(bs > 0 && (!state.bp.baseline || !state.bp.baseline.ready)){ loadBaseline(); }
+
+    // If enabled, poll CLI-rendered topomap BMP for display.
+    updateTopoPolling();
   }
 
   // ---------------- rendering + event handlers ----------------
@@ -968,6 +1322,7 @@
       dirtyNf = true;
       dirtyBp = true;
       scheduleRender();
+      updateTopoPolling();
       markLive(stateConn, 'state');
     }catch(e){}
   }
@@ -1007,11 +1362,28 @@
     }catch(e){}
   }
 
+  function artifactAtTime(t){
+    const arr = state.art.frames;
+    if(!arr || !arr.length || t===null || t===undefined || !Number.isFinite(t)) return null;
+    let i = (state.art.cursor||0);
+    if(i < 0) i = 0;
+    if(i >= arr.length) i = arr.length-1;
+    // If the cursor points into the future (e.g., after trimming), reset.
+    if(arr[i] && typeof arr[i].t === 'number' && arr[i].t > t){
+      i = 0;
+    }
+    while(i+1 < arr.length && typeof arr[i+1].t === 'number' && arr[i+1].t <= t){
+      i++;
+    }
+    state.art.cursor = i;
+    return arr[i] || null;
+  }
+
   function handleBandpowerMsg(raw){
     if(state.paused) return;
     try{
       const un = unpackMsg(raw);
-      if(un.reset){ state.bp.frames = []; state.bp.lastT = -Infinity; state.bp.rollingMin = null; state.bp.rollingMax = null; state.bp.baseline = null; }
+      if(un.reset){ state.bp.frames = []; state.bp.lastT = -Infinity; state.bp.rollingMin = null; state.bp.rollingMax = null; state.bp.baseline = null; state.bp.lastClean = null; }
       for(const f of un.frames){
         if(!f || typeof f !== 'object') continue;
         if(f.t !== null && f.t !== undefined && Number.isFinite(f.t)){
@@ -1021,8 +1393,16 @@
         state.bp.frames.push(f);
         // Collect baseline stats (client-side) for z-score mapping.
         if(f && Array.isArray(f.values) && typeof f.t === 'number' && Number.isFinite(f.t)){
-          const badNow = state.art.latest && state.art.latest.bad;
-          if(!badNow && f.t <= (state.bp.baselineSec || 0)) baselineUpdate(f.values);
+          const aAt = artifactAtTime(f.t);
+          const aReady = (aAt && aAt.ready !== null && aAt.ready !== undefined) ? !!aAt.ready : true;
+          const artifactHit = !!(aAt && aReady && aAt.bad);
+          // Track last clean bandpower frame for artifact-hold topomap rendering.
+          if(!artifactHit){
+            state.bp.lastClean = f;
+          }
+          const bs = (state.bp.baselineSec || 0);
+          if(!artifactHit && f.t <= bs) baselineUpdate(f.values);
+          else if(state.bp.baseline && !state.bp.baseline.finalized && f.t > bs) finalizeBaselineStats();
         }
       }
       if(state.bp.frames.length > 20000) state.bp.frames.splice(0, state.bp.frames.length-20000);
@@ -1036,7 +1416,7 @@
     if(state.paused) return;
     try{
       const un = unpackMsg(raw);
-      if(un.reset){ state.art.frames = []; state.art.lastT = -Infinity; state.art.latest = null; }
+      if(un.reset){ state.art.frames = []; state.art.lastT = -Infinity; state.art.latest = null; state.art.cursor = 0; }
       for(const f of un.frames){
         if(!f || typeof f !== 'object') continue;
         if(f.t !== null && f.t !== undefined && Number.isFinite(f.t)){
@@ -1046,7 +1426,10 @@
         state.art.frames.push(f);
         state.art.latest = f;
       }
-      if(state.art.frames.length > 40000) state.art.frames.splice(0, state.art.frames.length-40000);
+      if(state.art.frames.length > 40000){
+        state.art.frames.splice(0, state.art.frames.length-40000);
+        state.art.cursor = 0;
+      }
       updateStats();
       dirtyNf = true;
       scheduleRender();
@@ -1062,6 +1445,7 @@
       dirtyNf = true;
       dirtyBp = true;
       scheduleRender();
+      updateTopoPolling();
     }, {passive:true});
 
     topoCanvas.addEventListener('click', (ev) => {

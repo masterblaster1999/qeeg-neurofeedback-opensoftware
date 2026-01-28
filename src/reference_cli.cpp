@@ -1,4 +1,5 @@
 #include "qeeg/bandpower.hpp"
+#include "qeeg/online_bandpower.hpp"
 #include "qeeg/preprocess.hpp"
 #include "qeeg/reader.hpp"
 #include "qeeg/robust_stats.hpp"
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -33,6 +35,14 @@ struct Args {
   size_t nperseg{1024};
   double overlap{0.5};
 
+  // Optional: build a reference distribution from sliding windows (more consistent
+  // with qeeg_nf_cli real-time bandpower frames).
+  // When both are > 0, reference values are accumulated over all emitted frames
+  // rather than one value per file.
+  double window_seconds{0.0};
+  double update_seconds{0.0};
+  double chunk_seconds{0.10};
+
   // If enabled, compute relative bandpower (band / total within a range).
   bool relative_power{false};
   bool relative_range_specified{false};
@@ -41,6 +51,10 @@ struct Args {
 
   bool log10_power{false};
   bool robust{false};
+
+  // Robust mode with windowed references can grow very large. We cap per-key sample
+  // storage via reservoir sampling to keep memory bounded.
+  std::size_t robust_max_samples_per_key{20000};
 
   // Optional preprocessing
   bool average_reference{false};
@@ -69,11 +83,15 @@ static void print_help() {
     << "  --bands SPEC            Band spec, e.g. 'delta:0.5-4,theta:4-7,alpha:8-12'\n"
     << "  --nperseg N             Welch segment length (default: 1024)\n"
     << "  --overlap FRAC          Welch overlap fraction in [0,1) (default: 0.5)\n"
+    << "  --window S              Optional: sliding window seconds (enables windowed reference mode when used with --update)\n"
+    << "  --update S              Optional: update interval seconds (windowed reference mode)\n"
+    << "  --chunk S               Optional: input chunk seconds for windowed mode (default: 0.10)\n"
     << "  --relative              Compute relative power: band_power / total_power\n"
     << "  --relative-range LO HI  Total-power integration range used for --relative.\n"
     << "                         Default: [min_band_fmin, max_band_fmax] from --bands.\n"
     << "  --log10                 Accumulate log10(power) instead of raw power\n"
     << "  --robust                Use median + MAD-derived scale (robust) instead of mean + std\n"
+    << "  --robust-max-per-key N  Robust mode: cap stored samples per (channel,band) using reservoir sampling (default: 20000)\n"
     << "  --average-reference     Apply common average reference across channels\n"
     << "  --notch HZ              Apply a notch filter at HZ (e.g., 50 or 60)\n"
     << "  --notch-q Q             Notch Q factor (default: 30)\n"
@@ -105,6 +123,12 @@ static Args parse_args(int argc, char** argv) {
       a.nperseg = static_cast<size_t>(to_int(argv[++i]));
     } else if (arg == "--overlap" && i + 1 < argc) {
       a.overlap = to_double(argv[++i]);
+    } else if (arg == "--window" && i + 1 < argc) {
+      a.window_seconds = to_double(argv[++i]);
+    } else if (arg == "--update" && i + 1 < argc) {
+      a.update_seconds = to_double(argv[++i]);
+    } else if (arg == "--chunk" && i + 1 < argc) {
+      a.chunk_seconds = to_double(argv[++i]);
     } else if (arg == "--relative") {
       a.relative_power = true;
     } else if (arg == "--relative-range" && i + 2 < argc) {
@@ -116,6 +140,8 @@ static Args parse_args(int argc, char** argv) {
       a.log10_power = true;
     } else if (arg == "--robust") {
       a.robust = true;
+    } else if (arg == "--robust-max-per-key" && i + 1 < argc) {
+      a.robust_max_samples_per_key = static_cast<std::size_t>(std::max(1, to_int(argv[++i])));
     } else if (arg == "--average-reference") {
       a.average_reference = true;
     } else if (arg == "--notch" && i + 1 < argc) {
@@ -132,6 +158,26 @@ static Args parse_args(int argc, char** argv) {
     }
   }
   return a;
+}
+
+static void reservoir_update(std::vector<double>* reservoir,
+                             std::size_t* seen,
+                             double x,
+                             std::size_t max_k,
+                             std::mt19937* rng) {
+  if (!reservoir || !seen || !rng) return;
+  if (max_k == 0) max_k = 1;
+  (*seen) += 1;
+  if (reservoir->size() < max_k) {
+    reservoir->push_back(x);
+    return;
+  }
+  // Classic reservoir sampling: replace an existing element with probability k/n.
+  std::uniform_int_distribution<std::size_t> dist(0, (*seen) - 1);
+  const std::size_t j = dist(*rng);
+  if (j < max_k) {
+    (*reservoir)[j] = x;
+  }
 }
 
 static std::string resolve_out_path(const std::string& outdir, const std::string& path_or_name) {
@@ -197,6 +243,19 @@ int main(int argc, char** argv) {
       throw std::runtime_error("--nperseg too small (>=16 recommended)");
     }
 
+    const bool windowed_mode = (args.window_seconds > 0.0 && args.update_seconds > 0.0);
+    if ((args.window_seconds > 0.0) != (args.update_seconds > 0.0)) {
+      throw std::runtime_error("Windowed reference mode requires both --window and --update to be set > 0");
+    }
+    if (windowed_mode) {
+      if (!(args.update_seconds > 0.0 && args.window_seconds > 0.0)) {
+        throw std::runtime_error("--window and --update must be > 0");
+      }
+      if (args.chunk_seconds <= 0.0) {
+        throw std::runtime_error("--chunk must be > 0 in windowed mode");
+      }
+    }
+
     ensure_directory(args.outdir);
     const std::string out_csv = resolve_out_path(args.outdir, args.out_csv);
 
@@ -241,6 +300,11 @@ int main(int argc, char** argv) {
     std::unordered_map<std::string, RunningStats> stats;               // key: band|channel
     std::unordered_map<std::string, std::vector<double>> robust_vals;  // key: band|channel
 
+    // For robust reservoir sampling.
+    std::unordered_map<std::string, std::size_t> robust_seen; // key: band|channel -> total samples observed
+    robust_seen.reserve(1024);
+    std::mt19937 rng(1337);
+
     size_t n_ok = 0;
     for (const auto& path : inputs) {
       if (trim(path).empty()) continue;
@@ -263,34 +327,74 @@ int main(int argc, char** argv) {
       }
 
       // Compute per-channel PSD, then integrate each band.
-      std::vector<PsdResult> psds(rec.n_channels());
-      for (size_t c = 0; c < rec.n_channels(); ++c) {
-        psds[c] = welch_psd(rec.data[c], rec.fs_hz, wopt);
-      }
-
       const double eps = 1e-20;
-
-      std::vector<double> total_power;
-      if (args.relative_power) {
-        total_power.resize(rec.n_channels(), 0.0);
+      if (!windowed_mode) {
+        std::vector<PsdResult> psds(rec.n_channels());
         for (size_t c = 0; c < rec.n_channels(); ++c) {
-          total_power[c] = integrate_bandpower(psds[c], rel_lo, rel_hi);
+          psds[c] = welch_psd(rec.data[c], rec.fs_hz, wopt);
         }
-      }
 
-      for (size_t b = 0; b < bands.size(); ++b) {
-        for (size_t c = 0; c < rec.n_channels(); ++c) {
-          double v = integrate_bandpower(psds[c], bands[b].fmin_hz, bands[b].fmax_hz);
-          if (args.relative_power) {
-            v = v / std::max(eps, total_power[c]);
+        std::vector<double> total_power;
+        if (args.relative_power) {
+          total_power.resize(rec.n_channels(), 0.0);
+          for (size_t c = 0; c < rec.n_channels(); ++c) {
+            total_power[c] = integrate_bandpower(psds[c], rel_lo, rel_hi);
           }
-          if (args.log10_power) v = std::log10(std::max(eps, v));
+        }
 
-          const std::string key = to_lower(bands[b].name) + "|" + to_lower(rec.channel_names[c]);
-          if (args.robust) {
-            robust_vals[key].push_back(v);
-          } else {
-            stats[key].add(v);
+        for (size_t b = 0; b < bands.size(); ++b) {
+          for (size_t c = 0; c < rec.n_channels(); ++c) {
+            double v = integrate_bandpower(psds[c], bands[b].fmin_hz, bands[b].fmax_hz);
+            if (args.relative_power) {
+              v = v / std::max(eps, total_power[c]);
+            }
+            if (args.log10_power) v = std::log10(std::max(eps, v));
+
+            const std::string key = to_lower(bands[b].name) + "|" + to_lower(rec.channel_names[c]);
+            if (args.robust) {
+              // One sample per file, so we can store directly.
+              robust_vals[key].push_back(v);
+            } else {
+              stats[key].add(v);
+            }
+          }
+        }
+      } else {
+        // Windowed mode: accumulate values from all emitted frames.
+        OnlineBandpowerOptions opt;
+        opt.window_seconds = args.window_seconds;
+        opt.update_seconds = args.update_seconds;
+        opt.welch = wopt;
+        opt.relative_power = args.relative_power;
+        opt.relative_fmin_hz = rel_lo;
+        opt.relative_fmax_hz = rel_hi;
+        opt.log10_power = args.log10_power;
+        OnlineWelchBandpower eng(rec.channel_names, rec.fs_hz, bands, opt);
+
+        const size_t chunk_samples = std::max<std::size_t>(1, static_cast<std::size_t>(std::llround(args.chunk_seconds * rec.fs_hz)));
+        std::vector<std::vector<float>> block(rec.n_channels());
+
+        for (size_t pos = 0; pos < rec.n_samples(); pos += chunk_samples) {
+          const size_t end = std::min(rec.n_samples(), pos + chunk_samples);
+          for (size_t c = 0; c < rec.n_channels(); ++c) {
+            block[c].assign(rec.data[c].begin() + static_cast<std::ptrdiff_t>(pos),
+                            rec.data[c].begin() + static_cast<std::ptrdiff_t>(end));
+          }
+          const auto frames = eng.push_block(block);
+          for (const auto& fr : frames) {
+            for (size_t b = 0; b < fr.bands.size(); ++b) {
+              for (size_t c = 0; c < fr.channel_names.size(); ++c) {
+                const double v = fr.powers[b][c];
+                if (!std::isfinite(v)) continue;
+                const std::string key = to_lower(fr.bands[b].name) + "|" + to_lower(fr.channel_names[c]);
+                if (args.robust) {
+                  std::size_t& seen = robust_seen[key];
+                  reservoir_update(&robust_vals[key], &seen, v, args.robust_max_samples_per_key, &rng);
+                } else {
+                  stats[key].add(v);
+                }
+              }
+            }
           }
         }
       }
@@ -318,6 +422,13 @@ int main(int argc, char** argv) {
     out << "# robust=" << (args.robust ? 1 : 0) << "\n";
     out << "# welch_nperseg=" << args.nperseg << "\n";
     out << "# welch_overlap=" << args.overlap << "\n";
+    out << "# windowed_mode=" << (windowed_mode ? 1 : 0) << "\n";
+    if (windowed_mode) {
+      out << "# window_seconds=" << args.window_seconds << "\n";
+      out << "# update_seconds=" << args.update_seconds << "\n";
+      out << "# chunk_seconds=" << args.chunk_seconds << "\n";
+      out << "# robust_max_samples_per_key=" << args.robust_max_samples_per_key << "\n";
+    }
     out << "# band_spec=" << (args.band_spec.empty() ? std::string("<default>") : args.band_spec) << "\n";
     out << "# channel,band,mean,std,n\n";
 

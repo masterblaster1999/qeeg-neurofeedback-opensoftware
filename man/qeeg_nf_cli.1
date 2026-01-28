@@ -210,14 +210,70 @@ Export coherence timeseries (coherence mode).
 \fB--export-artifacts\fP
 Export artifact gate timeline (artifact_gate_timeseries.csv).
 .TP
+\fB--flush-csv\fP
+Flush CSV outputs after each row. Useful for real-time dashboards (e.g. \fBtail -f\fP).
+.TP
 \fB--biotrace-ui\fP
 Write a self-contained BioTrace+ style HTML UI (biotrace_ui.html).
+.TP
+\fB--live-ui\fP
+Write a lightweight live dashboard HTML (nf_live_ui.html) that tails nf_feedback.csv.
+Designed to be served by \fBqeeg_ui_server_cli\fP while the run is in progress.
+Implies \fB--flush-csv\fP.
+.TP
+\fB--topomap-latest\fP
+Write/update a scalp topomap BMP (nf_topomap_latest.bmp) during the run.
+Supported for bandpower-derived metrics only (bandpower/ratio/asymmetry).
+Implies \fB--flush-csv\fP.
+If \fB--artifact-gate\fP is enabled and artifact detection is configured, topomap updates are frozen on gated artifact frames.
+Baseline z-scores (\fBzbase\fP) ignore artifact frames when artifact detection is enabled.
+.TP
+\fB--topomap-band\fP \fINAME\fP
+Topomap band name (default: inferred from --metric; ratio defaults to numerator).
+.TP
+\fB--topomap-mode\fP \fIMODE\fP
+Topomap values: \fBauto\fP|\fBraw\fP|\fBzbase\fP|\fBzref\fP (default: auto).
+\fBzbase\fP uses per-channel baseline z-scores from the initial \fB--baseline\fP window.
+\fBzref\fP uses per-channel reference z-scores from \fB--reference-csv\fP.
+.TP
+\fB--topomap-every\fP \fIN\fP
+Update topomap every N NF frames (default: 1).
+.TP
+\fB--topomap-grid\fP \fIN\fP
+Topomap grid size in pixels (default: 256).
+.TP
+\fB--topomap-vmin\fP \fIX\fP
+Topomap color scale minimum (optional; set both vmin and vmax).
+.TP
+\fB--topomap-vmax\fP \fIX\fP
+Topomap color scale maximum (optional; set both vmin and vmax).
+.TP
+\fB--topomap-no-annotate\fP
+Disable head/electrode overlay and colorbar in topomap BMP.
+.TP
+\fB--montage\fP \fIPATH\fP
+Optional montage CSV for topomaps: name,x,y (unit circle).
+.TP
+\fB--montage-1010\fP
+Use built-in 10-10 montage (61 channels; default for topomaps).
+.TP
+\fB--montage-1020\fP
+Use built-in 10-20 montage (19 channels).
 .TP
 \fB--osc-host\fP \fIHOST\fP
 OSC/UDP destination host (default: 127.0.0.1).
 .TP
 \fB--osc-port\fP \fIPORT\fP
 OSC/UDP destination port (0 disables).
+.TP
+\fB--osc-prefix\fP \fIPATH\fP
+OSC address prefix (default: /qeeg).
+.TP
+\fB--osc-mode\fP \fIMODE\fP
+OSC framing: state|split|bundle (default: state).
+.TP
+\fB--osc-bundle-ms\fP \fIMS\fP
+Bundle interval (milliseconds) when \fB--osc-mode\fP=bundle.
 .TP
 \fB--audio-wav\fP \fIPATH\fP
 Optional reward-tone WAV output.
@@ -230,6 +286,26 @@ Duration for \fB--demo\fP.
 .TP
 \fB-h\fP, \fB--help\fP
 Show help.
+.SH OSC OUTPUT
+When OSC is enabled (\fB--osc-port\fP > 0), the CLI sends best-effort OSC/UDP messages using the configured host/port and prefix.
+
+Core state (depends on \fB--osc-mode\fP):
+.IP \(bu 2
+\fBstate\fP: \fI<prefix>\fP/state (t_end_sec, metric, threshold, reward, reward_rate, have_threshold)
+.IP \(bu 2
+\fBsplit\fP: \fI<prefix>\fP/time, /metric, /threshold, /reward, /reward_rate, /have_threshold (each as a separate message)
+.IP \(bu 2
+\fBbundle\fP: like split, but grouped into OSC bundles at roughly \fB--osc-bundle-ms\fP intervals
+
+Additional messages (sent when available):
+.IP \(bu 2
+\fI<prefix>\fP/phase (t_end_sec, "baseline"|"train"|"rest")
+.IP \(bu 2
+\fI<prefix>\fP/metric_z, /threshold_z (t_end_sec, z-score vs baseline median/MAD)
+.IP \(bu 2
+\fI<prefix>\fP/metric_z_ref, /threshold_z_ref (t_end_sec, z-score vs \fB--reference-csv\fP; bandpower-only)
+.IP \(bu 2
+\fI<prefix>\fP/feedback_raw, /reward_value (t_end_sec, value; continuous feedback mode)
 .SH EXAMPLES
 List channel names from an input file:
 .RS

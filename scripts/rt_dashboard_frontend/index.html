@@ -63,16 +63,22 @@
               </div>
               <div class="row">
                 <span class="ctrl">Transform</span>
+                <select id="xformSel">
+                  <option value="linear" selected>linear</option>
+                  <option value="log10">log10</option>
+                  <option value="db">dB (10·log10)</option>
+                </select>
+                <span class="ctrl">Topo</span>
+                <select id="topoSrcSel">
+                  <option value="auto" selected>auto</option>
+                  <option value="browser">browser</option>
+                  <option value="cli">cli bmp</option>
+                </select>
                 <span class="ctrl">Map</span>
                 <select id="mapSel">
                   <option value="raw" selected>raw</option>
                   <option value="zbase">z (baseline)</option>
                   <option value="zref">z (reference)</option>
-                </select>
-                <select id="xformSel">
-                  <option value="linear" selected>linear</option>
-                  <option value="log10">log10</option>
-                  <option value="db">dB (10·log10)</option>
                 </select>
                 <span class="ctrl">Scale</span>
                 <select id="scaleSel">
