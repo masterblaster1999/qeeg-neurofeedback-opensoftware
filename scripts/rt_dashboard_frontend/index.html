@@ -148,6 +148,24 @@
           </div>
         </details>
 
+        <details id="reportsDetails" class="details">
+          <summary>Reports</summary>
+          <div class="detailsBody">
+            <div class="detailsActions">
+              <button id="reportsGenNf" class="btn" type="button">Generate NF feedback report</button>
+              <button id="reportsGenDash" class="btn" type="button">Generate reports dashboard</button>
+              <button id="reportsGenBundle" class="btn" type="button">Generate reports bundle (.zip)</button>
+              <label class="small muted" style="display:flex; gap:6px; align-items:center;">
+                <input id="reportsForce" type="checkbox" /> Force regenerate
+              </label>
+              <button id="reportsRefresh" class="btn" type="button">Refresh</button>
+            </div>
+            <div id="reportsStatus" class="small muted" style="margin-top:8px"></div>
+            <div id="reportsList" class="filesList"></div>
+            <div class="small muted" style="margin-top:8px">Reports are generated from files in the output directory and saved alongside them. HTML reports can be opened in a new tab; bundles are downloaded as ZIP.</div>
+          </div>
+        </details>
+
         <details id="statsDetails" class="details">
           <summary>Server stats</summary>
           <div class="detailsBody">

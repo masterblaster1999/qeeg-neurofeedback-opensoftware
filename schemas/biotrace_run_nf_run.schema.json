@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/biotrace_run_nf_run.schema.json",
+  "title": "biotrace_run_nf.py --run-json output",
+  "description": "Schema for the JSON manifest emitted by scripts/biotrace_run_nf.py --run-json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "started_utc",
+    "finished_utc",
+    "input",
+    "outdir",
+    "extract_dir",
+    "kept_extracted",
+    "prefer_exts",
+    "select",
+    "extracted",
+    "qeeg_nf_cli",
+    "cmd",
+    "forwarded_args",
+    "returncode",
+    "dashboard",
+    "error"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/biotrace_run_nf_run.schema.json"
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Version of this run manifest schema."
+    },
+    "started_utc": {
+      "type": "number",
+      "description": "Unix timestamp (seconds) when the wrapper started."
+    },
+    "finished_utc": {
+      "type": "number",
+      "description": "Unix timestamp (seconds) when the wrapper finished."
+    },
+    "input": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to the container or directory that was processed."
+    },
+    "outdir": {
+      "type": "string",
+      "description": "Output directory passed to qeeg_nf_cli."
+    },
+    "extract_dir": {
+      "type": "string",
+      "description": "Directory used for extraction (may be a temp directory)."
+    },
+    "kept_extracted": {
+      "type": "boolean",
+      "description": "Whether extracted files were preserved."
+    },
+    "prefer_exts": {
+      "type": "array",
+      "description": "Extension preference list used to rank candidates.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "select": {
+      "type": "string",
+      "description": "Selection directive for the embedded export (index/name/glob/substr), or empty when auto-selected."
+    },
+    "extracted": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Path to the extracted main recording file (null on failure)."
+    },
+    "qeeg_nf_cli": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Resolved qeeg_nf_cli executable path (null on failure)."
+    },
+    "cmd": {
+      "type": "array",
+      "description": "Exact command argv executed for qeeg_nf_cli.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "forwarded_args": {
+      "type": "array",
+      "description": "Raw args forwarded to qeeg_nf_cli (after wrapper override stripping).",
+      "items": {
+        "type": "string"
+      }
+    },
+    "returncode": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Return code from qeeg_nf_cli (or a wrapper error code if the wrapper failed before launching it)."
+    },
+    "dashboard": {
+      "$ref": "#/$defs/dashboard"
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Error string when the wrapper failed, otherwise null."
+    }
+  },
+  "$defs": {
+    "dashboard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "cmd",
+        "pid",
+        "info",
+        "error",
+        "raw_line",
+        "terminated",
+        "kept"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether --dashboard was requested."
+        },
+        "cmd": {
+          "type": "array",
+          "description": "Command argv used to launch rt_qeeg_dashboard.py (empty when disabled).",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Dashboard process id when started successfully."
+        },
+        "info": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Parsed startup JSON emitted by rt_qeeg_dashboard.py --print-json when available."
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Dashboard startup error string when it failed, otherwise null."
+        },
+        "raw_line": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Raw first line read from dashboard stdout (for debugging), otherwise null."
+        },
+        "terminated": {
+          "type": "boolean",
+          "description": "Whether the wrapper terminated the dashboard process."
+        },
+        "kept": {
+          "type": "boolean",
+          "description": "Whether the dashboard process was kept alive after qeeg_nf_cli exited."
+        }
+      }
+    }
+  }
+}

@@ -33,6 +33,7 @@ import math
 import mimetypes
 import tempfile
 import zipfile
+import subprocess
 import os
 import socket
 import secrets
@@ -759,6 +760,19 @@ def build_baseline_info(outdir: Path, *, baseline_sec_override: Optional[float] 
     return resp
 
 
+class CsvTailerFileChanged(RuntimeError):
+    """Raised when the tailed file has been replaced or truncated.
+
+    The dashboard workers treat this as a signal to restart their tail loop so
+    they can re-read the CSV header and re-establish column indices.
+
+    This is conceptually similar to how tools like `tail --follow=name`/`tail -F`
+    reopen a file when the device/inode pair changes (log rotation), or when the
+    file is truncated and needs to be read from the start again.
+    """
+    pass
+
+
 class CsvTailer:
 
     """Incrementally tails a CSV file that is appended over time."""
@@ -770,9 +784,24 @@ class CsvTailer:
         self._fp = None  # type: Optional[object]
         self._buf = b""
         self._header: Optional[List[str]] = None
+        self._open_dev_ino: Optional[Tuple[int, int]] = None
 
     def header(self) -> Optional[List[str]]:
         return self._header
+
+    @staticmethod
+    def _dev_ino_from_stat(st: object) -> Optional[Tuple[int, int]]:
+        """Return (st_dev, st_ino) if available and non-zero."""
+        try:
+            dev = int(getattr(st, "st_dev", 0) or 0)
+            ino = int(getattr(st, "st_ino", 0) or 0)
+            if dev == 0 and ino == 0:
+                return None
+            # Some platforms may legitimately report 0 for one of the fields.
+            # Treat (0,0) as "unknown", but allow mixed zeros.
+            return (dev, ino)
+        except Exception:
+            return None
 
     def close(self) -> None:
         try:
@@ -780,6 +809,9 @@ class CsvTailer:
                 self._fp.close()
         finally:
             self._fp = None
+            self._buf = b""
+            self._header = None
+            self._open_dev_ino = None
 
     def _open_wait(self, timeout: float = 0.0, stop_event: Optional[threading.Event] = None) -> None:
         t0 = time.time()
@@ -787,9 +819,24 @@ class CsvTailer:
         while True:
             if se is not None and se.is_set():
                 raise InterruptedError("Stopped")
-            if self.path.exists() and self.path.stat().st_size > 0:
+            try:
+                st = self.path.stat()
+            except Exception:
+                st = None
+
+            if st is not None and self.path.exists() and getattr(st, "st_size", 0) > 0:
                 self._fp = self.path.open("rb")
                 self._buf = b""
+                self._header = None
+
+                # Capture identity of the *opened* file. This lets us detect when the
+                # path has been replaced/rotated to a new inode.
+                try:
+                    fst = os.fstat(self._fp.fileno())  # type: ignore[arg-type]
+                    self._open_dev_ino = self._dev_ino_from_stat(fst)
+                except Exception:
+                    self._open_dev_ino = None
+
                 # Read header line.
                 while True:
                     if se is not None and se.is_set():
@@ -810,6 +857,7 @@ class CsvTailer:
                     hdr = next(csv.reader([line.decode("utf-8", errors="replace")]))
                     self._header = hdr
                     return
+
             if timeout > 0 and (time.time() - t0) >= timeout:
                 raise TimeoutError(f"Timed out waiting for file: {self.path}")
             if se is not None and se.is_set():
@@ -818,14 +866,33 @@ class CsvTailer:
 
     def _ensure_open(self) -> None:
         if self._fp is not None:
-            # Detect truncation and reopen.
+            # Detect truncation/replacement and signal the caller to restart.
             try:
-                cur = self._fp.tell()
-                size = self.path.stat().st_size
-                if size < cur:
-                    self.close()
+                path_st = self.path.stat()
+            except FileNotFoundError:
+                # Path missing: close and re-wait for it to reappear.
+                self.close()
             except Exception:
                 self.close()
+            else:
+                # Truncation: file shrank below our current read position.
+                try:
+                    cur = int(self._fp.tell())
+                except Exception:
+                    cur = 0
+                try:
+                    size = int(getattr(path_st, "st_size", 0) or 0)
+                except Exception:
+                    size = 0
+                if size < cur:
+                    self.close()
+                    raise CsvTailerFileChanged(f"File truncated: {self.path}")
+
+                # Replacement/rotation detection: compare device/inode.
+                cur_id = self._dev_ino_from_stat(path_st)
+                if self._open_dev_ino is not None and cur_id is not None and self._open_dev_ino != cur_id:
+                    self.close()
+                    raise CsvTailerFileChanged(f"File replaced: {self.path}")
 
         if self._fp is None:
             self._open_wait(timeout=0.0, stop_event=self.stop_event)
@@ -860,20 +927,27 @@ class CsvTailer:
         assert self._fp is not None
 
         # File pointer is expected to be at EOF after read_initial_rows.
+        last_check = 0.0
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
             try:
                 chunk = self._fp.read(4096)
             except Exception:
-                # Reopen on transient errors.
+                # Reopen on transient errors (will also detect rotations/truncations).
                 self.close()
                 self._ensure_open()
                 assert self._fp is not None
                 chunk = b""
 
             if not chunk:
-                # No new data.
+                # No new data. Periodically check whether the path now points at a
+                # different file (rotation) or whether it has been truncated.
+                now = time.time()
+                if (now - last_check) > 0.25:
+                    last_check = now
+                    self._ensure_open()  # may raise CsvTailerFileChanged
+                    assert self._fp is not None
                 if stop_event is not None and stop_event.is_set():
                     return
                 time.sleep(0.05)
@@ -897,6 +971,7 @@ class CsvTailer:
 
 
 class StreamBuffer:
+
     """Thread-safe ring buffer for SSE frames.
 
     Each appended frame gets a monotonically increasing sequence number.
@@ -1477,6 +1552,8 @@ def _build_urls(bind_host: str, port: int, token: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     out["dashboard_url"] = f"http://{local_host}:{port}/?token={token}"
     out["kiosk_url"] = f"http://{local_host}:{port}/kiosk?token={token}"
+    out["health_url"] = f"http://{local_host}:{port}/api/health?token={token}"
+    out["openapi_url"] = f"http://{local_host}:{port}/api/openapi.json?token={token}"
 
     lan_host: Optional[str] = None
     if _is_wildcard_host(h):
@@ -1488,6 +1565,8 @@ def _build_urls(bind_host: str, port: int, token: str) -> Dict[str, str]:
     if lan_host and lan_host != local_host:
         out["dashboard_url_lan"] = f"http://{lan_host}:{port}/?token={token}"
         out["kiosk_url_lan"] = f"http://{lan_host}:{port}/kiosk?token={token}"
+        out["health_url_lan"] = f"http://{lan_host}:{port}/api/health?token={token}"
+        out["openapi_url_lan"] = f"http://{lan_host}:{port}/api/openapi.json?token={token}"
 
     return out
 
@@ -1657,6 +1736,17 @@ _FRONTEND_PATH_MAP: Dict[str, str] = {
     "/kiosk.js": "kiosk.js",
     "/style.css": "style.css",
 }
+
+
+# Cookie used to persist the dashboard token after first successful load.
+# This reduces token exposure in URLs/address bars while keeping the server dependency-free.
+_TOKEN_COOKIE_NAME = "qeeg_token"
+
+
+def _token_cookie_header(token: str) -> str:
+    """Build a Set-Cookie header value for the dashboard token."""
+    t = (token or "").replace("\n", "").replace("\r", "").strip()
+    return f"{_TOKEN_COOKIE_NAME}={t}; Path=/; HttpOnly; SameSite=Strict"
 
 
 _MIME_MAP: Dict[str, str] = {
@@ -1844,6 +1934,142 @@ def _file_category(name: str) -> str:
     if n.endswith("_report.html") or "reports" in n:
         return "report"
     return "other"
+
+
+# ------------------------ reports generation ------------------------
+
+# The dashboard can optionally generate offline HTML reports from outdir
+# using the dependency-free scripts shipped in this repository.
+#
+# This is meant for convenience/sharing. It does not change the live streaming
+# behavior of the dashboard.
+
+_REPORT_KIND_ORDER: Tuple[str, ...] = (
+    "nf_feedback",
+    "reports_dashboard",
+    "reports_bundle",
+)
+
+_REPORT_KINDS: Dict[str, Dict[str, object]] = {
+    "nf_feedback": {
+        "kind": "nf_feedback",
+        "title": "Neurofeedback feedback report",
+        "description": (
+            "Generate nf_feedback_report.html from nf_feedback.csv (optionally enriched by nf_summary.json and nf_run_meta.json)."
+        ),
+        "script": "render_nf_feedback_report.py",
+        "inputs": ["nf_feedback.csv"],
+        "outputs": ["nf_feedback_report.html"],
+    },
+    "reports_dashboard": {
+        "kind": "reports_dashboard",
+        "title": "Reports dashboard",
+        "description": (
+            "Generate qeeg_reports_dashboard.html (+ qeeg_reports_dashboard_index.json) by scanning the output directory for known CLI outputs and linking per-run HTML reports."
+        ),
+        "script": "render_reports_dashboard.py",
+        "inputs": [],
+        "outputs": ["qeeg_reports_dashboard.html", "qeeg_reports_dashboard_index.json"],
+    },
+    "reports_bundle": {
+        "kind": "reports_bundle",
+        "title": "Reports bundle",
+        "description": (
+            "Create qeeg_reports_bundle.zip containing the reports dashboard and all referenced report HTML files (portable bundle)."
+        ),
+        "script": "render_reports_dashboard.py",
+        "inputs": [],
+        "outputs": ["qeeg_reports_bundle.zip"],
+    },
+}
+
+
+def _report_script_path(script_name: str) -> Path:
+    return Path(__file__).resolve().parent / str(script_name)
+
+
+def _truncate_log(s: str, *, max_chars: int = 20000) -> str:
+    if not s:
+        return ""
+    if len(s) <= max_chars:
+        return s
+    # Keep the tail, which often includes the actual error.
+    return "…(truncated)…\n" + s[-max_chars:]
+
+
+def _build_report_cmd(kind: str, outdir: Path, *, force: bool = False) -> Optional[List[str]]:
+    """Build a subprocess argv list for a known report kind."""
+
+    k = (kind or "").strip()
+    if not k:
+        return None
+
+    info = _REPORT_KINDS.get(k)
+    if not isinstance(info, dict):
+        return None
+
+    script = str(info.get("script") or "")
+    if not script:
+        return None
+
+    script_path = _report_script_path(script)
+    if not script_path.exists():
+        return None
+
+    py = sys.executable or "python3"
+
+    if k == "nf_feedback":
+        out_html = outdir / "nf_feedback_report.html"
+        return [
+            py,
+            "-B",
+            str(script_path),
+            "--input",
+            str(outdir),
+            "--out",
+            str(out_html),
+        ]
+
+    if k == "reports_dashboard":
+        out_html = outdir / "qeeg_reports_dashboard.html"
+        out_idx = outdir / "qeeg_reports_dashboard_index.json"
+        argv = [
+            py,
+            "-B",
+            str(script_path),
+            str(outdir),
+            "--out",
+            str(out_html),
+            "--json-index",
+            str(out_idx),
+        ]
+        if force:
+            argv.append("--force")
+        return argv
+
+    if k == "reports_bundle":
+        out_html = outdir / "qeeg_reports_dashboard.html"
+        out_idx = outdir / "qeeg_reports_dashboard_index.json"
+        out_zip = outdir / "qeeg_reports_bundle.zip"
+        argv = [
+            py,
+            "-B",
+            str(script_path),
+            str(outdir),
+            "--out",
+            str(out_html),
+            "--json-index",
+            str(out_idx),
+            "--bundle",
+            str(out_zip),
+        ]
+        if force:
+            argv.append("--force")
+        return argv
+
+    return None
+
+
 DASH_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -2593,11 +2819,6 @@ DASH_HTML = r"""<!doctype html>
   }
 
   function start(){
-    if(!TOKEN){
-      showStatus('Missing token. Re-open using the printed URL (it includes <code>?token=…</code>).');
-      return;
-    }
-
     fetch(`/api/meta?token=${encodeURIComponent(TOKEN)}`)
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then(meta => {
@@ -2798,7 +3019,7 @@ KIOSK_HTML = r'''<!doctype html>
     <button id="pauseBtn" type="button">Pause</button>
   </div>
   <div class="small">
-    Lightweight view for tablets / second screens. Requires the <code>?token=…</code> in the URL.
+    Lightweight view for tablets / second screens. Use the printed URL once (it includes <code>?token=…</code>); after the first successful load, you can refresh/bookmark without the token (cookie auth).
     (If you run the server with <code>--host 0.0.0.0 --allow-remote</code>, you can open the LAN URL on a Nexus/Android tablet.)
   </div>
 </div>
@@ -2818,10 +3039,7 @@ KIOSK_HTML = r'''<!doctype html>
     return m ? decodeURIComponent(m[1]) : "";
   }
   var TOKEN = getToken();
-  if(!TOKEN){
-    sEl.className = "badge artifact";
-    sEl.innerHTML = "missing token";
-  }
+  // If TOKEN is empty, rely on the HttpOnly qeeg_token cookie (set by the server after the first successful load).
 
   function fmt(v){
     if(v===null || v===undefined || !isFinite(v)) return "—";
@@ -2884,7 +3102,8 @@ KIOSK_HTML = r'''<!doctype html>
       setBadge("artifact", "no EventSource support");
       return;
     }
-    var url = "/api/sse/nf?token=" + encodeURIComponent(TOKEN);
+    var url = "/api/sse/nf";
+    if(TOKEN){ url += "?token=" + encodeURIComponent(TOKEN); }
     var es = new EventSource(url);
     setBadge("noreward", "connecting…");
 
@@ -3171,13 +3390,81 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception:
             # Connection might be closed; ignore.
             pass
+    def _request_token(self) -> str:
+        """Extract an access token from the request.
 
+        For EventSource/SSE compatibility, the dashboard primarily uses a `?token=...`
+        query parameter. For non-SSE API calls, clients may also send the token via
+        an `Authorization: Bearer <token>` header (common bearer-token convention)
+        or a simple custom header like `X-QEEG-Token`.
+        """
+        # Query param (works with EventSource which cannot set custom headers).
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            tok = (q.get("token") or [""])[0]
+            if tok:
+                return str(tok)
+        except Exception:
+            pass
 
+        # Authorization header: "Bearer <token>" (or "Token <token>").
+        try:
+            auth = str(self.headers.get("Authorization", "") or "").strip()
+            if auth:
+                parts = auth.split(None, 1)
+                if len(parts) == 2 and parts[0].lower() in ("bearer", "token"):
+                    return parts[1].strip()
+        except Exception:
+            pass
 
+        # Fallback custom headers (handy for curl / simple tooling).
+        for hn in ("X-QEEG-Token", "X-Auth-Token", "X-Api-Token"):
+            try:
+                v = str(self.headers.get(hn, "") or "").strip()
+            except Exception:
+                v = ""
+            if v:
+                return v
+
+        # Cookie-based token (set after first successful HTML load).
+        try:
+            ck = str(self.headers.get("Cookie", "") or "")
+            if ck:
+                for part in ck.split(";"):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    name, _, val = part.partition("=")
+                    if name.strip() == _TOKEN_COOKIE_NAME and val:
+                        return val.strip()
+        except Exception:
+            pass
+
+        return ""
+
+    def _request_base_url(self) -> str:
+        """Best-effort base URL (scheme+host) for docs/spec output."""
+        # Prefer Host header (what the client actually used).
+        try:
+            host = str(self.headers.get("Host", "") or "").strip()
+            if host:
+                host = host.splitlines()[0].strip()
+                return f"http://{host}"
+        except Exception:
+            pass
+
+        # Fallback to bind address (may be 0.0.0.0 which is not connectable).
+        try:
+            bh, bp = self.server.server_address
+            h = str(bh)
+            if _is_wildcard_host(h):
+                h = "127.0.0.1"
+            return f"http://{h}:{int(bp)}"
+        except Exception:
+            return "http://127.0.0.1"
 
     def _require_token(self) -> bool:
-        q = parse_qs(urlparse(self.path).query)
-        tok = (q.get("token") or [""])[0]
+        tok = self._request_token()
         if tok != self.server.config.token:
             p = urlparse(self.path).path
             if p.startswith("/api/") and not p.startswith("/api/sse/"):
@@ -3232,29 +3519,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path in _FRONTEND_PATH_MAP:
                 # HTML routes are token-protected.
                 if path in ("/", "/index.html"):
+                    # If the token is missing from the URL, allow access when the browser already
+                    # has the correct token stored in a cookie (avoids keeping the token in the address bar).
                     if "token=" not in u.query:
-                        url = f"/?token={self.server.config.token}"
-                        self.send_response(HTTPStatus.FOUND)
-                        self.send_header("Location", url)
-                        self.end_headers()
-                        return
+                        if self._request_token() != self.server.config.token:
+                            url = f"/?token={self.server.config.token}"
+                            self.send_response(HTTPStatus.FOUND)
+                            self.send_header("Location", url)
+                            self.end_headers()
+                            return
                     if not self._require_token():
                         return
                     body, ctype = self.server.frontend_asset_bytes("/")
-                    self._send(HTTPStatus.OK, body, ctype)
+                    self._send(
+                        HTTPStatus.OK,
+                        body,
+                        ctype,
+                        extra_headers={"Set-Cookie": _token_cookie_header(self.server.config.token)},
+                    )
                     return
 
                 if path in ("/kiosk", "/kiosk.html"):
                     if "token=" not in u.query:
-                        url = f"/kiosk?token={self.server.config.token}"
-                        self.send_response(HTTPStatus.FOUND)
-                        self.send_header("Location", url)
-                        self.end_headers()
-                        return
+                        if self._request_token() != self.server.config.token:
+                            url = f"/kiosk?token={self.server.config.token}"
+                            self.send_response(HTTPStatus.FOUND)
+                            self.send_header("Location", url)
+                            self.end_headers()
+                            return
                     if not self._require_token():
                         return
                     body, ctype = self.server.frontend_asset_bytes("/kiosk")
-                    self._send(HTTPStatus.OK, body, ctype)
+                    self._send(
+                        HTTPStatus.OK,
+                        body,
+                        ctype,
+                        extra_headers={"Set-Cookie": _token_cookie_header(self.server.config.token)},
+                    )
                     return
 
                 # JS/CSS assets are safe to serve without the token.
@@ -3268,6 +3569,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_not_modified(cache_control=cache_cc, etag=etag, last_modified=last_mod)
                     return
                 self._send(HTTPStatus.OK, body, ctype, cache_control=cache_cc, etag=etag, last_modified=last_mod)
+                return
+
+            if path == "/api/health":
+                if not self._require_token():
+                    return
+                self._send_json(HTTPStatus.OK, self.server.build_health())
+                return
+
+            if path == "/api/openapi.json":
+                if not self._require_token():
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.server.build_openapi(base_url=self._request_base_url()),
+                    cache_control="no-cache",
+                )
                 return
 
             if path == "/api/meta":
@@ -3366,6 +3683,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "parse_error": parse_error,
                 }
                 self._send_json(HTTPStatus.OK, resp, cache_control="no-cache", etag=etag, last_modified=last_mod)
+                return
+
+
+            if path == "/api/reports":
+                if not self._require_token():
+                    return
+                self._send_json(HTTPStatus.OK, self.server.build_reports(), cache_control="no-cache")
                 return
 
 
@@ -3590,8 +3914,95 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.INTERNAL_SERVER_ERROR, tb.encode("utf-8"))
 
     def do_POST(self) -> None:
-        # Alias POST -> PUT for browser compatibility.
-        return self.do_PUT()
+        """Handle POST requests.
+
+        - POST /api/state: alias of PUT (shared UI state updates).
+        - POST /api/reports: generate offline reports into the selected outdir.
+
+        Notes:
+        - This server is intended for localhost/LAN use; endpoints remain token protected.
+        - If a JSON body is provided it must be an object; otherwise query parameters are used.
+        """
+        try:
+            u = urlparse(self.path)
+            path = u.path
+
+            if path == "/api/state":
+                # Backwards-compatible alias.
+                return self.do_PUT()
+
+            if path == "/api/reports":
+                if not self._require_token():
+                    return
+
+                # Body is optional. If present, it must be valid JSON.
+                try:
+                    n = int(self.headers.get("Content-Length", "0") or "0")
+                except Exception:
+                    n = 0
+                body: Optional[object] = None
+                if n > 0:
+                    body = self._read_json_body()
+                    if body is None:
+                        # _read_json_body already sent an error response.
+                        return
+
+                q = parse_qs(u.query)
+
+                kinds: List[str] = []
+                force = False
+                timeout_sec = 30.0
+
+                if isinstance(body, dict):
+                    ks = body.get("kinds") or body.get("kind") or body.get("reports")
+                    if isinstance(ks, list):
+                        for v in ks:
+                            if isinstance(v, str) and v.strip():
+                                kinds.append(v.strip())
+                    elif isinstance(ks, str):
+                        kinds.extend([s.strip() for s in ks.split(",") if s.strip()])
+
+                    fr = body.get("force")
+                    if isinstance(fr, bool):
+                        force = fr
+                    elif isinstance(fr, (int, float)) and float(fr) != 0.0:
+                        force = True
+
+                    ts = body.get("timeout") or body.get("timeout_sec")
+                    if ts is not None:
+                        try:
+                            timeout_sec = float(ts)
+                        except Exception:
+                            pass
+
+                if not kinds:
+                    kinds_q = ((q.get("kinds") or q.get("kind") or q.get("reports") or [""])[0] or "").strip()
+                    if kinds_q:
+                        kinds = [s.strip() for s in kinds_q.split(",") if s.strip()]
+
+                force_q = ((q.get("force") or [""])[0] or "").strip().lower()
+                if force_q in ("1", "true", "yes", "y", "on"):
+                    force = True
+
+                timeout_q = ((q.get("timeout") or q.get("timeout_sec") or [""])[0] or "").strip()
+                if timeout_q:
+                    try:
+                        timeout_sec = float(timeout_q)
+                    except Exception:
+                        pass
+
+                if not kinds:
+                    # Safe default: generate the small nf_feedback_report only.
+                    kinds = ["nf_feedback"]
+
+                resp = self.server.generate_reports(kinds, force=force, timeout_sec=timeout_sec)
+                self._send_json(HTTPStatus.OK, resp, cache_control="no-cache")
+                return
+
+            self._send(HTTPStatus.NOT_FOUND, b"Not found\n")
+        except Exception:
+            tb = traceback.format_exc()
+            self._send(HTTPStatus.INTERNAL_SERVER_ERROR, tb.encode("utf-8"))
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -3622,6 +4033,9 @@ class DashboardServer(ThreadingHTTPServer):
         self._state_lock = threading.Lock()
         self._ui_state: Dict[str, object] = self._load_ui_state()
         self._ui_state_buf = StreamBuffer(maxlen=2000)
+
+        # Optional: offline report generation (uses stdlib-only scripts in scripts/).
+        self._reports_lock = threading.Lock()
 
     def server_close(self) -> None:
         try:
@@ -3757,12 +4171,363 @@ class DashboardServer(ThreadingHTTPServer):
                 "baseline": True,
                 "asset_etag": True,
                 "files": True,
+                "reports": True,
                 "file_download": True,
                 "bundle_download": True,
+                "health": True,
+                "openapi": True,
+                "cookie_auth": True,
             },
         }
 
     
+
+    # ------------------------ health / OpenAPI ------------------------
+
+    def build_health(self) -> Dict[str, object]:
+        """Health/readiness payload (used by wrappers and orchestration tooling)."""
+        return {
+            "schema_version": 1,
+            "status": "ok",
+            "api_version": 1,
+            "server_time_utc": float(time.time()),
+            "server_instance_id": self.instance_id,
+            "uptime_sec": float(max(0.0, time.time() - float(self._started_utc))),
+            "outdir": str(self.config.outdir),
+            "frontend": "external" if self.frontend_dir else "embedded",
+            "token_cookie_name": _TOKEN_COOKIE_NAME,
+        }
+
+    def build_openapi(self, *, base_url: Optional[str] = None) -> Dict[str, object]:
+        """Return an OpenAPI 3.0 spec describing the dashboard HTTP API.
+
+        The spec is intentionally lightweight (no external deps) and focuses on
+        discoverability/integration rather than exhaustive schema modeling.
+        """
+        servers: List[Dict[str, str]] = []
+        if base_url:
+            servers.append({"url": str(base_url)})
+        # Relative fallback keeps the spec usable behind reverse proxies.
+        servers.append({"url": "/"})
+
+        # Common response templates.
+        resp_json: Dict[str, object] = {
+            "description": "OK",
+            "content": {"application/json": {"schema": {"type": "object"}}},
+        }
+        resp_zip: Dict[str, object] = {
+            "description": "OK",
+            "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
+        }
+        resp_file: Dict[str, object] = {
+            "description": "OK",
+            "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}},
+        }
+        resp_sse: Dict[str, object] = {
+            "description": "OK",
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        }
+
+        resp_forbidden: Dict[str, object] = {
+            "description": "Forbidden",
+            "content": {"application/json": {"schema": {"type": "object"}}},
+        }
+        resp_not_found: Dict[str, object] = {
+            "description": "Not Found",
+            "content": {"application/json": {"schema": {"type": "object"}}},
+        }
+        resp_bad_request: Dict[str, object] = {
+            "description": "Bad Request",
+            "content": {"application/json": {"schema": {"type": "object"}}},
+        }
+
+        # Common parameters.
+        p_topics = {
+            "name": "topics",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": "Comma-separated topic list (nf,bandpower,artifact,meta,state,config).",
+        }
+        p_name = {
+            "name": "name",
+            "in": "query",
+            "required": True,
+            "schema": {"type": "string"},
+            "description": "File name relative to outdir.",
+        }
+        p_names = {
+            "name": "names",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": "Comma-separated list of file names to include in a bundle.",
+        }
+        p_download = {
+            "name": "download",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "integer", "enum": [0, 1]},
+            "description": "If 1, set Content-Disposition: attachment.",
+        }
+        p_baseline = {
+            "name": "baseline_sec",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "number"},
+            "description": "Override baseline seconds for /api/baseline.",
+        }
+        p_wait = {
+            "name": "wait",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "number"},
+            "description": "Long-poll wait seconds for /api/snapshot.",
+        }
+        p_limit = {
+            "name": "limit",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "integer"},
+            "description": "Max rows per topic for /api/snapshot.",
+        }
+        p_cursors = {
+            "name": "cursors",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": "Cursor blob from a previous snapshot response (opaque).",
+        }
+
+        h_last_event = {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": "SSE resume cursor (browser sets automatically on reconnect).",
+        }
+        h_range = {
+            "name": "Range",
+            "in": "header",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": "HTTP byte range (single range only), e.g. bytes=0-1023.",
+        }
+        h_if_range = {
+            "name": "If-Range",
+            "in": "header",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": "ETag or HTTP-date gating the Range request.",
+        }
+        h_if_none_match = {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": "ETag for conditional requests (304).",
+        }
+        h_if_modified = {
+            "name": "If-Modified-Since",
+            "in": "header",
+            "required": False,
+            "schema": {"type": "string"},
+            "description": "HTTP-date for conditional requests (304).",
+        }
+
+        paths: Dict[str, object] = {
+            "/api/health": {
+                "get": {
+                    "summary": "Health/readiness",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/openapi.json": {
+                "get": {
+                    "summary": "OpenAPI specification (this document)",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/config": {
+                "get": {
+                    "summary": "Frontend configuration / feature flags",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/meta": {
+                "get": {
+                    "summary": "Live file/status metadata",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/state": {
+                "get": {
+                    "summary": "Shared UI state (read)",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                },
+                "put": {
+                    "summary": "Shared UI state (update)",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    },
+                    "responses": {"200": resp_json, "400": resp_bad_request, "403": resp_forbidden},
+                },
+                "post": {
+                    "summary": "Shared UI state (update; alias of PUT)",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    },
+                    "responses": {"200": resp_json, "400": resp_bad_request, "403": resp_forbidden},
+                },
+            },
+            "/api/reference": {
+                "get": {
+                    "summary": "Reference / defaults (e.g., montage positions)",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/baseline": {
+                "get": {
+                    "summary": "Compute baseline values from recent bandpower history",
+                    "parameters": [p_baseline],
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/run_meta": {
+                "get": {
+                    "summary": "Read run meta (best-effort) from outdir",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/topomap_latest": {
+                "get": {
+                    "summary": "Latest bandpower values mapped to a simple scalp grid",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/stats": {
+                "get": {
+                    "summary": "Diagnostic server stats (buffers/connections)",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/snapshot": {
+                "get": {
+                    "summary": "Polling snapshot endpoint (cursor-based incremental batches)",
+                    "parameters": [p_topics, p_cursors, p_wait, p_limit],
+                    "responses": {"200": resp_json, "400": resp_bad_request, "403": resp_forbidden},
+                }
+            },
+            "/api/reports": {
+                "get": {
+                    "summary": "List report generators and existing report artifacts",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                },
+                "post": {
+                    "summary": "Generate offline reports into outdir",
+                    "requestBody": {
+                        "required": False,
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    },
+                    "responses": {"200": resp_json, "400": resp_bad_request, "403": resp_forbidden},
+                },
+            },
+            "/api/files": {
+                "get": {
+                    "summary": "List downloadable files in outdir",
+                    "responses": {"200": resp_json, "403": resp_forbidden},
+                }
+            },
+            "/api/file": {
+                "get": {
+                    "summary": "Download a single file (with caching + range support)",
+                    "parameters": [p_name, p_download, h_range, h_if_range, h_if_none_match, h_if_modified],
+                    "responses": {"200": resp_file, "206": resp_file, "304": {"description": "Not Modified"}, "403": resp_forbidden, "404": resp_not_found},
+                },
+                "head": {
+                    "summary": "HEAD variant of /api/file (headers only)",
+                    "parameters": [p_name, p_download],
+                    "responses": {"200": {"description": "OK"}, "403": resp_forbidden, "404": resp_not_found},
+                },
+            },
+            "/api/bundle": {
+                "get": {
+                    "summary": "Download a zip bundle of files from outdir",
+                    "parameters": [p_names],
+                    "responses": {"200": resp_zip, "400": resp_bad_request, "403": resp_forbidden},
+                }
+            },
+            "/api/sse/meta": {
+                "get": {
+                    "summary": "Legacy SSE stream for meta updates",
+                    "parameters": [h_last_event],
+                    "responses": {"200": resp_sse, "403": resp_forbidden},
+                }
+            },
+            "/api/sse/state": {
+                "get": {
+                    "summary": "Legacy SSE stream for UI state updates",
+                    "parameters": [h_last_event],
+                    "responses": {"200": resp_sse, "403": resp_forbidden},
+                }
+            },
+            "/api/sse/nf": {
+                "get": {
+                    "summary": "Legacy SSE stream for neurofeedback frames",
+                    "parameters": [h_last_event],
+                    "responses": {"200": resp_sse, "403": resp_forbidden},
+                }
+            },
+            "/api/sse/bandpower": {
+                "get": {
+                    "summary": "Legacy SSE stream for bandpower frames",
+                    "parameters": [h_last_event],
+                    "responses": {"200": resp_sse, "403": resp_forbidden},
+                }
+            },
+            "/api/sse/artifact": {
+                "get": {
+                    "summary": "Legacy SSE stream for artifact gate frames",
+                    "parameters": [h_last_event],
+                    "responses": {"200": resp_sse, "403": resp_forbidden},
+                }
+            },
+            "/api/sse/stream": {
+                "get": {
+                    "summary": "Multiplexed SSE stream (named events per topic)",
+                    "parameters": [p_topics, h_last_event],
+                    "responses": {"200": resp_sse, "403": resp_forbidden},
+                }
+            },
+        }
+
+        return {
+            "openapi": "3.0.3",
+            "info": {
+                "title": "qEEG Real-time Dashboard API",
+                "version": "1.0.0",
+                "description": (
+                    "HTTP API for the dependency-free real-time qEEG/neurofeedback dashboard. "
+                    "Authentication is required; supply the token via query (?token=...), "
+                    "Authorization: Bearer <token>, or the qeeg_token cookie."
+                ),
+            },
+            "servers": servers,
+            "components": {
+                "securitySchemes": {
+                    "bearerAuth": {"type": "http", "scheme": "bearer"},
+                    "tokenQuery": {"type": "apiKey", "in": "query", "name": "token"},
+                    "tokenCookie": {"type": "apiKey", "in": "cookie", "name": _TOKEN_COOKIE_NAME},
+                }
+            },
+            # OR semantics across entries: any of these auth methods may satisfy a request.
+            "security": [{"bearerAuth": []}, {"tokenQuery": []}, {"tokenCookie": []}],
+            "paths": paths,
+        }
+
+
 
 
     # ------------------------ downloads API helpers ------------------------
@@ -3825,6 +4590,193 @@ class DashboardServer(ThreadingHTTPServer):
         cat_order = {'core': 0, 'ui': 1, 'events': 2, 'report': 3, 'other': 4}
         out.sort(key=lambda e: (cat_order.get(str(e.get('category')), 99), str(e.get('name'))))
         return out
+
+    # ------------------------ reports API ------------------------
+
+    def build_reports(self) -> Dict[str, object]:
+        """Build JSON response for /api/reports.
+
+        This endpoint advertises available report generators (kinds) and lists
+        existing report artifacts in the outdir (HTML/ZIP/JSON).
+        """
+
+        outdir = self.config.outdir
+
+        kinds: List[Dict[str, object]] = []
+        for k in _REPORT_KIND_ORDER:
+            info = _REPORT_KINDS.get(k, {})
+            if not isinstance(info, dict):
+                continue
+
+            inputs: List[Dict[str, object]] = []
+            for nm in list(info.get("inputs") or []):
+                pth = outdir / str(nm)
+                st = _stat_dict(pth)
+                inputs.append({"name": str(nm), "stat": st})
+
+            outputs: List[Dict[str, object]] = []
+            for nm in list(info.get("outputs") or []):
+                pth = outdir / str(nm)
+                st = _stat_dict(pth)
+                outputs.append({"name": str(nm), "stat": st})
+
+            ready = True
+            missing: List[str] = []
+            for inp in inputs:
+                st = inp.get("stat")
+                if isinstance(st, dict) and not bool(st.get("exists")):
+                    ready = False
+                    missing.append(str(inp.get("name") or ""))
+
+            kinds.append(
+                {
+                    "kind": str(info.get("kind") or k),
+                    "title": str(info.get("title") or k),
+                    "description": str(info.get("description") or ""),
+                    "script": str(info.get("script") or ""),
+                    "ready": bool(ready),
+                    "missing_inputs": missing,
+                    "inputs": inputs,
+                    "outputs": outputs,
+                }
+            )
+
+        artifacts = [e for e in self.list_downloadable_files() if str(e.get("category")) == "report"]
+
+        return {
+            "schema_version": 1,
+            "server_time_utc": float(time.time()),
+            "server_instance_id": self.instance_id,
+            "outdir": str(outdir),
+            "kinds": kinds,
+            "artifacts": artifacts,
+        }
+
+    def generate_reports(self, kinds: List[str], *, force: bool = False, timeout_sec: float = 30.0) -> Dict[str, object]:
+        """Generate one or more report kinds into outdir.
+
+        Returns a machine-readable manifest of successes/failures.
+        """
+
+        outdir = self.config.outdir
+
+        # Clamp timeout defensively (avoid hanging threads).
+        try:
+            timeout_sec = float(timeout_sec)
+        except Exception:
+            timeout_sec = 30.0
+        timeout_sec = max(1.0, min(180.0, timeout_sec))
+
+        # Normalize kinds, preserve order, drop duplicates.
+        norm: List[str] = []
+        for k in kinds or []:
+            if not isinstance(k, str):
+                continue
+            kk = k.strip()
+            if not kk:
+                continue
+            if kk not in norm:
+                norm.append(kk)
+
+        if not norm:
+            norm = ["nf_feedback"]
+
+        results: List[Dict[str, object]] = []
+
+        # Serialize generation to avoid overlapping writes in outdir.
+        with self._reports_lock:
+            for kind in norm:
+                info = _REPORT_KINDS.get(kind)
+                if not isinstance(info, dict):
+                    results.append({"kind": kind, "ok": False, "error": "unknown_kind"})
+                    continue
+
+                # Check required inputs exist before running a subprocess.
+                missing_inputs: List[str] = []
+                for nm in list(info.get("inputs") or []):
+                    st = _stat_dict(outdir / str(nm))
+                    if not bool(st.get("exists")):
+                        missing_inputs.append(str(nm))
+                if missing_inputs:
+                    results.append({"kind": kind, "ok": False, "error": "missing_inputs", "missing_inputs": missing_inputs})
+                    continue
+
+                argv = _build_report_cmd(kind, outdir, force=force)
+                if not argv:
+                    results.append({"kind": kind, "ok": False, "error": "script_not_found_or_unsupported"})
+                    continue
+
+                t0 = float(time.time())
+                env = dict(os.environ)
+                env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
+                try:
+                    cp = subprocess.run(
+                        argv,
+                        cwd=str(outdir),
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout_sec,
+                    )
+                    rc = getattr(cp, "returncode", 1)
+                    try:
+                        rc_i = int(rc)
+                    except Exception:
+                        rc_i = 1
+                    ok = (rc_i == 0)
+                    results.append(
+                        {
+                            "kind": kind,
+                            "ok": bool(ok),
+                            "returncode": int(rc_i),
+                            "elapsed_sec": float(max(0.0, time.time() - t0)),
+                            "stdout": _truncate_log(str(getattr(cp, "stdout", "") or "")),
+                            "stderr": _truncate_log(str(getattr(cp, "stderr", "") or "")),
+                            "argv": argv,
+                        }
+                    )
+                except subprocess.TimeoutExpired as e:
+                    results.append(
+                        {
+                            "kind": kind,
+                            "ok": False,
+                            "error": "timeout",
+                            "elapsed_sec": float(max(0.0, time.time() - t0)),
+                            "stdout": _truncate_log(str(getattr(e, "stdout", "") or "")),
+                            "stderr": _truncate_log(str(getattr(e, "stderr", "") or "")),
+                            "argv": argv,
+                        }
+                    )
+                except Exception as e:
+                    results.append(
+                        {
+                            "kind": kind,
+                            "ok": False,
+                            "error": f"exception:{e}",
+                            "elapsed_sec": float(max(0.0, time.time() - t0)),
+                            "argv": argv,
+                        }
+                    )
+
+        # Return the updated list of report artifacts after generation.
+        resp = {
+            "schema_version": 1,
+            "server_time_utc": float(time.time()),
+            "server_instance_id": self.instance_id,
+            "outdir": str(outdir),
+            "requested_kinds": norm,
+            "force": bool(force),
+            "timeout_sec": float(timeout_sec),
+            "results": results,
+        }
+        try:
+            resp["reports"] = self.build_reports()
+        except Exception:
+            pass
+        return resp
 
     def build_files(self) -> Dict[str, object]:
         """Build JSON response for /api/files."""
@@ -3933,6 +4885,36 @@ class DashboardServer(ThreadingHTTPServer):
                         total += size
                     except Exception as e:
                         skipped.append({'name': nm, 'reason': f'zip_write_failed:{e}'})
+                        continue
+
+
+                # Include small generated context files for offline debugging/sharing.
+                # These are not part of the outdir file set, but are useful alongside the CSVs.
+                gen_time = float(time.time())
+                generated = [
+                    ("dashboard_config.json", self.build_config()),
+                    ("dashboard_state.json", self.get_ui_state()),
+                    ("dashboard_meta.json", self.build_meta()),
+                    ("dashboard_openapi.json", self.build_openapi()),
+                    ("dashboard_reports.json", self.build_reports()),
+                ]
+                for gen_name, gen_obj in generated:
+                    try:
+                        payload = (json.dumps(gen_obj, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+                    except Exception as e:
+                        skipped.append({'name': gen_name, 'reason': f'generated_json_failed:{e}', 'generated': True})
+                        continue
+
+                    if (total + len(payload)) > int(_MAX_BUNDLE_TOTAL_BYTES):
+                        skipped.append({'name': gen_name, 'reason': f'bundle_total_limit>{int(_MAX_BUNDLE_TOTAL_BYTES)}', 'generated': True})
+                        continue
+
+                    try:
+                        z.writestr(gen_name, payload)
+                        included.append({'name': gen_name, 'size_bytes': int(len(payload)), 'mtime_utc': gen_time, 'generated': True})
+                        total += int(len(payload))
+                    except Exception as e:
+                        skipped.append({'name': gen_name, 'reason': f'generated_write_failed:{e}', 'generated': True})
                         continue
 
                 # Add a manifest so downstream tools know what was (not) included.
@@ -4652,6 +5634,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Open the lightweight /kiosk view (implies --open)",
     )
+    ap.add_argument(
+        "--print-json",
+        action="store_true",
+        help=(
+            "Print a single-line JSON object with server info (urls/token/etc.) to stdout for machine parsing; "
+            "human URLs go to stderr. The server continues running."
+        ),
+    )
     return ap.parse_args(argv)
 
 
@@ -4697,16 +5687,39 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     urls = _build_urls(bind_host, port, token)
 
-    # flush=True so scripts that capture stdout can reliably parse the URL.
-    print(f"Dashboard: {urls['dashboard_url']}", flush=True)
+    # Optional: machine-readable startup info (one JSON line on stdout).
+    #
+    # When enabled, we print the human-friendly URLs to stderr to keep stdout clean
+    # for scripts that want to parse the JSON.
+    human_fp = sys.stdout
+    if getattr(ns, "print_json", False):
+        human_fp = sys.stderr
+        try:
+            info = {
+                "schema_version": 1,
+                "server_time_utc": float(time.time()),
+                "outdir": str(outdir),
+                "bind_host": str(bind_host),
+                "port": int(port),
+                "token": str(token),
+                "urls": dict(urls),
+            }
+            sys.stdout.write(json.dumps(info, ensure_ascii=False, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+        except Exception:
+            # If stdout is broken (e.g., closed pipe), don't crash the server.
+            pass
+
+    # flush=True so scripts that capture stderr can reliably parse the URL in --print-json mode.
+    print(f"Dashboard: {urls['dashboard_url']}", file=human_fp, flush=True)
     if "dashboard_url_lan" in urls:
-        print(f"Dashboard (LAN): {urls['dashboard_url_lan']}", flush=True)
+        print(f"Dashboard (LAN): {urls['dashboard_url_lan']}", file=human_fp, flush=True)
 
-    print(f"Kiosk:     {urls['kiosk_url']}", flush=True)
+    print(f"Kiosk:     {urls['kiosk_url']}", file=human_fp, flush=True)
     if "kiosk_url_lan" in urls:
-        print(f"Kiosk (LAN): {urls['kiosk_url_lan']}", flush=True)
+        print(f"Kiosk (LAN): {urls['kiosk_url_lan']}", file=human_fp, flush=True)
 
-    print(f"Watching:  {outdir}", flush=True)
+    print(f"Watching:  {outdir}", file=human_fp, flush=True)
 
     if ns.open:
         url = urls["kiosk_url"] if ns.open_kiosk else urls["dashboard_url"]

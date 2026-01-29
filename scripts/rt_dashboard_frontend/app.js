@@ -2,6 +2,26 @@
   'use strict';
 
   const TOKEN = (window.location.search.match(/(?:\?|&)token=([^&]+)/) || [])[1] || '';
+
+  // If the token is present in the URL, drop it from the address bar.
+  // The server sets a SameSite=Strict cookie so reloads can still authenticate without keeping
+  // the token in browser history.
+  if (TOKEN && window.history && window.history.replaceState) {
+    try {
+      const clean = window.location.pathname + window.location.hash;
+      window.history.replaceState(null, '', clean);
+    } catch (e) {
+      // ignore
+    }
+  }
+  function withToken(url){
+    // Prefer cookie-based auth when the token is not in the URL.
+    if(!TOKEN) return url;
+    if(/(?:^|[?&])token=/.test(url)) return url;
+    const sep = (url.indexOf('?') >= 0) ? '&' : '?';
+    return url + sep + 'token=' + encodeURIComponent(TOKEN);
+  }
+
   const qs = (id) => document.getElementById(id);
 
   const statusBox = qs('status');
@@ -30,6 +50,15 @@
   const filesRefresh = qs('filesRefresh');
   const filesList = qs('filesList');
   const filesHint = qs('filesHint');
+
+  const reportsDetails = qs('reportsDetails');
+  const reportsGenNf = qs('reportsGenNf');
+  const reportsGenDash = qs('reportsGenDash');
+  const reportsGenBundle = qs('reportsGenBundle');
+  const reportsForce = qs('reportsForce');
+  const reportsRefresh = qs('reportsRefresh');
+  const reportsStatus = qs('reportsStatus');
+  const reportsList = qs('reportsList');
 
   const winSel = qs('winSel');
   const pauseBtn = qs('pauseBtn');
@@ -213,8 +242,8 @@
       renderKvGrid(runMetaKv, null);
       if(runMetaRaw) runMetaRaw.textContent = '';
     }
-    if(runMetaDownload && TOKEN){
-      runMetaDownload.href = `/api/run_meta?token=${encodeURIComponent(TOKEN)}&format=raw`;
+    if(runMetaDownload){
+      runMetaDownload.href = withToken('/api/run_meta?format=raw');
     }
   }
 
@@ -270,7 +299,7 @@
 
   function updateTopoPolling(){
     const want = resolveTopoSource(state.serverMeta);
-    const enabled = (want === 'cli') && !state.paused && !!TOKEN;
+    const enabled = (want === 'cli') && !state.paused;
     if(!enabled){
       if(topoPollTimer){
         clearInterval(topoPollTimer);
@@ -286,12 +315,11 @@
   }
 
   async function pollCliTopomapOnce(){
-    if(!TOKEN) return;
     const cli = state.bp.cliTopomap || (state.bp.cliTopomap = {etag:null,url:null,img:null,inflight:false,lastOk_utc:0});
     if(cli.inflight) return;
     cli.inflight = true;
     try{
-      const url = `/api/topomap_latest?token=${encodeURIComponent(TOKEN)}`;
+      const url = withToken('/api/topomap_latest');
       const headers = {};
       if(cli.etag) headers['If-None-Match'] = cli.etag;
       const r = await fetch(url, {headers, cache: 'no-cache'});
@@ -437,9 +465,8 @@
   }
 
   async function loadReference(){
-    if(!TOKEN) return;
     try{
-      const r = await fetch(`/api/reference?token=${encodeURIComponent(TOKEN)}`);
+      const r = await fetch(withToken('/api/reference'));
       if(!r.ok) return;
       const obj = await r.json();
       if(obj && obj.aligned){
@@ -458,45 +485,43 @@
   }
 
   async function loadBaseline(){
-  if(!TOKEN) return;
-  if(state.bp._baselineInFlight) return;
-  state.bp._baselineInFlight = true;
-  try{
-    const bs = (typeof state.bp.baselineSec === 'number' && Number.isFinite(state.bp.baselineSec) && state.bp.baselineSec > 0)
-      ? state.bp.baselineSec : null;
-    const bsQ = bs ? `&baseline_sec=${encodeURIComponent(String(bs))}` : '';
-    const r = await fetch(`/api/baseline?token=${encodeURIComponent(TOKEN)}${bsQ}`);
-    if(!r.ok) return;
-    const obj = await r.json();
-    const aligned = obj && obj.aligned ? obj.aligned : null;
-    const base = obj && obj.baseline ? obj.baseline : null;
-    if(aligned && Array.isArray(aligned.median) && Array.isArray(aligned.scale)){
-      const nCols = aligned.median.length;
-      const okCols = aligned.ok_cols || 0;
-      const complete = !!(base && base.complete);
-      const bsSrv = (base && typeof base.seconds === 'number' && Number.isFinite(base.seconds)) ? base.seconds : null;
-      if(bsSrv && bsSrv > 0){ state.bp.baselineSec = bsSrv; }
-      if(nCols > 0 && okCols > 0 && complete){
-        state.bp.baseline = {
-          method: (base && base.method) ? base.method : 'median_mad',
-          nCols,
-          samples: null,
-          median: aligned.median,
-          scale: aligned.scale,
-          present: aligned.present || null,
-          finalized: true,
-          ready: true,
-          nFrames: (base && typeof base.frames_used === 'number') ? base.frames_used : 0,
-          source: 'server',
-          baselineSec: bsSrv,
-        };
-        dirtyBp = true;
-        scheduleRender();
+    if(state.bp._baselineInFlight) return;
+    state.bp._baselineInFlight = true;
+    try{
+      const bs = (typeof state.bp.baselineSec === 'number' && Number.isFinite(state.bp.baselineSec) && state.bp.baselineSec > 0)
+        ? state.bp.baselineSec : null;
+      const bsQ = bs ? `?baseline_sec=${encodeURIComponent(String(bs))}` : '';
+      const r = await fetch(withToken(`/api/baseline${bsQ}`));
+      if(!r.ok) return;
+      const obj = await r.json();
+      const aligned = obj && obj.aligned ? obj.aligned : null;
+      const base = obj && obj.baseline ? obj.baseline : null;
+      if(aligned && Array.isArray(aligned.median) && Array.isArray(aligned.scale)){
+        const nCols = aligned.median.length;
+        const okCols = aligned.ok_cols || 0;
+        const complete = !!(base && base.complete);
+        const bsSrv = (base && typeof base.seconds === 'number' && Number.isFinite(base.seconds)) ? base.seconds : null;
+        if(bsSrv && bsSrv > 0){ state.bp.baselineSec = bsSrv; }
+        if(nCols > 0 && okCols > 0 && complete){
+          state.bp.baseline = {
+            method: (base && base.method) ? base.method : 'median_mad',
+            nCols,
+            samples: null,
+            median: aligned.median,
+            scale: aligned.scale,
+            present: aligned.present || null,
+            finalized: true,
+            ready: true,
+            nFrames: (base && typeof base.frames_used === 'number') ? base.frames_used : 0,
+            source: 'server',
+            baselineSec: bsSrv,
+          };
+          dirtyBp = true;
+          scheduleRender();
+        }
       }
-    }
-  }catch(e){}
-  finally{ state.bp._baselineInFlight = false; }
-}
+    }catch(e){} finally{ state.bp._baselineInFlight = false; }
+  }
 
   function updateStats(){
     const f = state.nf.frames.length ? state.nf.frames[state.nf.frames.length-1] : null;
@@ -1086,7 +1111,7 @@ if(Array.isArray(arts) && arts.length){
       setBadge(badgeEl, `${label}: no EventSource`, 'warn');
       return null;
     }
-    const url = `${path}?token=${encodeURIComponent(TOKEN)}`;
+    const url = withToken(path);
     const es = new EventSource(url);
     setBadge(badgeEl, `${label}: connecting`, 'warn');
     es.onopen = () => { setBadge(badgeEl, `${label}: connected`, 'good'); };
@@ -1103,8 +1128,8 @@ if(Array.isArray(arts) && arts.length){
     const qp = [];
     if(t){ qp.push(`topics=${encodeURIComponent(t)}`); }
     if(Number.isFinite(hz) && hz > 0){ qp.push(`hz=${encodeURIComponent(String(hz))}`); }
-    const q = qp.length ? ('&' + qp.join('&')) : '';
-    const url = `/api/sse/stream?token=${encodeURIComponent(TOKEN)}${q}`;
+    const q = qp.length ? ('?' + qp.join('&')) : '';
+    const url = withToken(`/api/sse/stream${q}`);
     return new EventSource(url);
   }
 
@@ -1136,12 +1161,11 @@ if(Array.isArray(arts) && arts.length){
   let pushTimer = null;
   function schedulePushUiState(){
     if(state.applyingRemote) return;
-    if(!TOKEN) return;
     if(pushTimer) clearTimeout(pushTimer);
     pushTimer = setTimeout(() => {
       pushTimer = null;
       const body = uiStateFromControls();
-      fetch(`/api/state?token=${encodeURIComponent(TOKEN)}` , {
+      fetch(withToken('/api/state'), {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(body)
@@ -1561,7 +1585,7 @@ if(Array.isArray(arts) && arts.length){
     } else {
       setBadge(metaConn, 'meta: polling', 'warn');
       setInterval(() => {
-        fetch(`/api/meta?token=${encodeURIComponent(TOKEN)}`)
+        fetch(withToken('/api/meta'))
           .then(r => r.ok ? r.json() : null)
           .then(m => { if(m) handleMetaMsg(m); })
           .catch(() => {});
@@ -1594,7 +1618,6 @@ if(Array.isArray(arts) && arts.length){
 
   function startPolling(){
     // Long-polling fallback using /api/snapshot (for environments without SSE/EventSource).
-    if(!TOKEN){ return; }
 
     setBadge(nfConn, 'nf: polling', 'warn');
     setBadge(bpConn, 'bandpower: polling', 'warn');
@@ -1609,7 +1632,6 @@ if(Array.isArray(arts) && arts.length){
 
     function buildUrl(){
       const qp = [];
-      qp.push(`token=${encodeURIComponent(TOKEN)}`);
       qp.push(`topics=${encodeURIComponent(topics.join(','))}`);
       qp.push(`wait=1.0`);
       qp.push(`limit=2500`);
@@ -1618,7 +1640,7 @@ if(Array.isArray(arts) && arts.length){
       qp.push(`artifact=${encodeURIComponent(String(cur.artifact||0))}`);
       qp.push(`meta=${encodeURIComponent(String(cur.meta||0))}`);
       qp.push(`state=${encodeURIComponent(String(cur.state||0))}`);
-      return `/api/snapshot?${qp.join('&')}`;
+      return withToken(`/api/snapshot?${qp.join('&')}`);
     }
 
     function applyTopic(topic, payload, handler){
@@ -1697,13 +1719,23 @@ if(Array.isArray(arts) && arts.length){
       const row = document.createElement('div');
       row.className = 'fileRow';
 
+      const left = document.createElement('div');
+      left.style.display = 'flex';
+      left.style.gap = '8px';
+      left.style.flexWrap = 'wrap';
+      left.style.alignItems = 'center';
+
       const a = document.createElement('a');
       a.textContent = name;
       a.target = '_blank';
       a.rel = 'noopener';
 
-      const baseUrl = (f && (f.download_url || f.url)) ? String(f.download_url || f.url) : (`/api/file?name=${encodeURIComponent(name)}&download=1`);
-      const href = baseUrl + (baseUrl.indexOf('?')>=0 ? '&' : '?') + `token=${encodeURIComponent(TOKEN)}`;
+      const urlView = (f && f.url) ? String(f.url) : (`/api/file?name=${encodeURIComponent(name)}`);
+      const urlDownload = (f && f.download_url) ? String(f.download_url) : (`/api/file?name=${encodeURIComponent(name)}&download=1`);
+      const isHtml = name.toLowerCase().endsWith('.html');
+      const primary = isHtml ? urlView : urlDownload;
+      const href = withToken(primary);
+
       const downloadable = (f && typeof f.downloadable === 'boolean') ? f.downloadable : true;
       if(downloadable){
         a.href = href;
@@ -1712,7 +1744,20 @@ if(Array.isArray(arts) && arts.length){
         a.style.opacity = '0.6';
         a.addEventListener('click', (ev)=>ev.preventDefault());
       }
-      row.appendChild(a);
+      left.appendChild(a);
+
+      // For HTML reports, provide an "open" (view) link plus a separate "download" chip.
+      if(downloadable && isHtml){
+        const dl = document.createElement('a');
+        dl.textContent = 'download';
+        dl.href = withToken(urlDownload);
+        dl.target = '_blank';
+        dl.rel = 'noopener';
+        dl.className = 'fileTag';
+        left.appendChild(dl);
+      }
+
+      row.appendChild(left);
 
       const meta = document.createElement('span');
       meta.className = 'fileMeta';
@@ -1732,7 +1777,6 @@ if(Array.isArray(arts) && arts.length){
   }
 
   async function loadFiles(force=false){
-    if(!TOKEN) return;
     if(!filesList) return;
     const now = Date.now()/1000;
     if(!force && (now - filesLastLoad_utc) < 1.0 && filesList.childElementCount > 0){
@@ -1741,7 +1785,7 @@ if(Array.isArray(arts) && arts.length){
     filesLastLoad_utc = now;
     if(filesHint) filesHint.textContent = 'Loading…';
     try{
-      const r = await fetch(`/api/files?token=${encodeURIComponent(TOKEN)}`, {cache: 'no-store'});
+      const r = await fetch(withToken('/api/files'), {cache: 'no-store'});
       if(!r.ok){
         throw new Error(`HTTP ${r.status}`);
       }
@@ -1753,10 +1797,176 @@ if(Array.isArray(arts) && arts.length){
   }
 
 
+  // ------------------------ reports ------------------------
+
+  let reportsLastLoad_utc = 0;
+
+  function setReportsStatus(msg){
+    if(!reportsStatus) return;
+    reportsStatus.textContent = msg || '';
+  }
+
+  function renderReports(obj){
+    if(!reportsList) return;
+    clearEl(reportsList);
+
+    const kinds = (obj && Array.isArray(obj.kinds)) ? obj.kinds : [];
+    const artifacts = (obj && Array.isArray(obj.artifacts)) ? obj.artifacts : [];
+
+    if(kinds.length === 0){
+      setReportsStatus('No report generators advertised by this server.');
+    } else {
+      const notReady = [];
+      for(const k of kinds){
+        if(k && k.ready === false){
+          const miss = Array.isArray(k.missing_inputs) ? k.missing_inputs.join(', ') : '';
+          notReady.push(String(k.kind || '') + (miss ? (' (missing ' + miss + ')') : ''));
+        }
+      }
+      if(notReady.length){
+        setReportsStatus('Some report generators are not ready: ' + notReady.join(' · '));
+      } else {
+        setReportsStatus('Ready.');
+      }
+    }
+
+    if(artifacts.length === 0){
+      const empty = document.createElement('div');
+      empty.className = 'small muted';
+      empty.textContent = 'No report artifacts found yet. Generate one using the buttons above.';
+      reportsList.appendChild(empty);
+      return;
+    }
+
+    const now = Date.now()/1000;
+
+    for(const f of artifacts){
+      const name = (f && f.name) ? String(f.name) : '';
+      if(!name) continue;
+
+      const row = document.createElement('div');
+      row.className = 'fileRow';
+
+      const left = document.createElement('div');
+      left.style.display = 'flex';
+      left.style.gap = '8px';
+      left.style.flexWrap = 'wrap';
+      left.style.alignItems = 'center';
+
+      const a = document.createElement('a');
+      a.textContent = name;
+      a.target = '_blank';
+      a.rel = 'noopener';
+
+      const urlView = (f && f.url) ? String(f.url) : (`/api/file?name=${encodeURIComponent(name)}`);
+      const urlDownload = (f && f.download_url) ? String(f.download_url) : (`/api/file?name=${encodeURIComponent(name)}&download=1`);
+      const isHtml = name.toLowerCase().endsWith('.html');
+      const primary = isHtml ? urlView : urlDownload;
+
+      const downloadable = (f && typeof f.downloadable === 'boolean') ? f.downloadable : true;
+      if(downloadable){
+        a.href = withToken(primary);
+      } else {
+        a.href = '#';
+        a.style.opacity = '0.6';
+        a.addEventListener('click', (ev)=>ev.preventDefault());
+      }
+      left.appendChild(a);
+
+      if(downloadable && isHtml){
+        const dl = document.createElement('a');
+        dl.textContent = 'download';
+        dl.href = withToken(urlDownload);
+        dl.target = '_blank';
+        dl.rel = 'noopener';
+        dl.className = 'fileTag';
+        left.appendChild(dl);
+      }
+
+      row.appendChild(left);
+
+      const meta = document.createElement('span');
+      meta.className = 'fileMeta';
+      const st = (f && f.stat && typeof f.stat === 'object') ? f.stat : {};
+      const size = (st && Number.isFinite(st.size_bytes)) ? st.size_bytes : null;
+      const mtime = (st && Number.isFinite(st.mtime_utc)) ? st.mtime_utc : null;
+      const parts = [];
+      if(size !== null) parts.push(fmtBytes(size));
+      if(mtime !== null) parts.push('age ' + fmtAgeSec(now - mtime));
+      if(f && f.mime) parts.push(String(f.mime).split(';')[0]);
+      meta.textContent = parts.join(' · ');
+      row.appendChild(meta);
+
+      reportsList.appendChild(row);
+    }
+  }
+
+  async function loadReports(force=false){
+    if(!reportsDetails) return;
+    const now = Date.now()/1000;
+    if(!force && (now - reportsLastLoad_utc) < 1.0 && reportsList && reportsList.childElementCount > 0){
+      return;
+    }
+    reportsLastLoad_utc = now;
+    setReportsStatus('Loading…');
+    try{
+      const r = await fetch(withToken('/api/reports'), {cache: 'no-store'});
+      if(r.status === 404){
+        // Older server: hide the entire panel.
+        reportsDetails.style.display = 'none';
+        return;
+      }
+      if(!r.ok){
+        throw new Error(`HTTP ${r.status}`);
+      }
+      const obj = await r.json();
+      renderReports(obj);
+    }catch(e){
+      setReportsStatus('Failed to load reports info.');
+    }
+  }
+
+  function setReportsButtonsDisabled(disabled){
+    const btns = [reportsGenNf, reportsGenDash, reportsGenBundle, reportsRefresh];
+    for(const b of btns){
+      if(b) b.disabled = !!disabled;
+    }
+  }
+
+  async function generateReports(kinds){
+    if(!Array.isArray(kinds)) kinds = [kinds];
+    const force = !!(reportsForce && reportsForce.checked);
+    setReportsButtonsDisabled(true);
+    setReportsStatus('Generating…');
+    try{
+      const body = JSON.stringify({kinds: kinds, force: force});
+      const r = await fetch(withToken('/api/reports'), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: body,
+      });
+      if(!r.ok){
+        const t = await r.text().catch(()=> '');
+        throw new Error(`HTTP ${r.status} ${t}`);
+      }
+      const obj = await r.json();
+      const results = (obj && Array.isArray(obj.results)) ? obj.results : [];
+      const ok = results.filter(x => x && x.ok).length;
+      const bad = results.length - ok;
+      setReportsStatus(`Generated ${ok}/${results.length} report(s)` + (bad ? (` (${bad} failed)`) : '') + '.');
+    }catch(e){
+      setReportsStatus('Report generation failed: ' + String(e && e.message ? e.message : e));
+    }finally{
+      setReportsButtonsDisabled(false);
+      loadReports(true);
+      loadFiles(true);
+    }
+  }
+
+
   async function loadRunMeta(force=false){
-    if(!TOKEN) return;
     if(!runMetaRaw && !runMetaKv && !runMetaStatus) return;
-    const url = `/api/run_meta?token=${encodeURIComponent(TOKEN)}`;
+    const url = withToken('/api/run_meta');
     const headers = {};
     if(!force && runMetaETag) headers['If-None-Match'] = runMetaETag;
     let resp;
@@ -1818,15 +2028,14 @@ if(Array.isArray(arts) && arts.length){
       if(runMetaRaw) runMetaRaw.textContent = (data && data.parse_error) ? `Parse error: ${data.parse_error}` : '';
     }
 
-    if(runMetaDownload && TOKEN){
-      runMetaDownload.href = `/api/run_meta?token=${encodeURIComponent(TOKEN)}&format=raw`;
+    if(runMetaDownload){
+      runMetaDownload.href = withToken('/api/run_meta?format=raw');
     }
   }
 
   async function loadStatsOnce(){
-    if(!TOKEN) return;
     if(!serverStats && !statsKv) return;
-    const url = `/api/stats?token=${encodeURIComponent(TOKEN)}`;
+    const url = withToken('/api/stats');
     let resp;
     try{
       resp = await fetch(url, {cache:'no-store'});
@@ -1887,14 +2096,9 @@ if(Array.isArray(arts) && arts.length){
 
 
   function start(){
-    if(!TOKEN){
-      showStatus('Missing token. Re-open using the printed URL (it includes <code>?token=…</code>).');
-      return;
-    }
-
     // Wire up Session panel controls (safe no-ops if elements missing).
     if(runMetaDownload){
-      runMetaDownload.href = `/api/run_meta?token=${encodeURIComponent(TOKEN)}&format=raw`;
+      runMetaDownload.href = withToken('/api/run_meta?format=raw');
     }
     if(runMetaRefresh){
       runMetaRefresh.addEventListener('click', ()=>{ loadRunMeta(true); });
@@ -1906,7 +2110,7 @@ if(Array.isArray(arts) && arts.length){
     }
 
     if(bundleDownload){
-      bundleDownload.href = `/api/bundle?token=${encodeURIComponent(TOKEN)}`;
+      bundleDownload.href = withToken('/api/bundle');
     }
     if(filesRefresh){
       filesRefresh.addEventListener('click', ()=>{ loadFiles(true); });
@@ -1919,11 +2123,30 @@ if(Array.isArray(arts) && arts.length){
     // Prefetch once so the list is ready when the user opens the panel.
     loadFiles(false);
 
+    // Reports panel (optional; server may not support this endpoint).
+    if(reportsGenNf){
+      reportsGenNf.addEventListener('click', ()=>generateReports(['nf_feedback']));
+    }
+    if(reportsGenDash){
+      reportsGenDash.addEventListener('click', ()=>generateReports(['reports_dashboard']));
+    }
+    if(reportsGenBundle){
+      reportsGenBundle.addEventListener('click', ()=>generateReports(['reports_bundle']));
+    }
+    if(reportsRefresh){
+      reportsRefresh.addEventListener('click', ()=>loadReports(true));
+    }
+    if(reportsDetails){
+      reportsDetails.addEventListener('toggle', ()=>{ if(reportsDetails.open) loadReports(false); });
+    }
+    // Prefetch once. If unsupported, loadReports hides the panel.
+    loadReports(false);
+
     ensureUiBindings();
     markAllReconnect('…');
 
     // Load server state (best-effort) and apply early.
-    fetch(`/api/state?token=${encodeURIComponent(TOKEN)}`)
+    fetch(withToken('/api/state'))
       .then(r => r.ok ? r.json() : null)
       .then(st => {
         if(st){
@@ -1936,7 +2159,7 @@ if(Array.isArray(arts) && arts.length){
       .catch(() => {});
 
     // Load meta once to populate band/channel selects, then pick streaming mode.
-    fetch(`/api/meta?token=${encodeURIComponent(TOKEN)}`)
+    fetch(withToken('/api/meta'))
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then(meta => {
         applyMeta(meta);
@@ -1951,7 +2174,7 @@ if(Array.isArray(arts) && arts.length){
         }
 
         // Prefer multiplexed stream if the server supports it.
-        fetch(`/api/config?token=${encodeURIComponent(TOKEN)}`)
+        fetch(withToken('/api/config'))
           .then(r => r.ok ? r.json() : null)
           .then(cfg => {
             const supports = cfg && cfg.supports ? cfg.supports : {};

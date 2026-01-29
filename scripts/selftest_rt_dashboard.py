@@ -71,6 +71,18 @@ def _http_request(
 
 
 
+
+
+def _assert_sse_headers(hdrs: Dict[str, str]) -> None:
+    ct = (hdrs.get("content-type", "") or "").lower()
+    if "text/event-stream" not in ct:
+        raise AssertionError(f"expected text/event-stream Content-Type (got {ct!r})")
+    # When running behind nginx/reverse proxies, buffering can break SSE; the server should disable it.
+    xab = (hdrs.get("x-accel-buffering", "") or "").strip().lower()
+    if xab != "no":
+        raise AssertionError(f"expected X-Accel-Buffering: no (got {xab!r})")
+
+
 def _sse_read_first_data(
     host: str,
     port: int,
@@ -249,6 +261,19 @@ def _write_min_nf_csv(outdir: Path) -> None:
     )
 
 
+
+
+def _replace_nf_csv_atomic(outdir: Path, *, rows: str) -> None:
+    """Atomically replace nf_feedback.csv (simulates temp-write + rename log rotation)."""
+    p = outdir / "nf_feedback.csv"
+    tmp = outdir / "nf_feedback.csv.tmp"
+    tmp.write_text(rows, encoding="utf-8")
+    try:
+        os.replace(tmp, p)
+    except Exception:
+        # Fallback: overwrite in-place.
+        p.write_text(rows, encoding="utf-8")
+
 def _write_min_bandpower_csv(outdir: Path) -> None:
     """Write a tiny bandpower_timeseries.csv so the bandpower SSE stream has data."""
     p = outdir / "bandpower_timeseries.csv"
@@ -313,6 +338,20 @@ def main() -> int:
             if not ok:
                 raise AssertionError("dashboard server did not become ready in time")
 
+            # Authorization header token support (useful for non-SSE API clients).
+            cfg_auth = _http_request(
+                host,
+                port,
+                "GET",
+                "/api/config",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if cfg_auth.status != 200:
+                raise AssertionError(f"/api/config with Authorization header returned {cfg_auth.status}")
+            cfg_auth_obj = json.loads(cfg_auth.body.decode("utf-8"))
+            if not isinstance(cfg_auth_obj, dict) or int(cfg_auth_obj.get("schema_version", 0) or 0) < 1:
+                raise AssertionError("/api/config (Authorization header) returned unexpected JSON")
+
             # Redirect behavior when token is missing.
             r = _http_request(host, port, "GET", "/")
             if r.status != 302:
@@ -328,6 +367,26 @@ def main() -> int:
             if b"qEEG Real-time Dashboard" not in r.body and b"qEEG Neurofeedback" not in r.body:
                 raise AssertionError("dashboard HTML did not contain expected marker text")
 
+            # The HTML route should set a cookie so the token doesn't have to stay in the URL.
+            set_cookie = str(r.headers.get("set-cookie", "") or "")
+            if "qeeg_token=" not in set_cookie:
+                raise AssertionError("expected Set-Cookie qeeg_token on HTML response")
+            cookie_pair = set_cookie.split(";", 1)[0].strip()
+
+            # With the cookie present, / should no longer redirect.
+            r2 = _http_request(host, port, "GET", "/", headers={"Cookie": cookie_pair})
+            if r2.status != 200:
+                raise AssertionError(f"expected 200 for / with cookie, got {r2.status}")
+
+            # With the cookie present, JSON endpoints should also authorize without ?token=...
+            cfg_cookie = _http_request(host, port, "GET", "/api/config", headers={"Cookie": cookie_pair})
+            if cfg_cookie.status != 200:
+                raise AssertionError(f"expected 200 for /api/config with cookie, got {cfg_cookie.status}")
+
+            meta_cookie = _http_request(host, port, "GET", "/api/meta", headers={"Cookie": cookie_pair})
+            if meta_cookie.status != 200:
+                raise AssertionError(f"expected 200 for /api/meta with cookie, got {meta_cookie.status}")
+
             # JSON endpoints.
             cfg_resp = _http_request(host, port, "GET", f"/api/config?token={token}")
             cfg_obj = json.loads(cfg_resp.body.decode("utf-8"))
@@ -336,6 +395,43 @@ def main() -> int:
             supports = cfg_obj.get("supports")
             if not isinstance(supports, dict) or not supports.get("sse_stream"):
                 raise AssertionError("/api/config missing supports.sse_stream")
+
+            # Health endpoint should require auth, but accept both token query and cookie.
+            health_forbidden = _http_request(host, port, "GET", "/api/health")
+            if health_forbidden.status != 403:
+                raise AssertionError(f"expected 403 for /api/health without auth, got {health_forbidden.status}")
+
+            health_resp = _http_request(host, port, "GET", f"/api/health?token={token}")
+            if health_resp.status != 200:
+                raise AssertionError(f"expected 200 for /api/health, got {health_resp.status}")
+            health_obj = json.loads(health_resp.body.decode("utf-8"))
+            if not isinstance(health_obj, dict) or str(health_obj.get("status", "")).lower() != "ok":
+                raise AssertionError("/api/health returned unexpected JSON")
+
+            health_cookie = _http_request(host, port, "GET", "/api/health", headers={"Cookie": cookie_pair})
+            if health_cookie.status != 200:
+                raise AssertionError(f"expected 200 for /api/health with cookie, got {health_cookie.status}")
+
+            # OpenAPI spec endpoint.
+            oa_forbidden = _http_request(host, port, "GET", "/api/openapi.json")
+            if oa_forbidden.status != 403:
+                raise AssertionError(f"expected 403 for /api/openapi.json without auth, got {oa_forbidden.status}")
+            oa = _http_request(host, port, "GET", f"/api/openapi.json?token={token}")
+            if oa.status != 200:
+                raise AssertionError(f"expected 200 for /api/openapi.json, got {oa.status}")
+            spec = json.loads(oa.body.decode("utf-8"))
+            if not isinstance(spec, dict) or spec.get("openapi") != "3.0.3":
+                raise AssertionError("openapi spec missing openapi=3.0.3")
+            paths = spec.get("paths", {})
+            if not isinstance(paths, dict):
+                raise AssertionError("openapi spec missing paths")
+            for p in ("/api/meta", "/api/file", "/api/sse/stream", "/api/health"):
+                if p not in paths:
+                    raise AssertionError(f"openapi spec missing path {p}")
+            comps = spec.get("components", {})
+            schemes = comps.get("securitySchemes", {}) if isinstance(comps, dict) else {}
+            if not isinstance(schemes, dict) or "tokenCookie" not in schemes:
+                raise AssertionError("openapi spec missing tokenCookie security scheme")
 
             meta_resp = _http_request(host, port, "GET", f"/api/meta?token={token}")
             meta_obj = json.loads(meta_resp.body.decode("utf-8"))
@@ -377,16 +473,18 @@ def main() -> int:
             
             # Legacy per-topic SSE endpoints (also validate SSE id + resume behavior).
             status, hdrs, meta_id, obj = _sse_read_first_data(host, port, f"/api/sse/meta?token={token}")
-            if status != 200 or "text/event-stream" not in (hdrs.get("content-type") or ""):
-                raise AssertionError("/api/sse/meta did not return an SSE response")
+            if status != 200:
+                raise AssertionError(f"/api/sse/meta returned {status}")
+            _assert_sse_headers(hdrs)
             if meta_id is None:
                 raise AssertionError("/api/sse/meta did not include an SSE id field")
             if not isinstance(obj, dict) or obj.get("type") != "batch":
                 raise AssertionError("/api/sse/meta first data frame malformed")
 
             status, hdrs, nf_id1, obj = _sse_read_first_data(host, port, f"/api/sse/nf?token={token}")
-            if status != 200 or "text/event-stream" not in (hdrs.get("content-type") or ""):
-                raise AssertionError("/api/sse/nf did not return an SSE response")
+            if status != 200:
+                raise AssertionError(f"/api/sse/nf returned {status}")
+            _assert_sse_headers(hdrs)
             if nf_id1 is None:
                 raise AssertionError("/api/sse/nf did not include an SSE id field")
             if not isinstance(obj, dict) or obj.get("type") != "batch":
@@ -405,8 +503,9 @@ def main() -> int:
                 raise AssertionError(f"/api/sse/nf returned an unexpected SSE id: {nf_seq1}")
 
             status, hdrs, bp_id, obj = _sse_read_first_data(host, port, f"/api/sse/bandpower?token={token}")
-            if status != 200 or "text/event-stream" not in (hdrs.get("content-type") or ""):
-                raise AssertionError("/api/sse/bandpower did not return an SSE response")
+            if status != 200:
+                raise AssertionError(f"/api/sse/bandpower returned {status}")
+            _assert_sse_headers(hdrs)
             if bp_id is None:
                 raise AssertionError("/api/sse/bandpower did not include an SSE id field")
             if not isinstance(obj, dict) or obj.get("type") != "batch":
@@ -416,8 +515,9 @@ def main() -> int:
                 raise AssertionError("/api/sse/bandpower did not include any frames")
 
             status, hdrs, art_id, obj = _sse_read_first_data(host, port, f"/api/sse/artifact?token={token}")
-            if status != 200 or "text/event-stream" not in (hdrs.get("content-type") or ""):
-                raise AssertionError("/api/sse/artifact did not return an SSE response")
+            if status != 200:
+                raise AssertionError(f"/api/sse/artifact returned {status}")
+            _assert_sse_headers(hdrs)
             if art_id is None:
                 raise AssertionError("/api/sse/artifact did not include an SSE id field")
             if not isinstance(obj, dict) or obj.get("type") != "batch":
@@ -460,10 +560,54 @@ def main() -> int:
             if min_t is None or min_t < 2.0:
                 raise AssertionError(f"resume /api/sse/nf replayed old frames (min_t={min_t})")
 
+            # Simulate "log rotation"/atomic replace of nf_feedback.csv:
+            # old readers that only watch file growth can miss this when the new file is larger.
+            seq_before_rot = int(httpd.hub.nf.latest_seq())
+            _replace_nf_csv_atomic(
+                outdir,
+                rows=(
+                    "t_end_sec,metric,threshold,reward,reward_rate\n"
+                    "10.0,0.9,0.4,1,0.9\n"
+                    "11.0,0.8,0.4,0,0.1\n"
+                ),
+            )
+
+            ok = _wait_until(lambda: httpd.hub.nf.latest_seq() > seq_before_rot, timeout_sec=5.0)
+            if not ok:
+                raise AssertionError("nf stream buffer did not detect rotated/replaced nf_feedback.csv")
+
+            status, hdrs, nf_id_rot, rot_obj = _sse_read_first_data(
+                host,
+                port,
+                f"/api/sse/nf?token={token}",
+                request_headers={"Last-Event-ID": str(seq_before_rot)},
+            )
+            if status != 200:
+                raise AssertionError(f"rotated /api/sse/nf returned {status}")
+            if nf_id_rot is None:
+                raise AssertionError("rotated /api/sse/nf did not include an SSE id field")
+            if not isinstance(rot_obj, dict) or rot_obj.get("type") != "batch":
+                raise AssertionError("rotated /api/sse/nf first data frame malformed")
+            rot_frames = rot_obj.get("frames")
+            if not isinstance(rot_frames, list) or not rot_frames:
+                raise AssertionError("rotated /api/sse/nf did not include any frames")
+            min_t = None
+            for fr in rot_frames:
+                if isinstance(fr, dict) and fr.get("t") is not None:
+                    try:
+                        tv = float(fr.get("t"))
+                    except Exception:
+                        continue
+                    min_t = tv if (min_t is None or tv < min_t) else min_t
+            if min_t is None or min_t < 10.0:
+                raise AssertionError(f"rotated /api/sse/nf did not emit new file rows (min_t={min_t})")
+
+
             # Multiplexed SSE endpoint (recommended by README): expects named events.
             status, hdrs, evs = _sse_read_n_events(host, port, f"/api/sse/stream?token={token}", n=6, timeout=5.0)
-            if status != 200 or "text/event-stream" not in (hdrs.get("content-type") or ""):
-                raise AssertionError("/api/sse/stream did not return an SSE response")
+            if status != 200:
+                raise AssertionError(f"/api/sse/stream returned {status}")
+            _assert_sse_headers(hdrs)
 
             # The first message should always be the config event.
             ev0, id0, obj0 = evs[0]
@@ -569,6 +713,47 @@ def main() -> int:
                 raise AssertionError("/api/files did not include nf_feedback.csv")
 
 
+            # Reports API (offline HTML/ZIP generation)
+            reports_resp = _http_request(host, port, "GET", f"/api/reports?token={token}")
+            reports_obj = json.loads(reports_resp.body.decode("utf-8"))
+            if not isinstance(reports_obj, dict) or "kinds" not in reports_obj:
+                raise AssertionError("/api/reports returned unexpected JSON")
+            kind_names = []
+            for k in reports_obj.get("kinds", []) if isinstance(reports_obj.get("kinds", []), list) else []:
+                if isinstance(k, dict) and k.get("kind"):
+                    kind_names.append(str(k.get("kind")))
+            if "nf_feedback" not in kind_names:
+                raise AssertionError("/api/reports missing nf_feedback kind")
+
+            gen_body = json.dumps({"kinds": ["nf_feedback"]}).encode("utf-8")
+            gen_resp = _http_request(
+                host,
+                port,
+                "POST",
+                f"/api/reports?token={token}",
+                body=gen_body,
+                headers={"Content-Type": "application/json"},
+                timeout=30.0,
+            )
+            if gen_resp.status != 200:
+                raise AssertionError(f"POST /api/reports returned status {gen_resp.status}")
+            gen_obj = json.loads(gen_resp.body.decode("utf-8"))
+            if not isinstance(gen_obj, dict) or "results" not in gen_obj:
+                raise AssertionError("POST /api/reports returned unexpected JSON")
+            ok_any = False
+            for r in gen_obj.get("results", []) if isinstance(gen_obj.get("results", []), list) else []:
+                if isinstance(r, dict) and r.get("kind") == "nf_feedback" and r.get("ok") is True:
+                    ok_any = True
+            if not ok_any:
+                raise AssertionError("nf_feedback report generation did not succeed")
+
+            rep_resp = _http_request(host, port, "GET", f"/api/file?token={token}&name=nf_feedback_report.html")
+            if rep_resp.status != 200:
+                raise AssertionError(f"nf_feedback_report.html fetch failed with {rep_resp.status}")
+            if b"<html" not in rep_resp.body.lower():
+                raise AssertionError("nf_feedback_report.html does not look like HTML")
+
+
             file_resp = _http_request(host, port, "GET", f"/api/file?token={token}&name=nf_feedback.csv")
             if file_resp.status != 200:
                 raise AssertionError(f"/api/file returned status {file_resp.status}")
@@ -651,6 +836,16 @@ def main() -> int:
                 raise AssertionError("/api/bundle zip missing bundle_manifest.json")
             if "nf_feedback.csv" not in nms:
                 raise AssertionError("/api/bundle zip missing nf_feedback.csv")
+
+            # Bundle should include small generated dashboard context JSON files.
+            for gen_name in ("dashboard_config.json", "dashboard_state.json", "dashboard_meta.json", "dashboard_openapi.json"):
+                if gen_name not in nms:
+                    raise AssertionError(f"/api/bundle zip missing {gen_name}")
+                try:
+                    _ = json.loads(z.read(gen_name).decode("utf-8"))
+                except Exception as e:
+                    raise AssertionError(f"/api/bundle {gen_name} is not valid JSON: {e}")
+
 
         finally:
             try:

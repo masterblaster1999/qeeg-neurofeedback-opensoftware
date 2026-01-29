@@ -1004,6 +1004,16 @@ This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral chan
   python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --select 2 \
     --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
     --realtime --export-bandpowers --flush-csv
+
+  # Optional: start the real-time dashboard automatically while qeeg_nf_cli runs:
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --dashboard --open-dashboard \
+    --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+    --realtime --export-bandpowers --flush-csv
+
+  # Optional: machine-readable run manifest (stdout is JSON; logs go to stderr):
+  python3 scripts/biotrace_run_nf.py --container session.m2k --outdir out_nf --run-json \
+    --metric alpha/beta:Pz --window 2.0 --update 0.25 --baseline 10 --target-rate 0.6 \
+    --realtime --export-bandpowers --flush-csv > run_manifest.json
   ```
 
   **Optional: validate JSON outputs** (for CI/dev sanity checks):
@@ -1451,6 +1461,8 @@ python3 scripts/rt_dashboard_simulate_output.py --outdir out_nf --with-bandpower
 python3 scripts/rt_qeeg_dashboard.py --outdir out_nf --open
 ```
 
+Tip: the simulator also writes small companion files like `nf_run_meta.json` and (when using `--with-bandpower`) a `reference_used.csv` so the dashboard can show a realistic Session panel and enable the **z (reference)** view.
+
 View from another device on the same network (e.g., a Nexus/Android tablet):
 
 ```bash
@@ -1479,6 +1491,7 @@ Notes:
   carries `nf/meta/bandpower/artifact/state` updates as **named SSE events**. This improves compatibility
   with browsers that enforce low per-origin connection limits. The legacy per-topic SSE endpoints remain.
 
+- After the first successful load via the printed `?token=...` URL, the server sets a SameSite=Strict, HttpOnly `qeeg_token` cookie so you can **refresh/bookmark** the dashboard URLs (`/` and `/kiosk`) without keeping the token in the address bar/history.
 - SSE streams include `id:` fields so EventSource can automatically resume after transient disconnects (via the `Last-Event-ID` header). This helps on flaky Wi‑Fi/tablet connections.
 - If `EventSource` is unavailable (or you want a simpler transport), the server also exposes a polling endpoint
   (`/api/snapshot`) that returns incremental batches using cursors (sequence numbers). The UI can fall back to it.
@@ -1486,9 +1499,16 @@ Notes:
   fallback (`/app_legacy.js`) to improve compatibility with older browsers/devices.
 - The Bandpower panel supports optional linear/log10/dB transforms (handy when your pipeline writes raw power).
 - Live file status uses a meta SSE stream (with a polling fallback if EventSource is unavailable).
+- The dashboard CSV tailers detect truncation and file replacement (e.g., log rotation or temp-write + rename) and will automatically reattach, similar to `tail -F`.
 - Dashboard UI state (window/band/channel/transform/pause) is shared across clients via `/api/state` and persisted to `<outdir>/rt_dashboard_state.json`.
 - The dashboard also exposes read-only download endpoints: `/api/files` (list), `/api/file?name=...` (single file), and `/api/bundle` (zip bundle). These are token-protected and only serve safe file types from the chosen `--outdir`.
+  - Authentication: supply the token as a `?token=...` query parameter, via `Authorization: Bearer <token>`, or via the `qeeg_token` cookie (the dashboard page sets it automatically after first load and the UI removes `?token=` from the address bar).
+    - For SSE/EventSource connections, use `?token=` **or** the cookie (headers aren't supported).
   - `/api/file` supports HTTP caching (ETag/Last-Modified) and single-range downloads (Range/If-Range) for resumable transfers.
+  - New: `/api/health` (readiness check) and `/api/openapi.json` (OpenAPI 3.0 spec of the HTTP API).
+- New: the **Reports** panel (and `/api/reports`) can generate offline HTML reports directly into `--outdir`
+  using the existing report renderers (e.g. `nf_feedback_report.html`, `qeeg_reports_dashboard.html`, and an optional
+  `qeeg_reports_bundle.zip` for sharing).
 - The HTML/CSS/JS frontend lives in `scripts/rt_dashboard_frontend/` (override with `--frontend-dir` if you want to customize/skin the UI).
 
 Optional: smooth the metric with an **exponential moving average** before thresholding/feedback:

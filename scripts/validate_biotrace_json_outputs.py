@@ -83,6 +83,22 @@ def _run_capture(cmd: List[str], *, cwd: Path, env: Optional[Dict[str, str]] = N
     )
 
 
+def _run_capture_separate(cmd: List[str], *, cwd: Path, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    """Run a command capturing stdout/stderr separately.
+
+    Useful when validating tools that intentionally keep stdout machine-readable and send logs to stderr.
+    """
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
 def _json_from_stdout(stdout: str) -> Any:
     s = (stdout or "").strip()
     try:
@@ -178,6 +194,89 @@ def _fallback_validate_manifest(obj: Any) -> None:
         raise AssertionError("error must be a string when present")
 
 
+def _fallback_validate_run_manifest(obj: Any) -> None:
+    if not isinstance(obj, dict):
+        raise AssertionError("run manifest must be an object")
+
+    # Minimal shape checks (used when jsonschema isn't available).
+    required = [
+        "schema_version",
+        "started_utc",
+        "finished_utc",
+        "input",
+        "outdir",
+        "extract_dir",
+        "kept_extracted",
+        "prefer_exts",
+        "select",
+        "extracted",
+        "qeeg_nf_cli",
+        "cmd",
+        "forwarded_args",
+        "returncode",
+        "dashboard",
+        "error",
+    ]
+    for k in required:
+        if k not in obj:
+            raise AssertionError(f"missing required key: {k}")
+
+    if not isinstance(obj.get("schema_version"), int) or int(obj["schema_version"]) < 1:
+        raise AssertionError("schema_version must be an integer >= 1")
+    if not isinstance(obj.get("started_utc"), (int, float)):
+        raise AssertionError("started_utc must be a number")
+    if not isinstance(obj.get("finished_utc"), (int, float)):
+        raise AssertionError("finished_utc must be a number")
+    if not isinstance(obj.get("input"), str) or not obj["input"]:
+        raise AssertionError("input must be a non-empty string")
+    if not isinstance(obj.get("outdir"), str):
+        raise AssertionError("outdir must be a string")
+    if not isinstance(obj.get("extract_dir"), str):
+        raise AssertionError("extract_dir must be a string")
+    if not isinstance(obj.get("kept_extracted"), bool):
+        raise AssertionError("kept_extracted must be a boolean")
+    if not _is_str_list(obj.get("prefer_exts")):
+        raise AssertionError("prefer_exts must be a list of strings")
+    if not isinstance(obj.get("select"), str):
+        raise AssertionError("select must be a string")
+    if obj.get("extracted") is not None and not isinstance(obj.get("extracted"), str):
+        raise AssertionError("extracted must be a string or null")
+    if obj.get("qeeg_nf_cli") is not None and not isinstance(obj.get("qeeg_nf_cli"), str):
+        raise AssertionError("qeeg_nf_cli must be a string or null")
+    if not _is_str_list(obj.get("cmd")):
+        raise AssertionError("cmd must be a list of strings")
+    if not _is_str_list(obj.get("forwarded_args")):
+        raise AssertionError("forwarded_args must be a list of strings")
+    if not isinstance(obj.get("returncode"), int) or int(obj["returncode"]) < 0:
+        raise AssertionError("returncode must be an integer >= 0")
+
+    dash = obj.get("dashboard")
+    if not isinstance(dash, dict):
+        raise AssertionError("dashboard must be an object")
+    for k in ("enabled", "cmd", "pid", "info", "error", "raw_line", "terminated", "kept"):
+        if k not in dash:
+            raise AssertionError(f"dashboard missing key: {k}")
+    if not isinstance(dash.get("enabled"), bool):
+        raise AssertionError("dashboard.enabled must be a bool")
+    if not _is_str_list(dash.get("cmd")):
+        raise AssertionError("dashboard.cmd must be a list of strings")
+    if dash.get("pid") is not None and not isinstance(dash.get("pid"), int):
+        raise AssertionError("dashboard.pid must be an int or null")
+    if dash.get("info") is not None and not isinstance(dash.get("info"), dict):
+        raise AssertionError("dashboard.info must be an object or null")
+    if dash.get("error") is not None and not isinstance(dash.get("error"), str):
+        raise AssertionError("dashboard.error must be a string or null")
+    if dash.get("raw_line") is not None and not isinstance(dash.get("raw_line"), str):
+        raise AssertionError("dashboard.raw_line must be a string or null")
+    if not isinstance(dash.get("terminated"), bool):
+        raise AssertionError("dashboard.terminated must be a bool")
+    if not isinstance(dash.get("kept"), bool):
+        raise AssertionError("dashboard.kept must be a bool")
+
+    if obj.get("error") is not None and not isinstance(obj.get("error"), str):
+        raise AssertionError("error must be a string or null")
+
+
 def _make_brainvision_triplet(base_name: str) -> tuple[str, bytes, str]:
     vhdr = (
         "Brain Vision Data Exchange Header File Version 1.0\n"
@@ -195,6 +294,55 @@ def _make_brainvision_triplet(base_name: str) -> tuple[str, bytes, str]:
         "Mk1=Stimulus,S 1,1,1,0\n"
     )
     return vhdr, eeg, vmrk
+
+
+def _make_fake_nf_cli(dir_path: Path) -> Path:
+    """Create a minimal qeeg_nf_cli stand-in that accepts --input/--outdir and exits 0."""
+
+    dir_path.mkdir(parents=True, exist_ok=True)
+
+    impl = dir_path / "qeeg_nf_cli_fake.py"
+    impl.write_text(
+        """#!/usr/bin/env python3
+import argparse
+import os
+import sys
+from pathlib import Path
+
+ap = argparse.ArgumentParser()
+ap.add_argument('--input', required=True)
+ap.add_argument('--outdir', required=True)
+# Accept and ignore the rest (matches the wrapper's pass-through behavior).
+args, _ = ap.parse_known_args()
+
+inp = Path(args.input)
+out = Path(args.outdir)
+if not inp.exists():
+    print(f'fake qeeg_nf_cli: input does not exist: {inp}', file=sys.stderr)
+    sys.exit(2)
+out.mkdir(parents=True, exist_ok=True)
+# Touch a file to prove we ran.
+try:
+    (out / 'fake_nf_cli_ran.txt').write_text('ok', encoding='utf-8')
+except Exception:
+    pass
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+
+    if os.name == "nt":
+        # Windows: create a .cmd wrapper that calls the python impl.
+        cmd = dir_path / "qeeg_nf_cli_fake.cmd"
+        cmd.write_text(f"@echo off\r\n\"{sys.executable}\" -B \"{impl}\" %*\r\n", encoding="utf-8")
+        return cmd
+
+    # POSIX: make the python file executable.
+    try:
+        os.chmod(str(impl), 0o755)
+    except Exception:
+        pass
+    return impl
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -217,6 +365,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     schema_extract_list = _load_schema(schemas_dir / "biotrace_extract_list.schema.json")
     schema_extract_manifest = _load_schema(schemas_dir / "biotrace_extract_manifest.schema.json")
     schema_run_nf_list = _load_schema(schemas_dir / "biotrace_run_nf_list.schema.json")
+    schema_run_nf_run = _load_schema(schemas_dir / "biotrace_run_nf_run.schema.json")
 
     # Prefer jsonschema if available.
     have_jsonschema = True
@@ -240,6 +389,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise AssertionError(f"{which}: jsonschema validation failed: {err}\nInstance: {json.dumps(obj, indent=2, sort_keys=True)}")
         else:
             _fallback_validate_manifest(obj)
+
+
+    def validate_run_manifest(which: str, obj: Any, schema: Dict[str, Any]) -> None:
+        if have_jsonschema:
+            err = _validate_with_jsonschema(schema, obj)
+            if err is not None:
+                raise AssertionError(
+                    f"{which}: jsonschema validation failed: {err}\nInstance: {json.dumps(obj, indent=2, sort_keys=True)}"
+                )
+        else:
+            _fallback_validate_run_manifest(obj)
 
     with tempfile.TemporaryDirectory(prefix="qeeg_validate_biotrace_json_") as td:
         td_path = Path(td)
@@ -372,6 +532,72 @@ def main(argv: Optional[List[str]] = None) -> int:
         validate_candidates("biotrace_run_nf.py --list-json (error)", obj, schema_run_nf_list)
         if not obj.get("error"):
             raise AssertionError("expected error field in wrapper list-json error mode")
+
+        # ------------------------------------------------------------------
+        # Validate wrapper run-json (success + error)
+        # ------------------------------------------------------------------
+        fake_nf_dir = td_path / "fake_nf_cli"
+        fake_nf = _make_fake_nf_cli(fake_nf_dir)
+
+        for cont in (container_edf, container_bv):
+            out_nf = td_path / f"out_runjson_{cont.stem}"
+            extract_nf = td_path / f"extract_runjson_{cont.stem}"
+
+            # keep extraction dir stable (and avoid leaving behind temp dirs on failure)
+            out_nf.mkdir(parents=True, exist_ok=True)
+            extract_nf.mkdir(parents=True, exist_ok=True)
+
+            r = _run_capture_separate(
+                [
+                    sys.executable,
+                    "scripts/biotrace_run_nf.py",
+                    "--container",
+                    str(cont),
+                    "--outdir",
+                    str(out_nf),
+                    "--extract-dir",
+                    str(extract_nf),
+                    "--nf-cli",
+                    str(fake_nf),
+                    "--run-json",
+                    "--metric",
+                    "alpha/beta:Pz",
+                    "--window",
+                    "2.0",
+                ],
+                cwd=repo_root,
+            )
+            if r.returncode != 0:
+                raise AssertionError(
+                    f"run_nf --run-json failed for {cont}: rc={r.returncode}\n--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
+                )
+
+            obj = _json_from_stdout(r.stdout)
+            validate_run_manifest("biotrace_run_nf.py --run-json", obj, schema_run_nf_run)
+            if int(obj.get("returncode", 1)) != 0:
+                raise AssertionError(f"expected returncode=0 in run manifest, got {obj.get('returncode')}")
+            if ns.verbose:
+                print(f"[OK] run_nf run-json: {cont}")
+
+        # Error mode: non-zip container should still return JSON on stdout.
+        r = _run_capture_separate(
+            [
+                sys.executable,
+                "scripts/biotrace_run_nf.py",
+                "--container",
+                str(not_zip),
+                "--outdir",
+                str(td_path / "out_runjson_error"),
+                "--run-json",
+            ],
+            cwd=repo_root,
+        )
+        if r.returncode == 0:
+            raise AssertionError("expected non-zero exit for non-zip in wrapper run-json")
+        obj = _json_from_stdout(r.stdout)
+        validate_run_manifest("biotrace_run_nf.py --run-json (error)", obj, schema_run_nf_run)
+        if not obj.get("error"):
+            raise AssertionError("expected error field in wrapper run-json error mode")
 
     print("validate_biotrace_json_outputs: OK")
     return 0

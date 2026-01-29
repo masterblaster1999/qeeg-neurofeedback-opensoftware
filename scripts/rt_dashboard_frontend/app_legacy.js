@@ -38,6 +38,26 @@ Transport strategy:
 
   var TOKEN = getParam('token');
 
+  // If the token is present in the URL, drop it from the address bar (the server also sets a cookie).
+  if (TOKEN && window.history && window.history.replaceState) {
+    try {
+      var clean = window.location.pathname + window.location.hash;
+      window.history.replaceState(null, '', clean);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+
+  function withToken(url){
+    if(!TOKEN) return url;
+    try{
+      if(/(?:^|[?&])token=/.test(url)) return url;
+    }catch(e){}
+    var sep = (url.indexOf('?') >= 0) ? '&' : '?';
+    return url + sep + 'token=' + encodeURIComponent(TOKEN);
+  }
+
   // DOM
   var statusBox = $('status');
   var nfConn = $('nfConn');
@@ -60,6 +80,15 @@ Transport strategy:
   var filesRefresh = $('filesRefresh');
   var filesList = $('filesList');
   var filesHint = $('filesHint');
+
+  var reportsDetails = $('reportsDetails');
+  var reportsGenNf = $('reportsGenNf');
+  var reportsGenDash = $('reportsGenDash');
+  var reportsGenBundle = $('reportsGenBundle');
+  var reportsForce = $('reportsForce');
+  var reportsRefresh = $('reportsRefresh');
+  var reportsStatus = $('reportsStatus');
+  var reportsList = $('reportsList');
 
   var winSel = $('winSel');
   var pauseBtn = $('pauseBtn');
@@ -217,8 +246,8 @@ Transport strategy:
       renderKvGrid(runMetaKv, null);
       if(runMetaRaw) runMetaRaw.textContent = '';
     }
-    if(runMetaDownload && TOKEN){
-      runMetaDownload.href = '/api/run_meta?token=' + encodeURIComponent(TOKEN) + '&format=raw';
+    if(runMetaDownload){
+      runMetaDownload.href = withToken('/api/run_meta?format=raw');
     }
   }
 
@@ -828,12 +857,11 @@ Transport strategy:
   var pushTimer = null;
   function schedulePushUiState(){
     if(state.applyingRemote) return;
-    if(!TOKEN) return;
     if(pushTimer) clearTimeout(pushTimer);
     pushTimer = setTimeout(function(){
       pushTimer = null;
       var body = uiStateFromControls();
-      xhrJson('PUT', '/api/state?token=' + encodeURIComponent(TOKEN), body, function(){ /* ignore */ });
+      xhrJson('PUT', withToken('/api/state'), body, function(){ /* ignore */ });
     }, 120);
   }
 
@@ -1054,8 +1082,11 @@ Transport strategy:
   function connectStream(topics){
     if(!window.EventSource) return null;
     var t = (topics && topics.join) ? topics.join(',') : String(topics || '');
-    var url = '/api/sse/stream?token=' + encodeURIComponent(TOKEN);
-    if(t){ url += '&topics=' + encodeURIComponent(t); }
+    var url = '/api/sse/stream';
+    var qp = [];
+    if(t){ qp.push('topics=' + encodeURIComponent(t)); }
+    if(qp.length){ url += '?' + qp.join('&'); }
+    url = withToken(url);
     return new EventSource(url);
   }
 
@@ -1064,7 +1095,7 @@ Transport strategy:
       setBadge(badgeEl, label + ': no EventSource', 'warn');
       return null;
     }
-    var url = path + '?token=' + encodeURIComponent(TOKEN);
+    var url = withToken(path);
     var es = new EventSource(url);
     setBadge(badgeEl, label + ': connecting', 'warn');
     es.onopen = function(){ setBadge(badgeEl, label + ': connected', 'good'); };
@@ -1126,8 +1157,6 @@ Transport strategy:
   }
 
   function startPolling(){
-    if(!TOKEN) return;
-
     setBadge(nfConn, 'nf: polling', 'warn');
     setBadge(bpConn, 'bandpower: polling', 'warn');
     setBadge(artConn, 'artifact: polling', 'warn');
@@ -1140,7 +1169,6 @@ Transport strategy:
 
     function buildUrl(){
       var qp = [];
-      qp.push('token=' + encodeURIComponent(TOKEN));
       qp.push('topics=' + encodeURIComponent(topics.join(',')));
       qp.push('wait=1.0');
       qp.push('limit=2500');
@@ -1149,7 +1177,7 @@ Transport strategy:
       qp.push('artifact=' + encodeURIComponent(String(cur.artifact||0)));
       qp.push('meta=' + encodeURIComponent(String(cur.meta||0)));
       qp.push('state=' + encodeURIComponent(String(cur.state||0)));
-      return '/api/snapshot?' + qp.join('&');
+      return withToken('/api/snapshot?' + qp.join('&'));
     }
 
     function applyTopic(name, payload, handler){
@@ -1259,8 +1287,8 @@ Transport strategy:
     if(!filesList) return;
     clearEl(filesList);
 
-    if(bundleDownload && TOKEN){
-      bundleDownload.href = '/api/bundle?token=' + encodeURIComponent(TOKEN);
+    if(bundleDownload){
+      bundleDownload.href = withToken('/api/bundle');
     }
 
     var files = (obj && obj.files && obj.files.length) ? obj.files : [];
@@ -1278,13 +1306,26 @@ Transport strategy:
       var row = document.createElement('div');
       row.className = 'fileRow';
 
+      var left = document.createElement('div');
+      left.style.display = 'flex';
+      left.style.gap = '8px';
+      left.style.flexWrap = 'wrap';
+      left.style.alignItems = 'center';
+
       var a = document.createElement('a');
       a.textContent = name;
       a.target = '_blank';
       a.rel = 'noopener';
 
-      var baseUrl = (f.download_url || f.url) ? String(f.download_url || f.url) : ('/api/file?name=' + encodeURIComponent(name) + '&download=1');
-      var href = baseUrl + (baseUrl.indexOf('?')>=0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+      var urlView = f.url ? String(f.url) : ('/api/file?name=' + encodeURIComponent(name));
+      var urlDownload = f.download_url ? String(f.download_url) : ('/api/file?name=' + encodeURIComponent(name) + '&download=1');
+      var isHtml = false;
+      try{
+        var low = name.toLowerCase();
+        isHtml = (low.lastIndexOf('.html') === (low.length - 5));
+      }catch(e){ isHtml = false; }
+      var primary = isHtml ? urlView : urlDownload;
+      var href = withToken(primary);
       var downloadable = (typeof f.downloadable === 'boolean') ? f.downloadable : true;
 
       if(downloadable){
@@ -1294,7 +1335,19 @@ Transport strategy:
         a.style.opacity = '0.6';
         a.onclick = function(ev){ try{ if(ev && ev.preventDefault) ev.preventDefault(); }catch(e){} return false; };
       }
-      row.appendChild(a);
+      left.appendChild(a);
+
+      if(downloadable && isHtml){
+        var dl = document.createElement('a');
+        dl.textContent = 'download';
+        dl.href = withToken(urlDownload);
+        dl.target = '_blank';
+        dl.rel = 'noopener';
+        dl.className = 'fileTag';
+        left.appendChild(dl);
+      }
+
+      row.appendChild(left);
 
       var meta = document.createElement('span');
       meta.className = 'fileMeta';
@@ -1314,7 +1367,6 @@ Transport strategy:
   }
 
   function loadFiles(force){
-    if(!TOKEN) return;
     if(!filesList) return;
     var now = nowSec();
     if(!force && (now - filesLastLoad_utc) < 1.0 && filesList.childNodes && filesList.childNodes.length){
@@ -1322,7 +1374,7 @@ Transport strategy:
     }
     filesLastLoad_utc = now;
     if(filesHint) filesHint.textContent = 'Loading…';
-    xhrJson('GET', '/api/files?token=' + encodeURIComponent(TOKEN), null, function(err, obj){
+    xhrJson('GET', withToken('/api/files'), null, function(err, obj){
       if(err){
         if(filesHint) filesHint.textContent = 'Failed to load file list.';
         return;
@@ -1331,10 +1383,177 @@ Transport strategy:
     });
   }
 
+  // ------------------------ reports ------------------------
+
+  var reportsLastLoad_utc = 0;
+
+  function setReportsStatus(msg){
+    if(!reportsStatus) return;
+    reportsStatus.textContent = msg || '';
+  }
+
+  function renderReports(obj){
+    if(!reportsList) return;
+    clearEl(reportsList);
+
+    var kinds = (obj && obj.kinds && obj.kinds.length) ? obj.kinds : [];
+    var artifacts = (obj && obj.artifacts && obj.artifacts.length) ? obj.artifacts : [];
+
+    if(kinds.length === 0){
+      setReportsStatus('No report generators advertised by this server.');
+    } else {
+      var notReady = [];
+      for(var i=0;i<kinds.length;i++){
+        var k = kinds[i];
+        if(k && k.ready === false){
+          var miss = (k.missing_inputs && k.missing_inputs.join) ? k.missing_inputs.join(', ') : '';
+          notReady.push(String(k.kind || '') + (miss ? (' (missing ' + miss + ')') : ''));
+        }
+      }
+      if(notReady.length){
+        setReportsStatus('Some report generators are not ready: ' + notReady.join(' \u00b7 '));
+      } else {
+        setReportsStatus('Ready.');
+      }
+    }
+
+    if(artifacts.length === 0){
+      var empty = document.createElement('div');
+      empty.className = 'small muted';
+      empty.textContent = 'No report artifacts found yet. Generate one using the buttons above.';
+      reportsList.appendChild(empty);
+      return;
+    }
+
+    var now = nowSec();
+
+    for(var j=0;j<artifacts.length;j++){
+      var f = artifacts[j];
+      if(!f || !f.name) continue;
+      var name = String(f.name);
+
+      var row = document.createElement('div');
+      row.className = 'fileRow';
+
+      var left = document.createElement('div');
+      left.style.display = 'flex';
+      left.style.gap = '8px';
+      left.style.flexWrap = 'wrap';
+      left.style.alignItems = 'center';
+
+      var a = document.createElement('a');
+      a.textContent = name;
+      a.target = '_blank';
+      a.rel = 'noopener';
+
+      var urlView = f.url ? String(f.url) : ('/api/file?name=' + encodeURIComponent(name));
+      var urlDownload = f.download_url ? String(f.download_url) : ('/api/file?name=' + encodeURIComponent(name) + '&download=1');
+      var isHtml = false;
+      try{
+        var low = name.toLowerCase();
+        isHtml = (low.lastIndexOf('.html') === (low.length - 5));
+      }catch(e){ isHtml = false; }
+      var primary = isHtml ? urlView : urlDownload;
+
+      var downloadable = (typeof f.downloadable === 'boolean') ? f.downloadable : true;
+      if(downloadable){
+        a.href = withToken(primary);
+      } else {
+        a.href = '#';
+        a.style.opacity = '0.6';
+        a.onclick = function(ev){ try{ if(ev && ev.preventDefault) ev.preventDefault(); }catch(e){} return false; };
+      }
+      left.appendChild(a);
+
+      if(downloadable && isHtml){
+        var dl = document.createElement('a');
+        dl.textContent = 'download';
+        dl.href = withToken(urlDownload);
+        dl.target = '_blank';
+        dl.rel = 'noopener';
+        dl.className = 'fileTag';
+        left.appendChild(dl);
+      }
+
+      row.appendChild(left);
+
+      var meta = document.createElement('span');
+      meta.className = 'fileMeta';
+      var st = (f.stat && typeof f.stat === 'object') ? f.stat : {};
+      var size = (st && isFinite(st.size_bytes)) ? st.size_bytes : null;
+      var mtime = (st && isFinite(st.mtime_utc)) ? st.mtime_utc : null;
+      var parts = [];
+      if(size !== null) parts.push(fmtBytes(size));
+      if(mtime !== null) parts.push('age ' + fmtAgeSec(now - mtime));
+      if(f.mime) parts.push(String(f.mime).split(';')[0]);
+      meta.textContent = parts.join(' \u00b7 ');
+      row.appendChild(meta);
+
+      reportsList.appendChild(row);
+    }
+  }
+
+  function loadReports(force){
+    if(!reportsDetails) return;
+    var now = nowSec();
+    if(!force && (now - reportsLastLoad_utc) < 1.0 && reportsList && reportsList.childNodes && reportsList.childNodes.length){
+      return;
+    }
+    reportsLastLoad_utc = now;
+    setReportsStatus('Loading\u2026');
+
+    xhrJson('GET', withToken('/api/reports'), null, function(err, obj, xhr){
+      if(err){
+        try{
+          if(xhr && xhr.status === 404){
+            reportsDetails.style.display = 'none';
+            return;
+          }
+        }catch(e){}
+        setReportsStatus('Failed to load reports info.');
+        return;
+      }
+      renderReports(obj);
+    });
+  }
+
+  function setReportsButtonsDisabled(disabled){
+    var btns = [reportsGenNf, reportsGenDash, reportsGenBundle, reportsRefresh];
+    for(var i=0;i<btns.length;i++){
+      var b = btns[i];
+      if(b) b.disabled = !!disabled;
+    }
+  }
+
+  function generateReports(kinds){
+    if(!kinds || !kinds.length) kinds = ['nf_feedback'];
+    var force = !!(reportsForce && reportsForce.checked);
+    setReportsButtonsDisabled(true);
+    setReportsStatus('Generating\u2026');
+
+    xhrJson('POST', withToken('/api/reports'), {kinds: kinds, force: force}, function(err, obj){
+      if(err || !obj){
+        setReportsStatus('Report generation failed.');
+        setReportsButtonsDisabled(false);
+        return;
+      }
+      var results = (obj.results && obj.results.length) ? obj.results : [];
+      var ok = 0;
+      for(var i=0;i<results.length;i++){
+        if(results[i] && results[i].ok) ok++;
+      }
+      var bad = results.length - ok;
+      setReportsStatus('Generated ' + String(ok) + '/' + String(results.length) + ' report(s)' + (bad ? (' (' + String(bad) + ' failed)') : '') + '.');
+      setReportsButtonsDisabled(false);
+      loadReports(true);
+      loadFiles(true);
+    });
+  }
+
+
   function loadRunMeta(force){
-    if(!TOKEN) return;
     if(!runMetaRaw && !runMetaKv && !runMetaStatus) return;
-    var url = '/api/run_meta?token=' + encodeURIComponent(TOKEN);
+    var url = withToken('/api/run_meta');
     var headers = {};
     if(!force && runMetaETag) headers['If-None-Match'] = runMetaETag;
     xhrJson('GET', url, null, function(err, data, xhr){
@@ -1363,9 +1582,8 @@ Transport strategy:
   }
 
   function loadStatsOnce(){
-    if(!TOKEN) return;
     if(!serverStats && !statsKv) return;
-    var url = '/api/stats?token=' + encodeURIComponent(TOKEN);
+    var url = withToken('/api/stats');
     xhrJson('GET', url, null, function(err, data){
       if(err){
         if(serverStats) serverStats.textContent = 'stats: fetch failed';
@@ -1414,14 +1632,9 @@ Transport strategy:
 
 
   function start(){
-    if(!TOKEN){
-      showStatus('Missing token. Re-open using the printed URL (it includes <code>?token=…</code>).');
-      return;
-    }
-
     // Wire up Session panel controls (safe no-ops if elements missing).
     if(runMetaDownload){
-      runMetaDownload.href = '/api/run_meta?token=' + encodeURIComponent(TOKEN) + '&format=raw';
+      runMetaDownload.href = withToken('/api/run_meta?format=raw');
     }
     if(runMetaRefresh){
       runMetaRefresh.onclick = function(){ loadRunMeta(true); };
@@ -1433,7 +1646,7 @@ Transport strategy:
     }
 
     if(bundleDownload){
-      bundleDownload.href = '/api/bundle?token=' + encodeURIComponent(TOKEN);
+      bundleDownload.href = withToken('/api/bundle');
     }
     if(filesRefresh){
       filesRefresh.onclick = function(){ loadFiles(true); };
@@ -1446,10 +1659,31 @@ Transport strategy:
     // Prefetch once so the list is ready when the user opens the panel.
     loadFiles(false);
 
+    // Reports panel (optional; server may not support this endpoint).
+    if(reportsGenNf){
+      reportsGenNf.onclick = function(){ generateReports(['nf_feedback']); };
+    }
+    if(reportsGenDash){
+      reportsGenDash.onclick = function(){ generateReports(['reports_dashboard']); };
+    }
+    if(reportsGenBundle){
+      reportsGenBundle.onclick = function(){ generateReports(['reports_bundle']); };
+    }
+    if(reportsRefresh){
+      reportsRefresh.onclick = function(){ loadReports(true); };
+    }
+    if(reportsDetails && reportsDetails.addEventListener){
+      reportsDetails.addEventListener('toggle', function(){
+        if(reportsDetails.open) loadReports(false);
+      });
+    }
+    // Prefetch once. If unsupported, loadReports hides the panel.
+    loadReports(false);
+
     ensureUiBindings();
 
     // Load state best-effort
-    xhrJson('GET', '/api/state?token=' + encodeURIComponent(TOKEN), null, function(err, st){
+    xhrJson('GET', withToken('/api/state'), null, function(err, st){
       if(!err && st){
         applyUiState(st);
         dirtyNf = true;
@@ -1459,7 +1693,7 @@ Transport strategy:
     });
 
     // Load meta once
-    xhrJson('GET', '/api/meta?token=' + encodeURIComponent(TOKEN), null, function(err, meta){
+    xhrJson('GET', withToken('/api/meta'), null, function(err, meta){
       if(err || !meta){
         showStatus('Failed to load metadata from the server. Is the process still running?');
         setBadge(nfConn, 'nf: offline', 'bad');
@@ -1481,7 +1715,7 @@ Transport strategy:
       }
 
       // Prefer multiplexed stream if supported
-      xhrJson('GET', '/api/config?token=' + encodeURIComponent(TOKEN), null, function(_e, cfg){
+      xhrJson('GET', withToken('/api/config'), null, function(_e, cfg){
         var supports = cfg && cfg.supports ? cfg.supports : {};
         if(supports && supports.stats){
           startStatsPolling();

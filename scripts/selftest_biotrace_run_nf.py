@@ -29,6 +29,12 @@ SCHEMA_LIST_ID = (
 )
 
 
+SCHEMA_RUN_ID = (
+    "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/"
+    "biotrace_run_nf_run.schema.json"
+)
+
+
 def _run(args, cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "scripts/biotrace_run_nf.py"] + args,
@@ -36,6 +42,19 @@ def _run(args, cwd: Path) -> subprocess.CompletedProcess:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        check=False,
+    )
+
+
+def _run_separate(args, cwd: Path, env=None) -> subprocess.CompletedProcess:
+    """Run wrapper capturing stdout/stderr separately (needed for --run-json)."""
+    return subprocess.run(
+        [sys.executable, "scripts/biotrace_run_nf.py"] + args,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
         check=False,
     )
 
@@ -585,6 +604,101 @@ def main() -> int:
         ):
             if not p.exists():
                 raise AssertionError(f"expected extracted file missing (multi select): {p}")
+
+        # ------------------------------------------------------------------
+        # Case 4: --run-json output (stdout must be pure JSON)
+        # ------------------------------------------------------------------
+        outdir_rj = td_path / "out_nf_runjson"
+        extract_dir_rj = td_path / "extracted_runjson"
+        outdir_rj.mkdir(parents=True, exist_ok=True)
+        extract_dir_rj.mkdir(parents=True, exist_ok=True)
+
+        log_path_rj = td_path / "nf_args_runjson.json"
+        env_rj = os.environ.copy()
+        env_rj["QEEG_FAKE_NF_LOG"] = str(log_path_rj)
+
+        rj_run = _run_separate(
+            [
+                "--container",
+                str(container_path),
+                "--outdir",
+                str(outdir_rj),
+                "--extract-dir",
+                str(extract_dir_rj),
+                "--nf-cli",
+                str(fake_nf),
+                "--run-json",
+                "--metric",
+                "alpha/beta:Pz",
+                "--window",
+                "2.0",
+            ],
+            repo_root,
+            env=env_rj,
+        )
+        if rj_run.returncode != 0:
+            print("--- stdout ---")
+            print(rj_run.stdout)
+            print("--- stderr ---")
+            print(rj_run.stderr)
+            raise AssertionError("--run-json failed (EDF)")
+
+        # Ensure stdout is valid JSON and matches schema id.
+        djr = json.loads(rj_run.stdout)
+        if djr.get("$schema") != SCHEMA_RUN_ID:
+            raise AssertionError("--run-json missing/incorrect $schema")
+        if int(djr.get("returncode", 1)) != 0:
+            raise AssertionError(f"--run-json expected returncode=0, got: {djr.get('returncode')}")
+        dash = djr.get("dashboard", {})
+        if dash.get("enabled") is not False:
+            raise AssertionError("expected dashboard.enabled=false by default")
+
+        # ------------------------------------------------------------------
+        # Case 5: --dashboard (ensure it starts/stops without hanging)
+        # ------------------------------------------------------------------
+        outdir_dash = td_path / "out_nf_dashboard"
+        extract_dir_dash = td_path / "extracted_dashboard"
+        outdir_dash.mkdir(parents=True, exist_ok=True)
+        extract_dir_dash.mkdir(parents=True, exist_ok=True)
+        log_path_dash = td_path / "nf_args_dashboard.json"
+
+        env_dash = os.environ.copy()
+        env_dash["QEEG_FAKE_NF_LOG"] = str(log_path_dash)
+
+        rd = subprocess.run(
+            [
+                sys.executable,
+                "scripts/biotrace_run_nf.py",
+                "--container",
+                str(container_path),
+                "--outdir",
+                str(outdir_dash),
+                "--extract-dir",
+                str(extract_dir_dash),
+                "--nf-cli",
+                str(fake_nf),
+                "--dashboard",
+                "--dashboard-port",
+                "0",
+                "--metric",
+                "alpha:Pz",
+                "--window",
+                "1.0",
+            ],
+            cwd=str(repo_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env_dash,
+            check=False,
+        )
+        if rd.returncode != 0:
+            print(rd.stdout)
+            raise AssertionError("--dashboard run failed")
+        if "Dashboard:" not in rd.stdout:
+            # Wrapper prints Dashboard/Kiosk hints when it parses the dashboard startup JSON.
+            print(rd.stdout)
+            raise AssertionError("expected Dashboard URL hint in output")
 
     print("selftest_biotrace_run_nf: OK")
     return 0
