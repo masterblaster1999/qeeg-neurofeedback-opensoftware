@@ -266,17 +266,81 @@ def finite_minmax(values: Sequence[float]) -> Tuple[float, float]:
         return mn - 1.0, mx + 1.0
     return mn, mx
 
-BASE_CSS = r"""
-:root {
+BASE_CSS = r""":root {
+  /* Default: dark theme */
   --bg:#0b0f14;
-  --panel:#111827;
+  --panel:rgba(17,24,39,0.78);
+  --panel-strong:#0f1725;
+  --panel-inset:#0b0f14;
+
   --text:#e7eefc;
   --muted:#9fb0c8;
   --grid:#233044;
+
   --accent:#8fb7ff;
+  --link:var(--accent);
+
   --ok:#7fb3ff;
   --bad:#ff7fa3;
   --warn:#ffb86b;
+
+  --note-bg: rgba(255,255,255,0.04);
+  --note-border: rgba(255,255,255,0.12);
+  --note-border-strong: rgba(255,255,255,0.10);
+  --hover: rgba(255,255,255,0.03);
+  --code-bg: rgba(255,255,255,0.06);
+}
+
+/* Explicit theme override (set by JS via data-theme). */
+:root[data-theme="light"] {
+  --bg:#f8fafc;
+  --panel:rgba(255,255,255,0.92);
+  --panel-strong:#e2e8f0;
+  --panel-inset:#ffffff;
+
+  --text:#0b1220;
+  --muted:#475569;
+  --grid:#cbd5e1;
+
+  --accent:#1d4ed8;
+  --link:var(--accent);
+
+  --ok:#2563eb;
+  --bad:#be123c;
+  --warn:#b45309;
+
+  --note-bg: rgba(0,0,0,0.03);
+  --note-border: rgba(0,0,0,0.16);
+  --note-border-strong: rgba(0,0,0,0.12);
+  --hover: rgba(0,0,0,0.03);
+  --code-bg: rgba(0,0,0,0.06);
+}
+
+/* Auto light theme if the OS prefers it and the user hasn't chosen an override. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --bg:#f8fafc;
+    --panel:rgba(255,255,255,0.92);
+    --panel-strong:#e2e8f0;
+    --panel-inset:#ffffff;
+
+    --text:#0b1220;
+    --muted:#475569;
+    --grid:#cbd5e1;
+
+    --accent:#1d4ed8;
+    --link:var(--accent);
+
+    --ok:#2563eb;
+    --bad:#be123c;
+    --warn:#b45309;
+
+    --note-bg: rgba(0,0,0,0.03);
+    --note-border: rgba(0,0,0,0.16);
+    --note-border-strong: rgba(0,0,0,0.12);
+    --hover: rgba(0,0,0,0.03);
+    --code-bg: rgba(0,0,0,0.06);
+  }
 }
 
 * { box-sizing: border-box; }
@@ -300,7 +364,7 @@ h1 { margin: 0; font-size: 20px; letter-spacing: 0.2px; }
 main { padding: 18px 22px 40px; max-width: 1200px; margin: 0 auto; }
 
 .card {
-  background: rgba(17,24,39,0.78);
+  background: var(--panel);
   border: 1px solid var(--grid);
   border-radius: 12px;
   padding: 14px 16px;
@@ -308,11 +372,11 @@ main { padding: 18px 22px 40px; max-width: 1200px; margin: 0 auto; }
 }
 
 .card h2 { margin: 0 0 10px; font-size: 16px; }
-.card h3 { margin: 0 0 10px; font-size: 14px; color: #d7e4ff; }
+.card h3 { margin: 0 0 10px; font-size: 14px; color: var(--text); }
 
 .note {
-  background: rgba(255,255,255,0.04);
-  border: 1px dashed rgba(255,255,255,0.12);
+  background: var(--note-bg);
+  border: 1px dashed var(--note-border);
   border-radius: 10px;
   padding: 10px 12px;
   color: var(--muted);
@@ -323,23 +387,23 @@ main { padding: 18px 22px 40px; max-width: 1200px; margin: 0 auto; }
 
 .footer { margin-top: 18px; font-size: 12px; color: var(--muted); }
 
-a { color: var(--accent); text-decoration: none; }
+a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
 code {
-  background: rgba(255,255,255,0.06);
+  background: var(--code-bg);
   padding: 2px 6px;
   border-radius: 6px;
 }
 
 pre {
-  background: #0b0f14;
+  background: var(--panel-inset);
   border: 1px solid var(--grid);
   border-radius: 10px;
   padding: 10px;
   margin: 0;
   overflow: auto;
-  color: #dce7ff;
+  color: var(--text);
   white-space: pre-wrap;
 }
 
@@ -350,15 +414,15 @@ pre {
 }
 
 .data-table th, .data-table td {
-  border-bottom: 1px solid rgba(255,255,255,0.08);
+  border-bottom: 1px solid var(--note-border-strong);
   padding: 8px;
   vertical-align: top;
 }
 
 .data-table th {
   text-align: left;
-  background: #0f1725;
-  color: #d7e4ff;
+  background: var(--panel-strong);
+  color: var(--text);
   cursor: pointer;
   user-select: none;
 }
@@ -373,7 +437,7 @@ pre {
   z-index: 2;
 }
 
-.data-table tr:hover td { background: rgba(255,255,255,0.03); }
+.data-table tr:hover td { background: var(--hover); }
 
 /* Small controls row used by several reports above large tables */
 .table-controls {
@@ -389,7 +453,7 @@ pre {
   padding: 10px 12px;
   border-radius: 10px;
   border: 1px solid var(--grid);
-  background: #0b0f14;
+  background: var(--panel-inset);
   color: var(--text);
 }
 
@@ -397,7 +461,7 @@ pre {
   padding: 10px 12px;
   border-radius: 10px;
   border: 1px solid var(--grid);
-  background: #0f1725;
+  background: var(--panel-strong);
   color: var(--text);
   cursor: pointer;
   font-size: 13px;
@@ -422,7 +486,7 @@ pre {
 details.col-chooser, details.filter-help {
   border: 1px solid var(--grid);
   border-radius: 10px;
-  background: rgba(255,255,255,0.03);
+  background: var(--note-bg);
 }
 
 details.col-chooser > summary,
@@ -431,7 +495,7 @@ details.filter-help > summary {
   cursor: pointer;
   user-select: none;
   list-style: none;
-  color: #d7e4ff;
+  color: var(--text);
   font-size: 13px;
 }
 
@@ -440,7 +504,7 @@ details.filter-help > summary::-webkit-details-marker { display: none; }
 
 details.col-chooser[open] > summary,
 details.filter-help[open] > summary {
-  border-bottom: 1px solid rgba(255,255,255,0.10);
+  border-bottom: 1px solid var(--note-border-strong);
 }
 
 .col-chooser-box,
@@ -460,7 +524,7 @@ details.filter-help[open] > summary {
   padding: 8px 10px;
   border-radius: 10px;
   border: 1px solid var(--grid);
-  background: #0b0f14;
+  background: var(--panel-inset);
   color: var(--text);
   margin: 0 0 10px;
 }
@@ -484,10 +548,32 @@ details.filter-help[open] > summary {
 
 .col-chooser-item input { transform: translateY(0.5px); }
 
+/* Floating theme toggle (auto/dark/light) - injected by JS. */
+.qeeg-theme-toggle {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 9999;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--grid);
+  background: var(--panel-strong);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0.92;
+}
+
+.qeeg-theme-toggle:hover { background: rgba(143,183,255,0.10); opacity: 1.0; }
+.qeeg-theme-toggle:active { transform: translateY(1px); }
+
+@media print {
+  .qeeg-theme-toggle { display: none; }
+}
 """
 
 
-JS_SORT_TABLE = r"""
+JS_SORT_TABLE_BASE = r"""
 // Minimal, dependency-free sortable/filterable HTML table helpers.
 //
 // Usage:
@@ -1241,3 +1327,118 @@ qeeg_onReady(() => {
   qeeg_init_table_enhancements();
 });
 """
+
+# Standalone theme toggle (for reports that don't use JS_SORT_TABLE).
+JS_THEME_TOGGLE = r"""
+// ---------------------------------------------------------------------------
+// Theme toggle (auto / dark / light).
+//
+// - Default: follow the OS color scheme (CSS prefers-color-scheme).
+// - Click the floating button to cycle: auto -> dark -> light -> auto.
+// - Preference is persisted in localStorage when available.
+//
+// Note: This snippet intentionally avoids registering its own DOMContentLoaded
+// handler when embedded into JS_SORT_TABLE. The table helper already uses a
+// single onReady hook (qeeg_onReady).
+// ---------------------------------------------------------------------------
+(function() {
+  const KEY = 'qeeg::theme';
+
+  function safeStorage() {
+    try { return window.localStorage; } catch (e) { return null; }
+  }
+
+  function getThemeAttr() {
+    try {
+      const t = document.documentElement.getAttribute('data-theme');
+      return t ? String(t) : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function setThemeAttr(t) {
+    try {
+      if (!t) document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  }
+
+  function labelFor(t) {
+    if (t === 'dark') return 'Theme: dark';
+    if (t === 'light') return 'Theme: light';
+    return 'Theme: auto';
+  }
+
+  function nextTheme(t) {
+    if (t === '') return 'dark';
+    if (t === 'dark') return 'light';
+    return '';
+  }
+
+  function applySavedTheme() {
+    const s = safeStorage();
+    if (!s) return;
+    try {
+      const v = s.getItem(KEY);
+      if (v === 'dark' || v === 'light') setThemeAttr(v);
+    } catch (e) {}
+  }
+
+  function persistTheme(t) {
+    const s = safeStorage();
+    if (!s) return;
+    try {
+      if (!t) s.removeItem(KEY);
+      else s.setItem(KEY, t);
+    } catch (e) {}
+  }
+
+  function ensureButton() {
+    try {
+      if (!document || !document.body) return;
+      if (document.querySelector('.qeeg-theme-toggle')) return;
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'qeeg-theme-toggle';
+      btn.title = 'Toggle color theme (auto / dark / light)';
+      btn.textContent = labelFor(getThemeAttr());
+
+      btn.addEventListener('click', () => {
+        const cur = getThemeAttr();
+        const nxt = nextTheme(cur);
+        setThemeAttr(nxt);
+        persistTheme(nxt);
+        btn.textContent = labelFor(getThemeAttr());
+      });
+
+      document.body.appendChild(btn);
+    } catch (e) {}
+  }
+
+  function init() {
+    applySavedTheme();
+    ensureButton();
+  }
+
+  // Prefer the shared onReady helper when available; otherwise run immediately
+  // (most reports embed this script at the end of <body>).
+  try {
+    if (typeof qeeg_onReady === 'function') {
+      qeeg_onReady(init);
+    } else {
+      init();
+      // If body wasn't available yet, try again on the next tick.
+      if (!document || !document.body) {
+        try { setTimeout(init, 0); } catch (e) {}
+      }
+    }
+  } catch (e) {
+    try { init(); } catch (e2) {}
+  }
+})();
+"""
+
+# Back-compat export: most reports import JS_SORT_TABLE, which now includes the theme toggle.
+JS_SORT_TABLE = JS_SORT_TABLE_BASE + "\n\n" + JS_THEME_TOGGLE

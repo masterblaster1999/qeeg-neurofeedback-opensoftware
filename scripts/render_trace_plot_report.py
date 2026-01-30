@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from report_common import (
     BASE_CSS,
+    JS_THEME_TOGGLE,
     e as _e,
     is_dir as _is_dir,
     posix_relpath as _posix_relpath,
@@ -222,8 +223,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     css = BASE_CSS + r"""
 .kv { width: 100%; border-collapse: collapse; font-size: 13px; }
-.kv th, .kv td { border-bottom: 1px solid rgba(255,255,255,0.08); padding: 8px; text-align: left; vertical-align: top; }
-.kv th { width: 240px; color: #d7e4ff; background: #0f1725; }
+.kv th, .kv td { border-bottom: 1px solid var(--note-border-strong); padding: 8px; text-align: left; vertical-align: top; }
+.kv th { width: 240px; color: var(--text); background: var(--panel-strong); }
 
 .svg-frame {
   background: #ffffff;
@@ -276,6 +277,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
   <div class=\"footer\">This HTML makes no network requests.</div>
 </main>
+<script>
+{JS_THEME_TOGGLE}
+</script>
 </body>
 </html>
 """
