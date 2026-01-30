@@ -1815,20 +1815,65 @@ def _make_spectrogram(outdir: Path) -> None:
     )
 
 
-def _make_nf(outdir: Path) -> None:
-    headers = ["t_end_sec", "metric", "threshold", "reward", "reward_rate", "artifact_ready", "artifact", "bad_channels", "phase", "raw_reward", "band", "channel"]
+def _make_nf(
+    outdir: Path,
+    *,
+    protocol: str = "alpha_up_pz",
+    band: str = "alpha",
+    channel: str = "Pz",
+    threshold: float = 0.15,
+    timestamp_utc: str = "2026-01-01T00:00:00Z",
+) -> None:
+    # Synthetic neurofeedback run outputs (nf_feedback.csv + BIDS-style derived events).
+    headers = [
+        "t_end_sec",
+        "metric",
+        "metric_raw",
+        "threshold",
+        "threshold_desired",
+        "reward",
+        "reward_rate",
+        "feedback_raw",
+        "reward_value",
+        "artifact_ready",
+        "artifact",
+        "bad_channels",
+        "phase",
+        "raw_reward",
+        "metric_z",
+        "threshold_z",
+        "metric_z_ref",
+        "threshold_z_ref",
+        "band",
+        "channel",
+    ]
     rows: List[Dict[str, object]] = []
     dt = 0.25
-    thr = 0.15
+    thr = float(threshold)
     rr = 0.0
-    alpha = 0.02  # smoothing for reward_rate
+    alpha_rr = 0.02  # smoothing for reward_rate
+
+    # Exponential smoothing for the displayed metric (simulate metric_smooth_seconds > 0).
+    alpha_metric = 0.15
+    metric_sm = 0.0
+
+    # Track flags for derived events.
+    t_end_all: List[float] = []
+    reward_all: List[int] = []
+    artifact_all: List[int] = []
+    phase_all: List[str] = []
+
     for i in range(600):
         t = (i + 1) * dt
-        metric = 0.2 * math.sin(2 * math.pi * 0.07 * t) + 0.05 * random.uniform(-1.0, 1.0)
+        metric_raw = 0.2 * math.sin(2 * math.pi * 0.07 * t) + 0.05 * random.uniform(-1.0, 1.0)
+        metric_sm = (1.0 - alpha_metric) * metric_sm + alpha_metric * metric_raw
+        metric = metric_sm
+
         raw_reward = 1 if metric > thr else 0
         # Simple dwell/refractory not modeled; use raw_reward as reward for the smoke test.
         reward = raw_reward
-        rr = (1.0 - alpha) * rr + alpha * float(reward)
+
+        rr = (1.0 - alpha_rr) * rr + alpha_rr * float(reward)
 
         # Artifact gate "ready" after 5s, occasional artifacts.
         artifact_ready = 1 if t >= 5.0 else 0
@@ -1842,35 +1887,134 @@ def _make_nf(outdir: Path) -> None:
             block = int((t - 10.0) // 5.0)
             phase = "train" if (block % 2 == 0) else "rest"
 
+        # Simple continuous feedback + reward value signals.
+        feedback_raw = metric - thr
+        reward_value = max(0.0, feedback_raw) if reward else 0.0
+
+        # Simple z-score proxies (not physiologically meaningful; for renderer smoke coverage).
+        metric_z = metric / 0.1
+        threshold_z = thr / 0.1
+        metric_z_ref = 0.0
+        threshold_z_ref = 0.0
+
         rows.append(
             {
                 "t_end_sec": t,
                 "metric": metric,
+                "metric_raw": metric_raw,
                 "threshold": thr,
+                "threshold_desired": thr,
                 "reward": reward,
                 "reward_rate": rr,
+                "feedback_raw": feedback_raw,
+                "reward_value": reward_value,
                 "artifact_ready": artifact_ready,
                 "artifact": artifact,
                 "bad_channels": bad_channels,
                 "phase": phase,
                 "raw_reward": raw_reward,
-                "band": "alpha",
-                "channel": "Pz",
+                "metric_z": metric_z,
+                "threshold_z": threshold_z,
+                "metric_z_ref": metric_z_ref,
+                "threshold_z_ref": threshold_z_ref,
+                "band": band,
+                "channel": channel,
             }
         )
 
+        t_end_all.append(t)
+        reward_all.append(int(reward))
+        artifact_all.append(int(artifact))
+        phase_all.append(phase)
+
     _write_csv(outdir / "nf_feedback.csv", headers, rows)
+
+    # Build BIDS-style derived events (baseline/train/rest + reward + artifact).
+    events: List[Dict[str, object]] = []
+
+    def _add_flag_segments(flags: List[int], label: str) -> None:
+        if not flags:
+            return
+        active = False
+        start = 0.0
+        last_end = 0.0
+        for i, f in enumerate(flags):
+            end = t_end_all[i]
+            st = t_end_all[i - 1] if i > 0 else max(0.0, end - dt)
+            if f == 1 and not active:
+                start = st
+                active = True
+            if f != 1 and active:
+                events.append({"onset": start, "duration": max(0.0, st - start), "trial_type": label})
+                active = False
+            last_end = end
+        if active:
+            events.append({"onset": start, "duration": max(0.0, last_end - start), "trial_type": label})
+
+    # Baseline segment (matches qeeg_nf_cli's NF:Baseline convention).
+    events.append({"onset": 0.0, "duration": 10.0, "trial_type": "NF:Baseline"})
+
+    _add_flag_segments([1 if p == "train" else 0 for p in phase_all], "NF:Train")
+    _add_flag_segments([1 if p == "rest" else 0 for p in phase_all], "NF:Rest")
+    _add_flag_segments(reward_all, "NF:Reward")
+    _add_flag_segments(artifact_all, "NF:Artifact")
+
+    # Deterministic ordering (BIDS recommends sorting by onset).
+    events.sort(key=lambda d: (float(d.get("onset", 0.0)), float(d.get("duration", 0.0))))
+
+    # Write events TSV (BIDS columns).
+    p_tsv = outdir / "nf_derived_events.tsv"
+    with p_tsv.open("w", encoding="utf-8", newline="") as f:
+        f.write("onset\tduration\ttrial_type\n")
+        for ev in events:
+            f.write(f"{float(ev['onset']):.6f}\t{float(ev['duration']):.6f}\t{ev['trial_type']}\n")
+
+    # Write companion CSV (legacy qeeg events CSV format).
+    p_csv = outdir / "nf_derived_events.csv"
+    csv_rows = [{"onset_sec": float(ev["onset"]), "duration_sec": float(ev["duration"]), "text": ev["trial_type"]} for ev in events]
+    _write_csv(p_csv, ["onset_sec", "duration_sec", "text"], csv_rows)
+
+    # Write a minimal BIDS-style sidecar describing the events columns + common trial_type levels.
+    _write_json(
+        outdir / "nf_derived_events.json",
+        {
+            "onset": {
+                "LongName": "Event onset",
+                "Description": "Event onset time, in seconds relative to the start of the recording.",
+                "Units": "s",
+            },
+            "duration": {
+                "LongName": "Event duration",
+                "Description": "Event duration, in seconds measured from onset.",
+                "Units": "s",
+            },
+            "trial_type": {
+                "LongName": "Event label",
+                "Description": "Event label, typically derived from the recording annotations or produced by a processing pipeline. Levels are listed under Levels for convenience.",
+                "Levels": {
+                    "NF:Baseline": "Baseline estimation segment.",
+                    "NF:Train": "Neurofeedback training block.",
+                    "NF:Rest": "Neurofeedback rest block (reinforcement paused).",
+                    "NF:Reward": "Neurofeedback reward active.",
+                    "NF:Artifact": "Artifact gate active (data considered contaminated).",
+                },
+            },
+        },
+    )
+
     _write_json(
         outdir / "nf_summary.json",
         {
-            "protocol": "alpha_up_pz",
-            "metric_spec": {"type": "band", "band": "alpha", "channel": "Pz"},
+            "protocol": protocol,
+            "metric_spec": {"type": "band", "band": band, "channel": channel},
             "fs_hz": 250,
             "baseline_seconds": 10.0,
             "train_block_seconds": 5.0,
             "rest_block_seconds": 5.0,
+            "metric_smooth_seconds": 1.0,
             "dwell_seconds": 0.0,
             "refractory_seconds": 0.0,
+            "duration_seconds": float(t_end_all[-1]) if t_end_all else 0.0,
         },
     )
     _write_json(
@@ -1882,12 +2026,20 @@ def _make_nf(outdir: Path) -> None:
             "BuildType": "unknown",
             "Compiler": "unknown",
             "CppStandard": "c++17",
-            "TimestampUTC": "selftest",
+            "TimestampUTC": timestamp_utc,
             "input_path": "synthetic",
             "OutputDir": str(outdir),
-            "Outputs": ["nf_feedback.csv", "nf_summary.json", "nf_run_meta.json"],
+            "Outputs": [
+                "nf_feedback.csv",
+                "nf_summary.json",
+                "nf_run_meta.json",
+                "nf_derived_events.tsv",
+                "nf_derived_events.csv",
+                "nf_derived_events.json",
+            ],
         },
     )
+
 
 
 def _make_pac(outdir: Path) -> None:
@@ -2269,7 +2421,8 @@ def _run_renderers(root: Path) -> None:
     out_conn_pair = root / "out_conn_pair"
     out_qc = root / "out_qc"
     out_art = root / "out_art"
-    out_nf = root / "out_nf"
+    out_nf_a = root / "out_nf_a"
+    out_nf_b = root / "out_nf_b"
     out_pac = root / "out_pac"
     out_epoch = root / "out_epoch"
     out_ms = root / "out_ms"
@@ -2287,7 +2440,23 @@ def _run_renderers(root: Path) -> None:
     _make_connectivity_pair(out_conn_pair)
     _make_channel_qc(out_qc)
     _make_artifacts(out_art)
-    _make_nf(out_nf)
+    # Two separate NF runs (exercise multi-session dashboards).
+    _make_nf(
+        out_nf_a,
+        protocol="alpha_up_pz",
+        band="alpha",
+        channel="Pz",
+        threshold=0.15,
+        timestamp_utc="2026-01-01T00:00:00Z",
+    )
+    _make_nf(
+        out_nf_b,
+        protocol="theta_down_fz",
+        band="theta",
+        channel="Fz",
+        threshold=0.10,
+        timestamp_utc="2026-01-02T00:00:00Z",
+    )
     _make_pac(out_pac)
     _make_epoch(out_epoch)
     _make_microstates(out_ms)
@@ -2330,10 +2499,15 @@ def _run_renderers(root: Path) -> None:
     _assert_contains(out_art / "artifacts_report.html", "downloadTableCSV")
     _assert_contains(out_art / "artifacts_report.html", "Download CSV")
 
-    assert render_nf_feedback_report.main(["--input", str(out_nf)]) == 0
-    _assert_file(out_nf / "nf_feedback_report.html")
-    _assert_contains(out_nf / "nf_feedback_report.html", "downloadTableCSV")
-    _assert_contains(out_nf / "nf_feedback_report.html", "Download CSV")
+    for _d in (out_nf_a, out_nf_b):
+        assert render_nf_feedback_report.main(["--input", str(_d)]) == 0
+        _assert_file(_d / "nf_feedback_report.html")
+        _assert_contains(_d / "nf_feedback_report.html", "downloadTableCSV")
+        _assert_contains(_d / "nf_feedback_report.html", "Download CSV")
+        _assert_contains(_d / "nf_feedback_report.html", "Derived events")
+        _assert_contains(_d / "nf_feedback_report.html", "nf_derived_events.tsv")
+        _assert_contains(_d / "nf_feedback_report.html", "Z-scores")
+        _assert_contains(_d / "nf_feedback_report.html", "Continuous feedback")
 
     assert render_pac_report.main(["--input", str(out_pac)]) == 0
     _assert_file(out_pac / "pac_report.html")
@@ -2420,6 +2594,13 @@ def _run_renderers(root: Path) -> None:
     assert any((r.get("kind") == "quality") for r in dash_idx.get("reports", []))
     assert any((r.get("kind") == "spectrogram") for r in dash_idx.get("reports", []))
     assert any((r.get("kind") == "topomap") for r in dash_idx.get("reports", []))
+    # When 2+ NF runs are present, the dashboard should also emit an aggregated
+    # sessions overview.
+    assert any((r.get("kind") == "nf_sessions_dashboard") for r in dash_idx.get("reports", []))
+    nf_sessions_dash = root / "nf_sessions_dashboard.html"
+    _assert_file(nf_sessions_dash, min_bytes=400)
+    _assert_contains(nf_sessions_dash, "Neurofeedback sessions")
+    _assert_contains(dash_out, "Neurofeedback sessions dashboard")
     _assert_contains(dash_out, "Spectrogram runs")
     _assert_contains(dash_out, "Topomap runs")
 
@@ -2445,6 +2626,13 @@ def _run_renderers(root: Path) -> None:
     _assert_file(extracted_index, min_bytes=200)
     assert validate_reports_dashboard_index.main([str(extracted_index), "--check-files"]) == 0
 
+    # The extracted bundle should include the aggregated NF sessions dashboard.
+    _assert_file(extract_dir / "nf_sessions_dashboard.html", min_bytes=400)
+
+    extracted_nf_sessions = extract_dir / "nf_sessions_dashboard.html"
+    _assert_file(extracted_nf_sessions, min_bytes=400)
+    _assert_contains(extracted_nf_sessions, "Sessions")
+
     # Convenience wrapper: verify+extract+open script (run in no-serve/no-open mode for tests).
     import open_reports_bundle
     extract_dir2 = root / "bundle_open_extract"
@@ -2457,6 +2645,7 @@ def _run_renderers(root: Path) -> None:
     _assert_contains(dash_out, "BIDS scan runs")
     _assert_contains(dash_out, "Epoch runs")
     _assert_contains(dash_out, "Connectivity pair runs")
+    _assert_contains(dash_out, "Neurofeedback sessions dashboard")
     # Dashboard should include the shared table helpers for sorting/filtering/export.
     _assert_contains(dash_out, "sortTable")
     _assert_contains(dash_out, "filterTable")
@@ -2470,7 +2659,9 @@ def _run_renderers(root: Path) -> None:
         out_conn_pair / "connectivity_pair_report.html",
         out_qc / "channel_qc_report.html",
         out_art / "artifacts_report.html",
-        out_nf / "nf_feedback_report.html",
+        out_nf_a / "nf_feedback_report.html",
+        out_nf_b / "nf_feedback_report.html",
+        root / "nf_sessions_dashboard.html",
         out_pac / "pac_report.html",
         out_epoch / "epoch_report.html",
         out_ms / "microstates_report.html",

@@ -338,6 +338,10 @@ def _safe_arcname(name: str) -> str:
     if not n:
         raise RuntimeError("Invalid empty ZIP entry name")
     parts = [p for p in PurePosixPath(n).parts if p not in ("", ".")]
+    # Reject names that collapse to an empty path after normalization
+    # (e.g. "."), since ZipFile requires a non-empty entry name.
+    if not parts:
+        raise RuntimeError(f"Invalid ZIP entry name (empty after normalization): {name!r}")
     if any(p == ".." for p in parts):
         raise RuntimeError(f"Refusing unsafe ZIP entry name containing '..': {name}")
     # Windows drive letters.
@@ -460,7 +464,14 @@ def create_bundle(
                 _require_under_base(d, paths.base_dir, label=f"outdir {d}")
             except Exception:
                 continue
-            arc_dir = _safe_arcname(_zip_relpath(d, paths.base_dir))
+            rel = _zip_relpath(d, paths.base_dir)
+            # If the outdir is the bundler's base directory, a directory entry
+            # is unnecessary and (if included) can collapse to an empty arcname
+            # after normalization. Skip it.
+            if rel in ("", "."):
+                continue
+
+            arc_dir = _safe_arcname(rel)
             _write_dir_entry(zf, arc_dir)
             if verbose:
                 log.append(f"dir  {arc_dir}/")

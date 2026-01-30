@@ -17,6 +17,7 @@ By default it will also (re)generate any missing reports using:
   - scripts/render_pac_report.py
   - scripts/render_epoch_report.py
   - scripts/render_nf_feedback_report.py
+  - scripts/render_nf_sessions_dashboard.py (aggregated, multi-session)
   - scripts/render_connectivity_report.py
   - scripts/render_connectivity_pair_report.py
   - scripts/render_microstates_report.py
@@ -478,6 +479,7 @@ def _build_dashboard(items: Sequence[ReportItem], out_path: str, roots: Sequence
         ("trace_plot", "Trace plot runs"),
         ("spectrogram", "Spectrogram runs"),
         ("bids_scan", "BIDS scan runs"),
+        ("nf_sessions_dashboard", "Neurofeedback sessions dashboard"),
         ("nf", "Neurofeedback runs"),
         ("pac", "PAC runs"),
         ("epoch", "Epoch runs"),
@@ -993,6 +995,92 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     items: List[ReportItem] = []
 
+    def _maybe_build_nf_sessions_dashboard() -> Optional[ReportItem]:
+        """Optionally generate an aggregated neurofeedback sessions dashboard.
+
+        This is only generated when 2+ neurofeedback runs are detected (or if an
+        existing nf_sessions_dashboard.html is already present in the dashboard
+        output directory).
+        """
+
+        sess_out = os.path.join(out_dir, "nf_sessions_dashboard.html")
+        have_existing = os.path.exists(sess_out)
+
+        # Avoid creating extra files for single-session folders, but still link
+        # if the user already has one.
+        if len(nf_dirs) < 2 and not have_existing:
+            return None
+
+        if (not args.force) and have_existing:
+            return ReportItem(
+                kind="nf_sessions_dashboard",
+                outdir=os.path.abspath(out_dir),
+                report_path=os.path.abspath(sess_out),
+                status="skipped",
+                message="exists",
+            )
+
+        try:
+            import render_nf_sessions_dashboard as _nfs  # type: ignore
+        except Exception as e:
+            return ReportItem(
+                kind="nf_sessions_dashboard",
+                outdir=os.path.abspath(out_dir),
+                report_path=os.path.abspath(sess_out),
+                status="error",
+                message=f"renderer not importable: {e}",
+            )
+
+        argv2: List[str] = [str(d) for d in sorted(nf_dirs)]
+        argv2 += ["--out", str(sess_out)]
+        if args.no_render:
+            # In no-render mode, don't create missing per-run reports.
+            argv2.append("--no-generate-reports")
+
+        try:
+            rc = int(_nfs.main(argv2))  # type: ignore[attr-defined]
+        except SystemExit as e:
+            code = getattr(e, "code", None)
+            if code is None:
+                rc = 0
+            elif isinstance(code, int):
+                rc = code
+            else:
+                rc = 1
+        except Exception as e:
+            return ReportItem(
+                kind="nf_sessions_dashboard",
+                outdir=os.path.abspath(out_dir),
+                report_path=os.path.abspath(sess_out),
+                status="error",
+                message=str(e),
+            )
+
+        if rc != 0:
+            return ReportItem(
+                kind="nf_sessions_dashboard",
+                outdir=os.path.abspath(out_dir),
+                report_path=os.path.abspath(sess_out),
+                status="error",
+                message=f"renderer returned {rc}",
+            )
+
+        if not os.path.exists(sess_out):
+            return ReportItem(
+                kind="nf_sessions_dashboard",
+                outdir=os.path.abspath(out_dir),
+                report_path=os.path.abspath(sess_out),
+                status="error",
+                message="report not created",
+            )
+
+        return ReportItem(
+            kind="nf_sessions_dashboard",
+            outdir=os.path.abspath(out_dir),
+            report_path=os.path.abspath(sess_out),
+            status="ok",
+        )
+
     def add_existing(kind: str, outdir: str, report_name: str) -> None:
         report_path = os.path.join(outdir, report_name)
         if os.path.exists(report_path):
@@ -1070,6 +1158,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             items.append(_render_report("channel_qc", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(art_dirs):
             items.append(_render_report("artifacts", d, force=bool(args.force), renderer_mods=renderer_mods))
+
+    # Aggregated NF sessions dashboard (if applicable).
+    nf_sess = _maybe_build_nf_sessions_dashboard()
+    if nf_sess is not None:
+        items.append(nf_sess)
 
     html_doc = _build_dashboard(items, out_path, roots)
     with open(out_path, "w", encoding="utf-8") as f:
