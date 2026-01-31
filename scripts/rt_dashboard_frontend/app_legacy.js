@@ -97,6 +97,7 @@ Transport strategy:
 
   var nfCanvas = $('nfChart');
   var bpCanvas = $('bpChart');
+  var bpHeatCanvas = $('bpHeatmap');
   var topoCanvas = $('topoCanvas');
 
   var bandSel = $('bandSel');
@@ -107,6 +108,8 @@ Transport strategy:
 
   var vminEl = $('vmin');
   var vmaxEl = $('vmax');
+  var hmVminEl = $('hmVmin');
+  var hmVmaxEl = $('hmVmax');
 
   if(!nfCanvas || !bpCanvas || !topoCanvas){
     // Not on the expected page.
@@ -116,6 +119,7 @@ Transport strategy:
   var nfCtx = nfCanvas.getContext('2d');
   var bpCtx = bpCanvas.getContext('2d');
   var topoCtx = topoCanvas.getContext('2d');
+  var bpHeatCtx = (bpHeatCanvas && bpHeatCanvas.getContext) ? bpHeatCanvas.getContext('2d') : null;
 
   function setBadge(el, txt, cls){
     if(!el) return;
@@ -185,7 +189,7 @@ Transport strategy:
     applyingRemote: false,
     pendingUi: null,
     nf: {frames: [], lastT: -Infinity},
-    bp: {meta: null, frames: [], lastT: -Infinity, rollingMin: null, rollingMax: null, tmpCanvas: null, tmpW: 0, tmpH: 0, electrodesPx: []},
+    bp: {meta: null, frames: [], lastT: -Infinity, rollingMin: null, rollingMax: null, heatRollingMin: null, heatRollingMax: null, tmpCanvas: null, tmpW: 0, tmpH: 0, electrodesPx: []},
     art: {frames: [], latest: null, lastT: -Infinity}
   };
 
@@ -220,6 +224,7 @@ Transport strategy:
         dirtyBp = false;
         drawTopo();
         drawBandpowerSeries();
+        drawBandpowerHeatmap();
       }
     });
   }
@@ -362,6 +367,29 @@ Transport strategy:
     return {frames: [msg], reset: false};
   }
 
+  function artifactAtTime(t){
+    var fr = state.art.frames;
+    if(!fr || !fr.length) return null;
+    var lo = 0;
+    var hi = fr.length - 1;
+    var best = 0;
+    while(lo <= hi){
+      var mid = (lo + hi) >> 1;
+      var tt = fr[mid].t;
+      if(tt === null || tt === undefined || !isFinite(tt)){
+        lo = mid + 1;
+        continue;
+      }
+      if(tt <= t){
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return fr[best];
+  }
+
   // ---------- Rendering ----------
 
   function drawNfChart(){
@@ -495,11 +523,37 @@ Transport strategy:
     return [r,g,b];
   }
 
+  function lerp(a, b, t){
+    return a + (b - a) * t;
+  }
+
+  function rgbLerp(c0, c1, t){
+    return [
+      Math.round(lerp(c0[0], c1[0], t)),
+      Math.round(lerp(c0[1], c1[1], t)),
+      Math.round(lerp(c0[2], c1[2], t)),
+    ];
+  }
+
   function valueToRgb(v, vmin, vmax){
     if(v===null || v===undefined || !isFinite(v) || !(vmax>vmin)) return [42,52,64];
     var t = (v - vmin) / (vmax - vmin);
     if(t<0) t=0;
     if(t>1) t=1;
+
+    if(vmin < 0 && vmax > 0){
+      var mid = (0 - vmin) / (vmax - vmin);
+      var blue = [59, 76, 192];
+      var neutral = [247, 247, 247];
+      var red = [180, 4, 38];
+      if(t <= mid){
+        var tt = (mid > 1e-9) ? (t / mid) : 0;
+        return rgbLerp(blue, neutral, tt);
+      }
+      var tt2 = ((1 - mid) > 1e-9) ? ((t - mid) / (1 - mid)) : 0;
+      return rgbLerp(neutral, red, tt2);
+    }
+
     var hue = (1 - t) * 240;
     return hslToRgb(hue, 0.90, 0.55);
   }
@@ -798,6 +852,176 @@ Transport strategy:
     bpCtx.fillText('t: ' + tMin.toFixed(1) + '–' + tNow.toFixed(1) + 's', 12, h-6);
   }
 
+  function drawBandpowerHeatmap(){
+    if(!bpHeatCanvas || !bpHeatCtx) return;
+
+    var meta = state.bp.meta;
+    resizeCanvasTo(bpHeatCanvas);
+    var w = bpHeatCanvas.width;
+    var h = bpHeatCanvas.height;
+    bpHeatCtx.clearRect(0,0,w,h);
+    bpHeatCtx.fillStyle = '#071018';
+    bpHeatCtx.fillRect(0,0,w,h);
+
+    var dpr = window.devicePixelRatio || 1;
+
+    if(!meta || !state.bp.frames.length){
+      bpHeatCtx.fillStyle = '#9fb0c3';
+      bpHeatCtx.font = String(Math.round(12*dpr)) + 'px system-ui';
+      bpHeatCtx.fillText('Waiting for bandpower_timeseries.csv …', 14*dpr, 24*dpr);
+      if(hmVminEl) hmVminEl.textContent = 'min: —';
+      if(hmVmaxEl) hmVmaxEl.textContent = 'max: —';
+      return;
+    }
+
+    var bands = meta.bands || [];
+    var channels = meta.channels || [];
+    var nBands = bands.length || 0;
+    var nCh = channels.length || 0;
+    if(!nBands || !nCh){
+      if(hmVminEl) hmVminEl.textContent = 'min: —';
+      if(hmVmaxEl) hmVmaxEl.textContent = 'max: —';
+      return;
+    }
+
+    var chName = (chSel && chSel.value) ? chSel.value : (channels.length ? channels[0] : '');
+    var cIdx = 0;
+    for(var ci=0;ci<channels.length;ci++){
+      if(channels[ci] === chName){ cIdx = ci; break; }
+    }
+
+    var frames = state.bp.frames;
+    var tNow = frames[frames.length-1].t;
+    var tMin = Math.max(frames[0].t, tNow - state.winSec);
+
+    var vis = [];
+    var need = nBands * nCh;
+    for(var i=0;i<frames.length;i++){
+      var f = frames[i];
+      if(f && f.t !== null && f.t !== undefined && isFinite(f.t) && f.t >= tMin && f.values && f.values.length >= need){
+        vis.push(f);
+      }
+    }
+    if(vis.length < 2){
+      if(hmVminEl) hmVminEl.textContent = 'min: —';
+      if(hmVmaxEl) hmVmaxEl.textContent = 'max: —';
+      return;
+    }
+
+    var left = 68*dpr;
+    var right = 10*dpr;
+    var top = 12*dpr;
+    var bottom = 24*dpr;
+    var plotW = Math.max(1, w - left - right);
+    var plotH = Math.max(1, h - top - bottom);
+    var rowH = plotH / nBands;
+
+    var maxCols = Math.max(50, Math.floor(plotW));
+    var step = Math.max(1, Math.ceil(vis.length / maxCols));
+
+    var vmin = Infinity;
+    var vmax = -Infinity;
+    for(i=0;i<vis.length;i+=step){
+      var vv = vis[i].values;
+      for(var b=0;b<nBands;b++){
+        var val = xformValue(vv[b*nCh + cIdx]);
+        if(val !== null && val !== undefined && isFinite(val)){
+          if(val < vmin) vmin = val;
+          if(val > vmax) vmax = val;
+        }
+      }
+    }
+    if(!(vmax > vmin)){
+      vmin = 0;
+      vmax = 1;
+    } else {
+      var pad = 0.02*(vmax - vmin);
+      vmin -= pad;
+      vmax += pad;
+    }
+
+    if(scaleSel && scaleSel.value === 'fixed'){
+      if(state.bp.heatRollingMin===null || state.bp.heatRollingMax===null){
+        state.bp.heatRollingMin = vmin;
+        state.bp.heatRollingMax = vmax;
+      } else {
+        state.bp.heatRollingMin = 0.98*state.bp.heatRollingMin + 0.02*vmin;
+        state.bp.heatRollingMax = 0.98*state.bp.heatRollingMax + 0.02*vmax;
+      }
+      vmin = state.bp.heatRollingMin;
+      vmax = state.bp.heatRollingMax;
+    } else {
+      state.bp.heatRollingMin = null;
+      state.bp.heatRollingMax = null;
+    }
+
+    if(hmVminEl) hmVminEl.textContent = 'min: ' + fmt(vmin);
+    if(hmVmaxEl) hmVmaxEl.textContent = 'max: ' + fmt(vmax);
+
+    bpHeatCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+    bpHeatCtx.lineWidth = 1;
+    for(i=0;i<=nBands;i++){
+      var yy = top + i*rowH;
+      bpHeatCtx.beginPath();
+      bpHeatCtx.moveTo(left, yy);
+      bpHeatCtx.lineTo(left + plotW, yy);
+      bpHeatCtx.stroke();
+    }
+    for(i=0;i<=4;i++){
+      var xx = left + i*plotW/4;
+      bpHeatCtx.beginPath();
+      bpHeatCtx.moveTo(xx, top);
+      bpHeatCtx.lineTo(xx, top + plotH);
+      bpHeatCtx.stroke();
+    }
+
+    var tSpan = (tNow - tMin) || 1;
+    for(i=0;i<vis.length;i+=step){
+      f = vis[i];
+      var t = f.t;
+      var t2 = (i+step < vis.length) ? vis[i+step].t : tNow;
+      var x1 = left + (t - tMin)/tSpan * plotW;
+      var x2 = left + (t2 - tMin)/tSpan * plotW;
+      var bw = Math.max(1, Math.ceil(x2 - x1));
+      var vals = f.values;
+
+      for(b=0;b<nBands;b++){
+        val = xformValue(vals[b*nCh + cIdx]);
+        var y0 = top + (nBands - 1 - b)*rowH;
+        var rgb = valueToRgb(val, vmin, vmax);
+        bpHeatCtx.fillStyle = 'rgb(' + String(rgb[0]) + ',' + String(rgb[1]) + ',' + String(rgb[2]) + ')';
+        bpHeatCtx.fillRect(x1, y0, bw, Math.ceil(rowH));
+      }
+
+      var aAt = artifactAtTime(t);
+      if(aAt && aAt.bad){
+        bpHeatCtx.fillStyle = 'rgba(255, 92, 92, 0.18)';
+        bpHeatCtx.fillRect(x1, top, bw, plotH);
+      }
+    }
+
+    bpHeatCtx.strokeStyle = 'rgba(255,255,255,0.25)';
+    bpHeatCtx.lineWidth = 1.5*dpr;
+    bpHeatCtx.strokeRect(left, top, plotW, plotH);
+
+    bpHeatCtx.fillStyle = '#9fb0c3';
+    bpHeatCtx.font = String(Math.round(11*dpr)) + 'px system-ui';
+    bpHeatCtx.textAlign = 'right';
+    bpHeatCtx.textBaseline = 'middle';
+    for(b=0;b<nBands;b++){
+      var ym = top + (nBands - 1 - b + 0.5)*rowH;
+      bpHeatCtx.fillText(bands[b], left - 8*dpr, ym);
+    }
+
+    var xm = (xformSel && xformSel.value) ? xformSel.value : 'linear';
+    var xLabel = (xm && xm !== 'linear') ? (' (' + xm + ')') : '';
+    bpHeatCtx.textAlign = 'left';
+    bpHeatCtx.textBaseline = 'top';
+    bpHeatCtx.fillText(chName + xLabel, left, 6*dpr);
+    bpHeatCtx.textBaseline = 'alphabetic';
+    bpHeatCtx.fillText('t: ' + tMin.toFixed(1) + '–' + tNow.toFixed(1) + 's', left, h - 6*dpr);
+  }
+
   // ---------- Networking ----------
 
   function xhrJson(method, url, body, cb, headers){
@@ -1039,7 +1263,7 @@ Transport strategy:
     if(state.paused) return;
     try {
       var un = unpackMsg(raw);
-      if(un.reset){ state.bp.frames = []; state.bp.lastT = -Infinity; state.bp.rollingMin = null; state.bp.rollingMax = null; }
+      if(un.reset){ state.bp.frames = []; state.bp.lastT = -Infinity; state.bp.rollingMin = null; state.bp.rollingMax = null; state.bp.heatRollingMin = null; state.bp.heatRollingMax = null; }
       for(var i=0;i<un.frames.length;i++){
         var f = un.frames[i];
         if(!f || typeof f !== 'object') continue;
@@ -1227,15 +1451,16 @@ Transport strategy:
         state.winSec = parseFloat(winSel.value || '60') || 60;
         schedulePushUiState();
         dirtyNf = true;
+        dirtyBp = true;
         scheduleRender();
       };
     }
 
-    if(bandSel){ bandSel.onchange = function(){ dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
-    if(chSel){ chSel.onchange = function(){ dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
+    if(bandSel){ bandSel.onchange = function(){ state.bp.heatRollingMin=null; state.bp.heatRollingMax=null; dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
+    if(chSel){ chSel.onchange = function(){ state.bp.heatRollingMin=null; state.bp.heatRollingMax=null; dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
     if(lblSel){ lblSel.onchange = function(){ dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
-    if(xformSel){ xformSel.onchange = function(){ state.bp.rollingMin=null; state.bp.rollingMax=null; dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
-    if(scaleSel){ scaleSel.onchange = function(){ state.bp.rollingMin=null; state.bp.rollingMax=null; dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
+    if(xformSel){ xformSel.onchange = function(){ state.bp.rollingMin=null; state.bp.rollingMax=null; state.bp.heatRollingMin=null; state.bp.heatRollingMax=null; dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
+    if(scaleSel){ scaleSel.onchange = function(){ state.bp.rollingMin=null; state.bp.rollingMax=null; state.bp.heatRollingMin=null; state.bp.heatRollingMax=null; dirtyBp = true; scheduleRender(); schedulePushUiState(); }; }
 
     // Click-to-select channel on topography
     topoCanvas.addEventListener('click', function(ev){
@@ -1262,6 +1487,7 @@ Transport strategy:
         var name = meta.channels[best];
         if(name && chSel){
           chSel.value = name;
+          state.bp.heatRollingMin=null; state.bp.heatRollingMax=null;
           dirtyBp = true;
           scheduleRender();
           schedulePushUiState();

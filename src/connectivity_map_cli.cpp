@@ -1,5 +1,6 @@
 #include "qeeg/bmp_writer.hpp"
 #include "qeeg/cli_input.hpp"
+#include "qeeg/connectivity_graph.hpp"
 #include "qeeg/montage.hpp"
 #include "qeeg/run_meta.hpp"
 #include "qeeg/svg_utils.hpp"
@@ -58,6 +59,11 @@ static void print_help() {
   std::cout
     << "qeeg_connectivity_map_cli\n\n"
     << "Render qEEG connectivity \"brain maps\" (scalp network diagrams) as SVG.\n"
+    << "\n"
+    << "In addition to the SVG map, this tool writes small summary tables:\n"
+    << "  - connectivity_edges_used.csv (filtered/trimmed edges used for the map)\n"
+    << "  - connectivity_nodes.csv (per-node degree/strength summary)\n"
+    << "  - connectivity_region_pairs.csv (coarse lobe/hemisphere region summary)\n"
     << "\n"
     << "Typical inputs:\n"
     << "  - *_pairs.csv from qeeg_coherence_cli (coherence_pairs.csv / imcoh_pairs.csv)\n"
@@ -533,10 +539,108 @@ static void write_svg(const Args& args,
   out << "</svg>\n";
 }
 
-static void write_html_report(const Args& args, const std::string& svg_file) {
+static void write_edges_used_csv(const std::string& outpath, const std::vector<Edge>& edges) {
+  std::ofstream out(outpath);
+  if (!out) throw std::runtime_error("Failed to write: " + outpath);
+  out << "channel_a,channel_b,weight\n";
+  out << std::setprecision(12);
+  for (const auto& e : edges) {
+    out << e.a << "," << e.b << "," << e.w << "\n";
+  }
+}
+
+static void write_nodes_csv(const std::string& outpath,
+                            const ConnectivityGraphMetrics& m,
+                            const std::map<std::string, Vec2>& node_pos) {
+  std::ofstream out(outpath);
+  if (!out) throw std::runtime_error("Failed to write: " + outpath);
+  out << "node,lobe,hemisphere,region,degree,strength,mean_weight,max_weight,x,y\n";
+  out << std::setprecision(12);
+
+  // For readability in spreadsheets, order by descending strength.
+  std::vector<ConnectivityNodeMetrics> nodes = m.nodes;
+  std::sort(nodes.begin(), nodes.end(), [](const ConnectivityNodeMetrics& a, const ConnectivityNodeMetrics& b) {
+    if (a.strength != b.strength) return a.strength > b.strength;
+    return a.node < b.node;
+  });
+
+  for (const auto& n : nodes) {
+    double x = std::numeric_limits<double>::quiet_NaN();
+    double y = std::numeric_limits<double>::quiet_NaN();
+    const auto it = node_pos.find(n.node);
+    if (it != node_pos.end()) {
+      x = it->second.x;
+      y = it->second.y;
+    }
+
+    out << n.node << ","
+        << connectivity_lobe_name(n.lobe) << ","
+        << connectivity_hemisphere_name(n.hemisphere) << ","
+        << n.region << ","
+        << n.degree << ","
+        << n.strength << ","
+        << n.mean_weight << ","
+        << n.max_weight << ","
+        << x << "," << y << "\n";
+  }
+}
+
+static void write_region_pairs_csv(const std::string& outpath, const ConnectivityGraphMetrics& m) {
+  std::ofstream out(outpath);
+  if (!out) throw std::runtime_error("Failed to write: " + outpath);
+  out << "region_a,region_b,edge_count,sum_weight,mean_weight\n";
+  out << std::setprecision(12);
+
+  std::vector<ConnectivityRegionPairMetrics> pairs = m.region_pairs;
+  std::sort(pairs.begin(), pairs.end(), [](const ConnectivityRegionPairMetrics& a, const ConnectivityRegionPairMetrics& b) {
+    // Descending mean weight, then stable names.
+    if (a.mean_weight != b.mean_weight) return a.mean_weight > b.mean_weight;
+    if (a.region_a != b.region_a) return a.region_a < b.region_a;
+    return a.region_b < b.region_b;
+  });
+
+  for (const auto& p : pairs) {
+    out << p.region_a << "," << p.region_b << "," << p.edge_count << "," << p.sum_weight << "," << p.mean_weight
+        << "\n";
+  }
+}
+
+static void write_html_report(const Args& args,
+                              const std::string& svg_file,
+                              const std::string& edges_csv,
+                              const std::string& nodes_csv,
+                              const std::string& region_csv,
+                              const std::vector<Edge>& edges,
+                              const ConnectivityGraphMetrics& metrics) {
   const std::string outpath = args.outdir + "/connectivity_report.html";
   std::ofstream out(outpath);
   if (!out) throw std::runtime_error("Failed to write: " + outpath);
+
+  // Precompute small previews.
+  std::vector<Edge> top_edges = edges;
+  std::sort(top_edges.begin(), top_edges.end(), [](const Edge& a, const Edge& b) {
+    if (a.w != b.w) return a.w > b.w;
+    if (a.a != b.a) return a.a < b.a;
+    return a.b < b.b;
+  });
+  const std::size_t max_preview_rows = 25;
+  if (top_edges.size() > max_preview_rows) top_edges.resize(max_preview_rows);
+
+  std::vector<ConnectivityNodeMetrics> top_nodes = metrics.nodes;
+  std::sort(top_nodes.begin(), top_nodes.end(), [](const ConnectivityNodeMetrics& a, const ConnectivityNodeMetrics& b) {
+    if (a.strength != b.strength) return a.strength > b.strength;
+    return a.node < b.node;
+  });
+  if (top_nodes.size() > max_preview_rows) top_nodes.resize(max_preview_rows);
+
+  std::vector<ConnectivityRegionPairMetrics> top_regions = metrics.region_pairs;
+  std::sort(top_regions.begin(), top_regions.end(), [](const ConnectivityRegionPairMetrics& a,
+                                                       const ConnectivityRegionPairMetrics& b) {
+    if (a.mean_weight != b.mean_weight) return a.mean_weight > b.mean_weight;
+    if (a.region_a != b.region_a) return a.region_a < b.region_a;
+    return a.region_b < b.region_b;
+  });
+  if (top_regions.size() > max_preview_rows) top_regions.resize(max_preview_rows);
 
   out << "<!doctype html>\n"
       << "<html>\n"
@@ -551,6 +655,10 @@ static void write_html_report(const Args& args, const std::string& svg_file) {
       << "    .card{background:rgba(17,26,51,0.6);border:1px solid rgba(255,255,255,0.10);border-radius:12px;padding:12px;}\n"
       << "    iframe{width:100%;height:900px;border:0;border-radius:12px;background:#0b1020;}\n"
       << "    .small{font-size:12px;color:#94a3b8;}\n"
+      << "    table{border-collapse:collapse;width:100%;font-size:13px;}\n"
+      << "    th,td{border-bottom:1px solid rgba(255,255,255,0.10);padding:6px 8px;text-align:left;}\n"
+      << "    th{font-weight:600;color:#cbd5e1;}\n"
+      << "    code{font-size:12px;}\n"
       << "  </style>\n"
       << "</head>\n"
       << "<body>\n"
@@ -560,9 +668,64 @@ static void write_html_report(const Args& args, const std::string& svg_file) {
       << "    <div style=\"height:12px\"></div>\n"
       << "    <div class=\"card\">\n"
       << "      <div class=\"small\">Input: <code>" << svg_escape(args.input_csv) << "</code></div>\n"
+      << "      <div class=\"small\" style=\"margin-top:6px\">Nodes: " << metrics.nodes.size() << " | Edges: "
+      << edges.size() << "</div>\n"
       << "      <div style=\"height:10px\"></div>\n"
       << "      <iframe src=\"" << url_escape(svg_file) << "\"></iframe>\n"
       << "      <div class=\"small\" style=\"margin-top:10px\">Open the SVG directly: <a href=\"" << url_escape(svg_file) << "\">" << svg_escape(svg_file) << "</a></div>\n"
+      << "      <div class=\"small\" style=\"margin-top:10px\">\n"
+      << "        CSV outputs: "
+      << "<a href=\"" << url_escape(edges_csv) << "\">" << svg_escape(edges_csv) << "</a> · "
+      << "<a href=\"" << url_escape(nodes_csv) << "\">" << svg_escape(nodes_csv) << "</a> · "
+      << "<a href=\"" << url_escape(region_csv) << "\">" << svg_escape(region_csv) << "</a>\n"
+      << "      </div>\n"
+      << "      <div style=\"height:12px\"></div>\n"
+
+      << "      <details open>\n"
+      << "        <summary style=\"cursor:pointer\">Top edges (preview)</summary>\n"
+      << "        <div style=\"height:8px\"></div>\n"
+      << "        <table>\n"
+      << "          <thead><tr><th>Channel A</th><th>Channel B</th><th>Weight</th></tr></thead>\n"
+      << "          <tbody>\n";
+  for (const auto& e : top_edges) {
+    out << "<tr><td><code>" << svg_escape(e.a) << "</code></td><td><code>" << svg_escape(e.b)
+        << "</code></td><td>" << svg_escape(fmt_double(e.w, 6)) << "</td></tr>\n";
+  }
+  out << "          </tbody>\n"
+      << "        </table>\n"
+      << "      </details>\n"
+
+      << "      <div style=\"height:12px\"></div>\n"
+      << "      <details>\n"
+      << "        <summary style=\"cursor:pointer\">Top nodes by strength (preview)</summary>\n"
+      << "        <div style=\"height:8px\"></div>\n"
+      << "        <table>\n"
+      << "          <thead><tr><th>Node</th><th>Region</th><th>Degree</th><th>Strength</th><th>Mean</th></tr></thead>\n"
+      << "          <tbody>\n";
+  for (const auto& n : top_nodes) {
+    out << "<tr><td><code>" << svg_escape(n.node) << "</code></td><td>" << svg_escape(n.region) << "</td><td>"
+        << n.degree << "</td><td>" << svg_escape(fmt_double(n.strength, 6)) << "</td><td>"
+        << svg_escape(fmt_double(n.mean_weight, 6)) << "</td></tr>\n";
+  }
+  out << "          </tbody>\n"
+      << "        </table>\n"
+      << "      </details>\n"
+
+      << "      <div style=\"height:12px\"></div>\n"
+      << "      <details>\n"
+      << "        <summary style=\"cursor:pointer\">Top region pairs by mean weight (preview)</summary>\n"
+      << "        <div style=\"height:8px\"></div>\n"
+      << "        <table>\n"
+      << "          <thead><tr><th>Region A</th><th>Region B</th><th>Edges</th><th>Mean</th><th>Sum</th></tr></thead>\n"
+      << "          <tbody>\n";
+  for (const auto& p : top_regions) {
+    out << "<tr><td>" << svg_escape(p.region_a) << "</td><td>" << svg_escape(p.region_b) << "</td><td>"
+        << p.edge_count << "</td><td>" << svg_escape(fmt_double(p.mean_weight, 6)) << "</td><td>"
+        << svg_escape(fmt_double(p.sum_weight, 6)) << "</td></tr>\n";
+  }
+  out << "          </tbody>\n"
+      << "        </table>\n"
+      << "      </details>\n"
       << "    </div>\n"
       << "  </div>\n"
       << "</body>\n"
@@ -677,11 +840,36 @@ int main(int argc, char** argv) {
     write_svg(args, edges, node_pos, vmin, vmax, svg_path);
     std::cout << "Wrote: " << svg_path << "\n";
 
+    // Export filtered edge list + simple summaries to accompany the map.
+    const std::string edges_csv_file = "connectivity_edges_used.csv";
+    const std::string nodes_csv_file = "connectivity_nodes.csv";
+    const std::string region_csv_file = "connectivity_region_pairs.csv";
+
+    {
+      write_edges_used_csv(args.outdir + "/" + edges_csv_file, edges);
+      std::cout << "Wrote: " << args.outdir << "/" << edges_csv_file << "\n";
+    }
+
+    ConnectivityGraphMetrics metrics;
+    {
+      std::vector<ConnectivityEdge> g_edges;
+      g_edges.reserve(edges.size());
+      for (const auto& e : edges) g_edges.push_back({e.a, e.b, e.w});
+      metrics = compute_connectivity_graph_metrics(g_edges);
+      write_nodes_csv(args.outdir + "/" + nodes_csv_file, metrics, node_pos);
+      write_region_pairs_csv(args.outdir + "/" + region_csv_file, metrics);
+      std::cout << "Wrote: " << args.outdir << "/" << nodes_csv_file << "\n";
+      std::cout << "Wrote: " << args.outdir << "/" << region_csv_file << "\n";
+    }
+
     std::vector<std::string> outputs;
     outputs.push_back(svg_file);
+    outputs.push_back(edges_csv_file);
+    outputs.push_back(nodes_csv_file);
+    outputs.push_back(region_csv_file);
 
     if (args.html_report) {
-      write_html_report(args, svg_file);
+      write_html_report(args, svg_file, edges_csv_file, nodes_csv_file, region_csv_file, edges, metrics);
       outputs.push_back("connectivity_report.html");
       std::cout << "Wrote: " << args.outdir << "/connectivity_report.html\n";
     }

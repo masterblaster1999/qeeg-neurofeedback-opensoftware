@@ -195,6 +195,7 @@ add_library(qeeg
   src/iaf.cpp
   src/microstates.cpp
   src/coherence.cpp
+  src/connectivity_graph.cpp
   src/pac.cpp
   src/plv.cpp
   src/online_plv.cpp
@@ -1168,6 +1169,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_imag_coherence tests/test_imag_coherence.cpp)
   target_link_libraries(qeeg_test_imag_coherence PRIVATE qeeg)
   add_test(NAME qeeg_test_imag_coherence COMMAND qeeg_test_imag_coherence)
+
+  add_executable(qeeg_test_connectivity_graph_metrics tests/test_connectivity_graph_metrics.cpp)
+  target_link_libraries(qeeg_test_connectivity_graph_metrics PRIVATE qeeg)
+  add_test(NAME qeeg_test_connectivity_graph_metrics COMMAND qeeg_test_connectivity_graph_metrics)
 
   add_executable(qeeg_test_online_coherence tests/test_online_coherence.cpp)
   target_link_libraries(qeeg_test_online_coherence PRIVATE qeeg)

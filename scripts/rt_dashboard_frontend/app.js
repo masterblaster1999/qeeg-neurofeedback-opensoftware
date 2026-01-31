@@ -77,11 +77,15 @@
   const lblSel = qs('lblSel');
   const vminEl = qs('vmin');
   const vmaxEl = qs('vmax');
+  const hmVminEl = qs('hmVmin');
+  const hmVmaxEl = qs('hmVmax');
 
   const topoCanvas = qs('topoCanvas');
   const topoCtx = topoCanvas.getContext('2d');
   const bpCanvas = qs('bpChart');
   const bpCtx = bpCanvas.getContext('2d');
+  const bpHeatCanvas = qs('bpHeatmap');
+  const bpHeatCtx = bpHeatCanvas ? bpHeatCanvas.getContext('2d') : null;
 
   const CLIENT_ID_KEY = 'qeeg_rt_dashboard_client_id';
   function newClientId(){
@@ -106,7 +110,7 @@
     applyingRemote: false,
     serverMeta: null,
     nf: {frames: [], lastT: -Infinity},
-    bp: {meta: null, frames: [], lastT: -Infinity, rollingMin: null, rollingMax: null, tmpCanvas: null, tmpW: 0, tmpH: 0, electrodesPx: [], baseline: null, reference: null, baselineSec: 10.0, topomapCfg: null, cliTopomap: {etag: null, url: null, img: null, inflight: false, lastOk_utc: 0}},
+    bp: {meta: null, frames: [], lastT: -Infinity, rollingMin: null, rollingMax: null, heatRollingMin: null, heatRollingMax: null, tmpCanvas: null, tmpW: 0, tmpH: 0, electrodesPx: [], baseline: null, reference: null, baselineSec: 10.0, topomapCfg: null, cliTopomap: {etag: null, url: null, img: null, inflight: false, lastOk_utc: 0}},
     art: {frames: [], latest: null, lastT: -Infinity},
   };
 
@@ -775,10 +779,36 @@ if(Array.isArray(arts) && arts.length){
     return [r,g,b];
   }
 
+  function lerp(a, b, t){ return a + (b-a)*t; }
+
+  function rgbLerp(c0, c1, t){
+    return [
+      Math.round(lerp(c0[0], c1[0], t)),
+      Math.round(lerp(c0[1], c1[1], t)),
+      Math.round(lerp(c0[2], c1[2], t)),
+    ];
+  }
+
   function valueToRgb(v, vmin, vmax){
     if(v===null || v===undefined || !Number.isFinite(v) || !(vmax>vmin)) return [42,52,64];
     let t = (v - vmin) / (vmax - vmin);
     if(t<0) t=0; if(t>1) t=1;
+
+    // Diverging map when the range crosses 0 (useful for z-scores and log/db values).
+    if(vmin < 0 && vmax > 0){
+      const mid = (0 - vmin) / (vmax - vmin);
+      const blue = [59, 76, 192];     // #3b4cc0
+      const neutral = [247, 247, 247];
+      const red = [180, 4, 38];      // #b40426
+      if(t <= mid){
+        const tt = (mid > 1e-9) ? (t / mid) : 0;
+        return rgbLerp(blue, neutral, tt);
+      }
+      const tt = ((1 - mid) > 1e-9) ? ((t - mid) / (1 - mid)) : 0;
+      return rgbLerp(neutral, red, tt);
+    }
+
+    // Sequential fallback.
     const hue = (1 - t) * 240;
     return hslToRgb(hue, 0.90, 0.55);
   }
@@ -1106,6 +1136,220 @@ if(Array.isArray(arts) && arts.length){
     bpCtx.fillText(`t: ${tMin.toFixed(1)}–${tNow.toFixed(1)}s`, 12, h-6);
   }
 
+  function drawBandpowerHeatmap(){
+    if(!bpHeatCanvas || !bpHeatCtx) return;
+
+    const meta = state.bp.meta;
+    resizeCanvasTo(bpHeatCanvas);
+    const w = bpHeatCanvas.width, h = bpHeatCanvas.height;
+    bpHeatCtx.clearRect(0,0,w,h);
+    bpHeatCtx.fillStyle = '#071018';
+    bpHeatCtx.fillRect(0,0,w,h);
+
+    const dpr = window.devicePixelRatio || 1;
+
+    if(!meta || !state.bp.frames.length){
+      bpHeatCtx.fillStyle = '#9fb0c3';
+      bpHeatCtx.font = `${Math.round(12*dpr)}px system-ui`;
+      bpHeatCtx.fillText('Waiting for bandpower_timeseries.csv …', 14*dpr, 24*dpr);
+      if(hmVminEl) hmVminEl.textContent = 'min: —';
+      if(hmVmaxEl) hmVmaxEl.textContent = 'max: —';
+      return;
+    }
+
+    const bands = meta.bands || [];
+    const channels = meta.channels || [];
+    const nBands = bands.length;
+    const nCh = channels.length;
+    if(!nBands || !nCh){
+      bpHeatCtx.fillStyle = '#9fb0c3';
+      bpHeatCtx.font = `${Math.round(12*dpr)}px system-ui`;
+      bpHeatCtx.fillText('No bandpower metadata', 14*dpr, 24*dpr);
+      if(hmVminEl) hmVminEl.textContent = 'min: —';
+      if(hmVmaxEl) hmVmaxEl.textContent = 'max: —';
+      return;
+    }
+
+    let chName = (chSel && chSel.value) ? chSel.value : (channels[0] || '');
+    let cIdx = channels.indexOf(chName);
+    if(cIdx < 0){
+      cIdx = 0;
+      chName = channels[0] || '';
+      if(chSel && chName) chSel.value = chName;
+    }
+
+    const frames = state.bp.frames;
+    const last = frames[frames.length-1];
+    const tNow = (last && typeof last.t === 'number' && Number.isFinite(last.t)) ? last.t : 0;
+    const tStart = (frames[0] && typeof frames[0].t === 'number' && Number.isFinite(frames[0].t)) ? frames[0].t : 0;
+    let tMin = Math.max(tStart, tNow - state.winSec);
+    if(!(tNow > tMin)) tMin = tNow - Math.max(1, state.winSec);
+
+    const need = nBands * nCh;
+    const vis = [];
+    for(const f of frames){
+      if(!f || typeof f !== 'object') continue;
+      const t = f.t;
+      if(t===null || t===undefined || !Number.isFinite(t)) continue;
+      if(t < tMin) continue;
+      if(!Array.isArray(f.values) || f.values.length < need) continue;
+      vis.push(f);
+    }
+
+    if(vis.length < 2){
+      bpHeatCtx.fillStyle = '#9fb0c3';
+      bpHeatCtx.font = `${Math.round(12*dpr)}px system-ui`;
+      bpHeatCtx.fillText('Waiting for bandpower frames …', 14*dpr, 24*dpr);
+      if(hmVminEl) hmVminEl.textContent = 'min: —';
+      if(hmVmaxEl) hmVmaxEl.textContent = 'max: —';
+      return;
+    }
+
+    const left = 68*dpr;
+    const right = 10*dpr;
+    const top = 12*dpr;
+    const bottom = 24*dpr;
+    const plotW = Math.max(1, w - left - right);
+    const plotH = Math.max(1, h - top - bottom);
+    const rowH = plotH / nBands;
+
+    // Decimate to keep rendering bounded (<=1 stripe / pixel).
+    const maxCols = Math.max(50, Math.floor(plotW));
+    const step = Math.max(1, Math.ceil(vis.length / maxCols));
+
+    // Scale.
+    let vmin = Infinity, vmax = -Infinity;
+    const mm = mapMode();
+    if(mm === 'zbase' || mm === 'zref'){
+      vmin = -3;
+      vmax = 3;
+    } else {
+      for(let i=0;i<vis.length;i+=step){
+        const vals = vis[i].values;
+        for(let b=0;b<nBands;b++){
+          const col = b*nCh + cIdx;
+          const v = bpDisplayValue(col, vals[col]);
+          if(v!==null && v!==undefined && Number.isFinite(v)){
+            vmin = Math.min(vmin, v);
+            vmax = Math.max(vmax, v);
+          }
+        }
+      }
+      if(!(vmax > vmin)) { vmin = 0; vmax = 1; }
+      const pad = 0.02*(vmax - vmin);
+      vmin -= pad;
+      vmax += pad;
+    }
+
+    // Rolling fixed scale (raw mode only); z-score modes keep a fixed symmetric range.
+    if(scaleSel && scaleSel.value === 'fixed' && mm === 'raw'){
+      if(state.bp.heatRollingMin===null || state.bp.heatRollingMax===null){
+        state.bp.heatRollingMin = vmin;
+        state.bp.heatRollingMax = vmax;
+      } else {
+        state.bp.heatRollingMin = 0.98*state.bp.heatRollingMin + 0.02*vmin;
+        state.bp.heatRollingMax = 0.98*state.bp.heatRollingMax + 0.02*vmax;
+      }
+      vmin = state.bp.heatRollingMin;
+      vmax = state.bp.heatRollingMax;
+    } else if(scaleSel && scaleSel.value === 'fixed' && (mm === 'zbase' || mm === 'zref')){
+      vmin = -3;
+      vmax = 3;
+    } else {
+      state.bp.heatRollingMin = null;
+      state.bp.heatRollingMax = null;
+    }
+
+    if(hmVminEl) hmVminEl.textContent = `min: ${Number.isFinite(vmin)?vmin.toFixed(3):'—'}`;
+    if(hmVmaxEl) hmVmaxEl.textContent = `max: ${Number.isFinite(vmax)?vmax.toFixed(3):'—'}`;
+
+    // Grid.
+    bpHeatCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+    bpHeatCtx.lineWidth = 1;
+    for(let i=0;i<=nBands;i++){
+      const yy = top + i*rowH;
+      bpHeatCtx.beginPath();
+      bpHeatCtx.moveTo(left, yy);
+      bpHeatCtx.lineTo(left + plotW, yy);
+      bpHeatCtx.stroke();
+    }
+    for(let i=0;i<=4;i++){
+      const xx = left + i*plotW/4;
+      bpHeatCtx.beginPath();
+      bpHeatCtx.moveTo(xx, top);
+      bpHeatCtx.lineTo(xx, top + plotH);
+      bpHeatCtx.stroke();
+    }
+
+    const tSpan = (tNow - tMin) || 1;
+
+    // Heat stripes.
+    for(let i=0;i<vis.length;i+=step){
+      const f = vis[i];
+      const t = f.t;
+      const t2 = (i+step < vis.length) ? vis[i+step].t : tNow;
+      const x1 = left + (t - tMin)/tSpan * plotW;
+      const x2 = left + (t2 - tMin)/tSpan * plotW;
+      const bw = Math.max(1, Math.ceil(x2 - x1));
+      const vals = f.values;
+
+      for(let b=0;b<nBands;b++){
+        const col = b*nCh + cIdx;
+        const vv = bpDisplayValue(col, vals[col]);
+        const y0 = top + (nBands - 1 - b)*rowH;
+        const [r,g,bb] = valueToRgb(vv, vmin, vmax);
+        bpHeatCtx.fillStyle = `rgb(${r},${g},${bb})`;
+        bpHeatCtx.fillRect(x1, y0, bw, Math.ceil(rowH));
+      }
+
+      const aAt = artifactAtTime(t);
+      const aReady = (aAt && aAt.ready !== null && aAt.ready !== undefined) ? !!aAt.ready : true;
+      const artifactHit = !!(aAt && aReady && aAt.bad);
+      if(artifactHit){
+        bpHeatCtx.fillStyle = 'rgba(255, 92, 92, 0.18)';
+        bpHeatCtx.fillRect(x1, top, bw, plotH);
+      }
+    }
+
+    // Border.
+    bpHeatCtx.strokeStyle = 'rgba(255,255,255,0.25)';
+    bpHeatCtx.lineWidth = 1.5*dpr;
+    bpHeatCtx.strokeRect(left, top, plotW, plotH);
+
+    // Band labels (low frequency at bottom).
+    bpHeatCtx.fillStyle = '#9fb0c3';
+    bpHeatCtx.font = `${Math.round(11*dpr)}px system-ui`;
+    bpHeatCtx.textAlign = 'right';
+    bpHeatCtx.textBaseline = 'middle';
+    for(let b=0;b<nBands;b++){
+      const ym = top + (nBands - 1 - b + 0.5)*rowH;
+      bpHeatCtx.fillText(bands[b], left - 8*dpr, ym);
+    }
+
+    // Title + time axis.
+    const xm = (xformSel && xformSel.value) ? xformSel.value : 'linear';
+    let title = '';
+    if(mm === 'raw'){
+      const xLabel = (xm && xm !== 'linear') ? ` (${xm})` : '';
+      title = `${chName}${xLabel}`;
+    } else if(mm === 'zbase'){
+      title = `${chName} z (baseline)`;
+    } else if(mm === 'zref'){
+      title = `${chName} z (reference)`;
+    } else {
+      title = chName;
+    }
+
+    bpHeatCtx.fillStyle = '#9fb0c3';
+    bpHeatCtx.textAlign = 'left';
+    bpHeatCtx.textBaseline = 'top';
+    bpHeatCtx.font = `${Math.round(11*dpr)}px system-ui`;
+    bpHeatCtx.fillText(title, left, 6*dpr);
+
+    bpHeatCtx.textBaseline = 'alphabetic';
+    bpHeatCtx.fillText(`t: ${tMin.toFixed(1)}–${tNow.toFixed(1)}s`, left, h - 6*dpr);
+  }
+
   function connectSSE(path, badgeEl, label){
     if(!window.EventSource){
       setBadge(badgeEl, `${label}: no EventSource`, 'warn');
@@ -1234,7 +1478,7 @@ if(Array.isArray(arts) && arts.length){
       p.channel = null;
       changed = true;
     }
-    if(changed){ drawTopo(); drawBandpowerSeries(); }
+    if(changed){ drawTopo(); drawBandpowerSeries(); drawBandpowerHeatmap(); }
   }
 
   // ---------------- start + streaming ----------------
@@ -1253,19 +1497,21 @@ if(Array.isArray(arts) && arts.length){
     state.winSec = parseFloat(winSel.value||'60') || 60;
     schedulePushUiState();
     dirtyNf = true;
+    dirtyBp = true;
     scheduleRender();
   };
 
-  bandSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); };
-  chSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); };
+  bandSel.onchange = () => { state.bp.heatRollingMin = null; state.bp.heatRollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
+  chSel.onchange = () => { state.bp.heatRollingMin = null; state.bp.heatRollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
   lblSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); };
-  xformSel.onchange = () => { state.bp.rollingMin = null; state.bp.rollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
+  xformSel.onchange = () => { state.bp.rollingMin = null; state.bp.rollingMax = null; state.bp.heatRollingMin = null; state.bp.heatRollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
   if(topoSrcSel){
     topoSrcSel.onchange = () => { dirtyBp = true; scheduleRender(); schedulePushUiState(); updateTopoPolling(); };
   }
   if(mapSel){
     mapSel.onchange = () => {
       state.bp.rollingMin = null; state.bp.rollingMax = null;
+      state.bp.heatRollingMin = null; state.bp.heatRollingMax = null;
       if(mapSel.value === 'zref' && !state.bp.reference){ loadReference(); }
       if(mapSel.value === 'zbase' && (!state.bp.baseline || !state.bp.baseline.ready)){ loadBaseline(); }
       dirtyBp = true; scheduleRender(); schedulePushUiState();
@@ -1274,7 +1520,7 @@ if(Array.isArray(arts) && arts.length){
   if(nfModeSel){
     nfModeSel.onchange = () => { dirtyNf = true; updateStats(); scheduleRender(); schedulePushUiState(); };
   }
-  scaleSel.onchange = () => { state.bp.rollingMin = null; state.bp.rollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
+  scaleSel.onchange = () => { state.bp.rollingMin = null; state.bp.rollingMax = null; state.bp.heatRollingMin = null; state.bp.heatRollingMax = null; dirtyBp = true; scheduleRender(); schedulePushUiState(); };
 
   function applyMeta(meta){
     if(!meta || typeof meta !== 'object') return;
@@ -1337,7 +1583,7 @@ if(Array.isArray(arts) && arts.length){
     requestAnimationFrame(() => {
       renderPending = false;
       if(dirtyNf){ drawChart(); dirtyNf = false; }
-      if(dirtyBp){ drawTopo(); drawBandpowerSeries(); dirtyBp = false; }
+      if(dirtyBp){ drawTopo(); drawBandpowerSeries(); drawBandpowerHeatmap(); dirtyBp = false; }
     });
   }
 
@@ -1425,7 +1671,7 @@ if(Array.isArray(arts) && arts.length){
     if(state.paused) return;
     try{
       const un = unpackMsg(raw);
-      if(un.reset){ state.bp.frames = []; state.bp.lastT = -Infinity; state.bp.rollingMin = null; state.bp.rollingMax = null; state.bp.baseline = null; state.bp.lastClean = null; }
+      if(un.reset){ state.bp.frames = []; state.bp.lastT = -Infinity; state.bp.rollingMin = null; state.bp.rollingMax = null; state.bp.heatRollingMin = null; state.bp.heatRollingMax = null; state.bp.baseline = null; state.bp.lastClean = null; }
       for(const f of un.frames){
         if(!f || typeof f !== 'object') continue;
         if(f.t !== null && f.t !== undefined && Number.isFinite(f.t)){
@@ -1511,6 +1757,8 @@ if(Array.isArray(arts) && arts.length){
         const name = meta.channels[best];
         if(name){
           chSel.value = name;
+          state.bp.heatRollingMin = null;
+          state.bp.heatRollingMax = null;
           dirtyBp = true;
           scheduleRender();
           schedulePushUiState();
