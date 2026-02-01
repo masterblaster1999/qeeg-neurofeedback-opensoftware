@@ -2759,11 +2759,7 @@ static void write_nf_summary_json(const Args& args,
                                  double wall_elapsed_sec) {
   (void)metric;
   const std::string outpath = args.outdir + "/nf_summary.json";
-  std::ofstream out(outpath);
-  if (!out) {
-    std::cerr << "Warning: failed to write " << outpath << "\n";
-    return;
-  }
+  std::ostringstream out;
 
   const double file_dur_sec = static_cast<double>(rec.n_samples()) / rec.fs_hz;
   const double achieved_speed = (wall_elapsed_sec > 0.0) ? (file_dur_sec / wall_elapsed_sec)
@@ -2795,17 +2791,20 @@ static void write_nf_summary_json(const Args& args,
   out << "{\n";
   out << "  \"$schema\": \"" << json_escape(schema_url("qeeg_nf_cli_nf_summary.schema.json")) << "\",\n";
   out << "  \"Tool\": \"qeeg_nf_cli\",\n";
+  out << "  \"QeegVersion\": \"" << json_escape(qeeg::version_string()) << "\",\n";
   out << "  \"Version\": \"" << json_escape(qeeg::version_string()) << "\",\n";
   out << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
   out << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
   out << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
   out << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
   out << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+  out << "  \"TimestampUTC\": \"" << json_escape(now_string_utc()) << "\",\n";
   out << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
   out << "  \"protocol\": ";
   if (!args.protocol.empty()) out << "\"" << json_escape(args.protocol) << "\"";
   else out << "null";
   out << ",\n";
+  out << "  \"InputPath\": \"" << json_escape(args.input_path) << "\",\n";
   out << "  \"input_path\": \"" << json_escape(args.input_path) << "\",\n";
   out << "  \"fs_hz\": " << rec.fs_hz << ",\n";
   out << "  \"file_duration_sec\": ";
@@ -2894,6 +2893,11 @@ static void write_nf_summary_json(const Args& args,
   out << "\n";
   out << "  }\n";
   out << "}\n";
+
+  if (!write_text_file_atomic(outpath, out.str())) {
+    std::cerr << "Warning: failed to write " << outpath << "\n";
+    return;
+  }
 
   std::cout << "Wrote NF summary: " << outpath << "\n";
 }
@@ -3742,20 +3746,19 @@ if (args.list_channels || args.list_channels_json) {
     // Convenience: write run parameters to JSON for easy downstream parsing.
     {
       const std::string meta_path = args.outdir + "/nf_run_meta.json";
-      std::ofstream meta(meta_path);
-      if (!meta) {
-        std::cerr << "Warning: failed to write " << meta_path << "\n";
-      } else {
+      std::ostringstream meta;
         meta << "{\n";
         meta << "  \"$schema\": \"" << json_escape(schema_url("qeeg_nf_cli_nf_run_meta.schema.json")) << "\",\n";
         const bool derived_events_written = (args.biotrace_ui || args.export_derived_events);
         meta << "  \"Tool\": \"qeeg_nf_cli\",\n";
+        meta << "  \"QeegVersion\": \"" << json_escape(qeeg::version_string()) << "\",\n";
         meta << "  \"Version\": \"" << json_escape(qeeg::version_string()) << "\",\n";
         meta << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
         meta << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
         meta << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
         meta << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
         meta << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+        meta << "  \"TimestampUTC\": \"" << json_escape(now_string_utc()) << "\",\n";
         meta << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
         meta << "  \"Outputs\": [\n";
         bool first_out = true;
@@ -3785,6 +3788,7 @@ if (args.list_channels || args.list_channels_json) {
         if (args.biotrace_ui) emit_out("biotrace_ui.html");
         meta << "\n  ],\n";
         meta << "  \"demo\": " << (args.demo ? "true" : "false") << ",\n";
+        meta << "  \"InputPath\": \"" << json_escape(args.input_path) << "\",\n";
         meta << "  \"input_path\": \"" << json_escape(args.input_path) << "\",\n";
         meta << "  \"channel_map\": ";
         if (!args.channel_map_path.empty()) meta << "\"" << json_escape(args.channel_map_path) << "\"";
@@ -3913,6 +3917,8 @@ if (args.list_channels || args.list_channels_json) {
              << (derived_events_written ? "\"" + json_escape("nf_derived_events.json") + "\"" : "null")
              << "\n";
         meta << "}\n";
+      if (!write_text_file_atomic(meta_path, meta.str())) {
+        std::cerr << "Warning: failed to write " << meta_path << "\n";
       }
     }
 

@@ -51,6 +51,9 @@ using qeeg::ensure_directory;
 using qeeg::file_exists;
 using qeeg::HttpRangeResult;
 using qeeg::json_escape;
+using qeeg::json_find_bool_value;
+using qeeg::json_find_int_value;
+using qeeg::json_find_string_value;
 using qeeg::now_string_local;
 using qeeg::parse_http_byte_range;
 using qeeg::random_hex_token;
@@ -58,6 +61,7 @@ using qeeg::split_commandline_args;
 using qeeg::starts_with;
 using qeeg::to_lower;
 using qeeg::trim;
+using qeeg::url_encode_path;
 
 struct Args {
   std::string root;
@@ -167,42 +171,180 @@ static void try_open_browser_url(const std::string& url) {
 #endif
 }
 
+#ifdef _WIN32
+// Forward declaration (definition appears later in this file).
+static std::wstring utf8_to_wide(const std::string& s);
+#endif
+
 struct CaptureResult {
   std::string text;
   bool truncated{false};
+  bool ok{false};
+  std::string error;
 };
 
-// Capture a command's stdout (best-effort) up to max_bytes.
+// Capture a process' combined stdout/stderr (best-effort) up to max_bytes.
 //
 // Used for serving tool --help output to the browser UI via /api/help.
-static CaptureResult capture_stdout_limited(const std::string& cmd, size_t max_bytes) {
+//
+// IMPORTANT: We do not invoke a shell. This avoids shell metacharacter issues and
+// makes argument handling consistent with the UI server's job runner.
+static CaptureResult capture_process_output_limited(const std::vector<std::string>& argv_s,
+                                                   const std::filesystem::path& cwd,
+                                                   size_t max_bytes) {
   CaptureResult r;
+  if (argv_s.empty()) {
+    r.error = "empty argv";
+    return r;
+  }
   if (max_bytes == 0) max_bytes = 1024 * 1024;
 
-#if defined(_WIN32)
-  FILE* pipe = _popen(cmd.c_str(), "r");
-#else
-  FILE* pipe = popen(cmd.c_str(), "r");
-#endif
-  if (!pipe) return r;
-
   r.text.reserve(4096);
+
+#ifdef _WIN32
+  // Build a single command line for CreateProcess using Win32 quoting rules.
+  const std::string cmd = qeeg::join_commandline_args_win32(argv_s);
+  const std::wstring cmd_w = utf8_to_wide(cmd);
+  std::vector<wchar_t> cmd_buf(cmd_w.begin(), cmd_w.end());
+  cmd_buf.push_back(L'\0');
+
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  sa.lpSecurityDescriptor = NULL;
+
+  HANDLE hRead = NULL;
+  HANDLE hWrite = NULL;
+  if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+    const DWORD err = GetLastError();
+    r.error = std::string("CreatePipe failed (win32_error=") + std::to_string(err) + ")";
+    return r;
+  }
+  // Do not inherit the read handle.
+  (void)SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  si.dwFlags |= STARTF_USESTDHANDLES;
+  si.hStdOutput = hWrite;
+  si.hStdError = hWrite;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+  PROCESS_INFORMATION pi{};
+  std::wstring cwd_w;
+  const wchar_t* cwd_ptr = NULL;
+  if (!cwd.empty()) {
+    cwd_w = utf8_to_wide(cwd.u8string());
+    cwd_ptr = cwd_w.c_str();
+  }
+
+  const BOOL ok = CreateProcessW(
+      NULL,
+      cmd_buf.data(),
+      NULL,
+      NULL,
+      TRUE,
+      CREATE_NO_WINDOW,
+      NULL,
+      cwd_ptr,
+      &si,
+      &pi);
+
+  // Parent: close our write end so ReadFile can observe EOF when the child exits.
+  CloseHandle(hWrite);
+  hWrite = NULL;
+
+  if (!ok) {
+    const DWORD err = GetLastError();
+    CloseHandle(hRead);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
+    if (pi.hThread) CloseHandle(pi.hThread);
+    r.error = std::string("CreateProcess failed (win32_error=") + std::to_string(err) + ")";
+    return r;
+  }
+  if (pi.hThread) CloseHandle(pi.hThread);
+
+  r.ok = true;
+
   char buf[4096];
-  while (std::fgets(buf, static_cast<int>(sizeof(buf)), pipe) != nullptr) {
-    r.text.append(buf);
-    if (r.text.size() >= max_bytes) {
-      r.text.resize(max_bytes);
+  for (;;) {
+    DWORD n = 0;
+    const BOOL rd = ReadFile(hRead, buf, static_cast<DWORD>(sizeof(buf)), &n, NULL);
+    if (!rd || n == 0) break;
+
+    if (r.text.size() < max_bytes) {
+      const size_t want = std::min<size_t>(static_cast<size_t>(n), max_bytes - r.text.size());
+      r.text.append(buf, buf + want);
+      if (want < static_cast<size_t>(n)) r.truncated = true;
+    } else {
       r.truncated = true;
-      break;
     }
   }
 
-#if defined(_WIN32)
-  _pclose(pipe);
-#else
-  pclose(pipe);
-#endif
+  CloseHandle(hRead);
+  // Ensure the child has exited.
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  CloseHandle(pi.hProcess);
   return r;
+#else
+  int fds[2];
+  if (pipe(fds) != 0) {
+    r.error = "pipe() failed";
+    return r;
+  }
+
+  const pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    r.error = "fork() failed";
+    return r;
+  }
+
+  if (pid == 0) {
+    // Child.
+    (void)dup2(fds[1], 1);
+    (void)dup2(fds[1], 2);
+    close(fds[0]);
+    close(fds[1]);
+
+    if (!cwd.empty()) {
+      (void)chdir(cwd.u8string().c_str());
+    }
+
+    std::vector<char*> argv;
+    argv.reserve(argv_s.size() + 1);
+    for (const auto& s : argv_s) argv.push_back(const_cast<char*>(s.c_str()));
+    argv.push_back(nullptr);
+
+    execv(argv[0], argv.data());
+    std::perror("execv");
+    std::exit(127);
+  }
+
+  // Parent.
+  close(fds[1]);
+  r.ok = true;
+
+  char buf[4096];
+  for (;;) {
+    const ssize_t n = read(fds[0], buf, sizeof(buf));
+    if (n <= 0) break;
+
+    if (r.text.size() < max_bytes) {
+      const size_t want = std::min<size_t>(static_cast<size_t>(n), max_bytes - r.text.size());
+      r.text.append(buf, buf + want);
+      if (want < static_cast<size_t>(n)) r.truncated = true;
+    } else {
+      r.truncated = true;
+    }
+  }
+  close(fds[0]);
+
+  int st = 0;
+  (void)waitpid(pid, &st, 0);
+  return r;
+#endif
 }
 
 static std::string now_compact_local() {
@@ -604,33 +746,6 @@ static std::string html_escape(const std::string& s) {
   }
   return out;
 }
-
-static std::string url_escape_path(const std::string& s) {
-  // Minimal URL percent-encoding for paths.
-  //
-  // Notes:
-  // - We keep '/' so the browser navigates directories correctly.
-  // - We normalize Windows path separators ('\') to URL separators ('/') to
-  //   avoid broken links when native paths are embedded into href/src.
-  static const char* kHex = "0123456789ABCDEF";
-  std::string out;
-  out.reserve(s.size());
-  for (unsigned char c : s) {
-    if (c == '\\') c = '/';
-
-    const bool ok =
-        (std::isalnum(c) != 0) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
-    if (ok) {
-      out.push_back(static_cast<char>(c));
-    } else {
-      out.push_back('%');
-      out.push_back(kHex[(c >> 4) & 0xF]);
-      out.push_back(kHex[c & 0xF]);
-    }
-  }
-  return out;
-}
-
 
 static std::string format_local_time(std::filesystem::file_time_type tp) {
   // Convert std::filesystem::file_time_type -> local time string.
@@ -1039,101 +1154,6 @@ static std::wstring utf8_to_wide(const std::string& s) {
   return w;
 }
 #endif
-
-static std::string json_find_string_value(const std::string& s, const std::string& key) {
-  // Tiny JSON string extractor (only for {"key":"value"}-style fields).
-  const std::string needle = "\"" + key + "\"";
-  const size_t pos = s.find(needle);
-  if (pos == std::string::npos) return {};
-  size_t i = s.find(':', pos + needle.size());
-  if (i == std::string::npos) return {};
-  ++i;
-  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i])) != 0) ++i;
-  if (i >= s.size() || s[i] != '"') return {};
-  ++i;
-  std::string out;
-  while (i < s.size()) {
-    const char c = s[i++];
-    if (c == '"') break;
-    if (c == '\\' && i < s.size()) {
-      const char e = s[i++];
-      switch (e) {
-        case '"': out.push_back('"'); break;
-        case '\\': out.push_back('\\'); break;
-        case 'n': out.push_back('\n'); break;
-        case 'r': out.push_back('\r'); break;
-        case 't': out.push_back('\t'); break;
-        default: out.push_back(e); break;
-      }
-      continue;
-    }
-    out.push_back(c);
-  }
-  return out;
-}
-
-static bool json_find_bool_value(const std::string& s, const std::string& key, bool default_value) {
-  // Tiny JSON boolean extractor.
-  // Accepts:
-  //   {"key":true} / {"key":false}
-  //   {"key":"true"} / {"key":"false"}
-  //   {"key":1} / {"key":0}
-  const std::string needle = "\"" + key + "\"";
-  const size_t pos = s.find(needle);
-  if (pos == std::string::npos) return default_value;
-  size_t i = s.find(':', pos + needle.size());
-  if (i == std::string::npos) return default_value;
-  ++i;
-  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i])) != 0) ++i;
-  if (i >= s.size()) return default_value;
-  if (s.compare(i, 4, "true") == 0) return true;
-  if (s.compare(i, 5, "false") == 0) return false;
-  if (s[i] == '1') return true;
-  if (s[i] == '0') return false;
-  // Handle quoted strings.
-  if (s[i] == '"') {
-    const std::string v = json_find_string_value(s, key);
-    const std::string lv = to_lower(trim(v));
-    if (lv == "true" || lv == "1" || lv == "yes" || lv == "y") return true;
-    if (lv == "false" || lv == "0" || lv == "no" || lv == "n") return false;
-  }
-  return default_value;
-}
-
-
-static int json_find_int_value(const std::string& s, const std::string& key, int default_value) {
-  // Tiny JSON integer extractor.
-  // Accepts:
-  //   {"key":123}
-  //   {"key":"123"}
-  //   {"key":-5}
-  const std::string needle = "\"" + key + "\"";
-  const size_t pos = s.find(needle);
-  if (pos == std::string::npos) return default_value;
-  size_t i = s.find(':', pos + needle.size());
-  if (i == std::string::npos) return default_value;
-  ++i;
-  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i])) != 0) ++i;
-  if (i >= s.size()) return default_value;
-
-  if (s[i] == '"') {
-    ++i;
-  }
-
-  size_t j = i;
-  if (j < s.size() && (s[j] == '-' || s[j] == '+')) ++j;
-  while (j < s.size() && std::isdigit(static_cast<unsigned char>(s[j])) != 0) ++j;
-
-  if (j <= i) return default_value;
-  std::string num = s.substr(i, j - i);
-  num = trim(num);
-
-  try {
-    return qeeg::to_int(num);
-  } catch (...) {
-    return default_value;
-  }
-}
 
 static bool glob_match_ci(const std::string& pattern, const std::string& text) {
   // Case-insensitive glob match supporting '*' and '?'.
@@ -1846,13 +1866,19 @@ class UiServer {
     }
 
     // Capture both stdout and stderr (some tools print help to stderr).
-    std::string cmd;
+    std::vector<std::string> argv_s;
+    argv_s.push_back(exe.u8string());
     if (used_toolbox) {
-      cmd = "\"" + exe.u8string() + "\" " + tool + " --help 2>&1";
-    } else {
-      cmd = "\"" + exe.u8string() + "\" --help 2>&1";
+      argv_s.push_back(tool);
     }
-    const CaptureResult cap = capture_stdout_limited(cmd, 512 * 1024);
+    argv_s.push_back("--help");
+
+    const CaptureResult cap = capture_process_output_limited(argv_s, root_, 512 * 1024);
+    if (!cap.ok) {
+      const std::string msg = cap.error.empty() ? "unknown error" : cap.error;
+      send_json(c, 500, std::string("{\"error\":\"help capture failed: ") + qeeg::json_escape(msg) + "\"}");
+      return;
+    }
 
     HelpEntry ent;
     ent.text = cap.text;
@@ -3516,19 +3542,11 @@ class UiServer {
       return;
     }
 
-    std::ofstream f(note_abs, std::ios::binary | std::ios::trunc);
-    if (!f) {
+    if (!qeeg::write_text_file_atomic(note_abs.u8string(), text)) {
       send_json(c, 500, "{\"error\":\"cannot write note\"}");
       return;
     }
 
-    if (!text.empty()) {
-      f.write(text.data(), static_cast<std::streamsize>(text.size()));
-      if (!f) {
-        send_json(c, 500, "{\"error\":\"cannot write note\"}");
-        return;
-      }
-    }
 
     std::ostringstream oss;
     oss << "{\"ok\":true"
@@ -3659,61 +3677,10 @@ class UiServer {
       }
     }
 
-    // Write via a temp file + rename for best-effort atomicity.
-    std::filesystem::path tmp = p;
-    tmp += ".tmp";
-
-    if (!path_is_within_root(root_canon_, tmp)) {
-      send_json(c, 403, "{\"error\":\"forbidden\"}");
+    // Write atomically via a temp file + rename (best-effort).
+    if (!qeeg::write_text_file_atomic(p.u8string(), json)) {
+      send_json(c, 500, "{\"error\":\"cannot write presets\"}");
       return;
-    }
-
-    ec.clear();
-    if (std::filesystem::exists(tmp, ec)) {
-      std::filesystem::remove(tmp, ec);
-      ec.clear();
-    }
-
-    {
-      std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-      if (!f) {
-        send_json(c, 500, "{\"error\":\"cannot write presets\"}");
-        return;
-      }
-      if (!json.empty()) {
-        f.write(json.data(), static_cast<std::streamsize>(json.size()));
-        if (!f) {
-          f.close();
-          std::error_code ec2;
-          std::filesystem::remove(tmp, ec2);
-          send_json(c, 500, "{\"error\":\"cannot write presets\"}");
-          return;
-        }
-      }
-    }
-
-#ifdef _WIN32
-    // On Windows, std::filesystem::rename may fail if destination exists.
-    ec.clear();
-    if (std::filesystem::exists(p, ec)) {
-      ec.clear();
-      std::filesystem::remove(p, ec);
-      ec.clear();
-    }
-#endif
-
-    ec.clear();
-    std::filesystem::rename(tmp, p, ec);
-    if (ec) {
-      // Fallback: copy + delete temp.
-      ec.clear();
-      std::filesystem::copy_file(tmp, p, std::filesystem::copy_options::overwrite_existing, ec);
-      std::error_code ec2;
-      std::filesystem::remove(tmp, ec2);
-      if (ec) {
-        send_json(c, 500, "{\"error\":\"cannot finalize presets\"}");
-        return;
-      }
     }
 
     std::ostringstream oss;
@@ -4682,7 +4649,7 @@ class UiServer {
       std::filesystem::path parent_rel = rel_dir.parent_path();
       std::string s = parent_rel.generic_u8string();
       if (s.empty() || s == ".") parent_href = "/";
-      else parent_href = "/" + url_escape_path(s) + "/";
+      else parent_href = "/" + url_encode_path(s) + "/";
     }
 
     std::ostringstream html;
@@ -4711,7 +4678,7 @@ class UiServer {
       ec.clear();
       std::string rel_s = rel.generic_u8string();
       if (rel_s.empty()) rel_s = e.name;
-      std::string href = "/" + url_escape_path(rel_s);
+      std::string href = "/" + url_encode_path(rel_s);
       std::string display = e.name;
       const char* type = e.is_dir ? "dir" : "file";
       if (e.is_dir) {

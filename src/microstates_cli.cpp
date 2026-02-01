@@ -9,6 +9,7 @@
 #include "qeeg/topomap.hpp"
 #include "qeeg/svg_utils.hpp"
 #include "qeeg/utils.hpp"
+#include "qeeg/version.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -277,12 +278,7 @@ static void write_microstates_run_meta(const std::string& outdir,
                                        size_t channels_used,
                                        const std::vector<std::string>& outputs) {
   const std::filesystem::path meta_path = std::filesystem::u8path(outdir) / "microstates_run_meta.json";
-  std::ofstream meta(meta_path, std::ios::binary);
-  if (!meta) {
-    std::cerr << "Warning: failed to write microstates_run_meta.json to: " << meta_path.u8string() << "\n";
-    return;
-  }
-
+  std::ostringstream meta;
   meta << std::setprecision(12);
 
   auto write_string_or_null = [&](const std::string& s) {
@@ -292,7 +288,13 @@ static void write_microstates_run_meta(const std::string& outdir,
 
   meta << "{\n";
   meta << "  \"Tool\": \"qeeg_microstates_cli\",\n";
+  meta << "  \"QeegVersion\": \"" << json_escape(qeeg::version_string()) << "\",\n";
+  meta << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
+  meta << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
+  meta << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
+  meta << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
   meta << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+  meta << "  \"TimestampUTC\": \"" << json_escape(now_string_utc()) << "\",\n";
   meta << "  \"Input\": {\n";
   meta << "    \"Path\": ";
   write_string_or_null(a.input_path);
@@ -349,6 +351,10 @@ static void write_microstates_run_meta(const std::string& outdir,
   }
   meta << "  ]\n";
   meta << "}\n";
+
+  if (!write_text_file_atomic(meta_path.u8string(), meta.str())) {
+    std::cerr << "Warning: failed to write microstates_run_meta.json to: " << meta_path.u8string() << "\n";
+  }
 }
 
 

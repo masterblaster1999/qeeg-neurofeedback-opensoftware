@@ -9,6 +9,7 @@
 #include "qeeg/utils.hpp"
 #include "qeeg/welch_psd.hpp"
 #include "qeeg/svg_utils.hpp"
+#include "qeeg/version.hpp"
 
 #include <cmath>
 #include <ctime>
@@ -414,8 +415,7 @@ static void write_map_run_meta_json(const Args& args,
                                     double rel_lo_hz,
                                     double rel_hi_hz) {
   const std::string outpath = args.outdir + "/map_run_meta.json";
-  std::ofstream out(std::filesystem::u8path(outpath), std::ios::binary);
-  if (!out) throw std::runtime_error("Failed to write map_run_meta.json: " + outpath);
+  std::ostringstream out;
   out << std::setprecision(12);
 
   auto write_string_or_null = [&](const std::string& s) {
@@ -449,7 +449,13 @@ static void write_map_run_meta_json(const Args& args,
 
   out << "{\n";
   out << "  \"Tool\": \"qeeg_map_cli\",\n";
+  out << "  \"QeegVersion\": \"" << json_escape(qeeg::version_string()) << "\",\n";
+  out << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
+  out << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
+  out << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
+  out << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
   out << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+  out << "  \"TimestampUTC\": \"" << json_escape(now_string_utc()) << "\",\n";
 
   out << "  \"Input\": {\n";
   out << "    \"Demo\": " << (args.demo ? "true" : "false") << ",\n";
@@ -555,6 +561,10 @@ static void write_map_run_meta_json(const Args& args,
 
   write_outputs_array();
   out << "\n}\n";
+
+  if (!write_text_file_atomic(outpath, out.str())) {
+    throw std::runtime_error("Failed to write map_run_meta.json: " + outpath);
+  }
 }
 
 static void write_map_report_html(const Args& args,

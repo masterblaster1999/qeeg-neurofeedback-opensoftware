@@ -5,6 +5,7 @@
 #include "qeeg/reader.hpp"
 #include "qeeg/topomap.hpp"
 #include "qeeg/utils.hpp"
+#include "qeeg/version.hpp"
 #include "qeeg/welch_psd.hpp"
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -458,55 +460,68 @@ int main(int argc, char** argv) {
     // (e.g., qeeg_export_derivatives_cli can copy all outputs listed here).
     {
       const std::string meta_path = args.outdir + "/iaf_run_meta.json";
-      std::ofstream meta(meta_path, std::ios::binary);
-      if (!meta) {
+
+      std::ostringstream meta;
+      meta << std::setprecision(12);
+
+      auto write_string_or_null = [&](const std::string& s) {
+        if (s.empty()) meta << "null";
+        else meta << "\"" << json_escape(s) << "\"";
+      };
+
+      meta << "{\n";
+      meta << "  \"Tool\": \"qeeg_iaf_cli\",\n";
+      meta << "  \"QeegVersion\": \"" << json_escape(qeeg::version_string()) << "\",\n";
+      meta << "  \"GitDescribe\": \"" << json_escape(qeeg::git_describe_string()) << "\",\n";
+      meta << "  \"BuildType\": \"" << json_escape(qeeg::build_type_string()) << "\",\n";
+      meta << "  \"Compiler\": \"" << json_escape(qeeg::compiler_string()) << "\",\n";
+      meta << "  \"CppStandard\": \"" << json_escape(qeeg::cpp_standard_string()) << "\",\n";
+      meta << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
+      meta << "  \"TimestampUTC\": \"" << json_escape(now_string_utc()) << "\",\n";
+      meta << "  \"Input\": { \"Path\": ";
+      write_string_or_null(args.input_path);
+      meta << ", \"FsCsvHz\": " << args.fs_csv << " },\n";
+      meta << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
+      meta << "  \"SamplingFrequencyHz\": " << rec.fs_hz << ",\n";
+      meta << "  \"ChannelCount\": " << rec.n_channels() << ",\n";
+      meta << "  \"MontageSpec\": \"" << json_escape(args.montage_spec) << "\",\n";
+      meta << "  \"AggregateMode\": \"" << json_escape(args.aggregate) << "\",\n";
+      meta << "  \"Metric\": \"" << json_escape(args.metric) << "\",\n";
+      meta << "  \"AggregateIAFHz\": " << iaf_agg << ",\n";
+      meta << "  \"AggregatePAFHz\": " << paf_agg << ",\n";
+      meta << "  \"AggregateCoGHz\": " << cog_agg << ",\n";
+      meta << "  \"Options\": {\n";
+      meta << "    \"AlphaMinHz\": " << args.alpha_min_hz << ",\n";
+      meta << "    \"AlphaMaxHz\": " << args.alpha_max_hz << ",\n";
+      meta << "    \"Detrend1f\": " << (args.detrend_1_f ? "true" : "false") << ",\n";
+      meta << "    \"DetrendRangeHz\": [" << args.detrend_min_hz << ", " << args.detrend_max_hz << "],\n";
+      meta << "    \"SmoothHz\": " << args.smooth_hz << ",\n";
+      meta << "    \"MinProminenceDb\": " << args.min_prom_db << ",\n";
+      meta << "    \"RequireLocalMax\": " << (args.require_local_max ? "true" : "false") << ",\n";
+      meta << "    \"Welch\": { \"Nperseg\": " << args.nperseg << ", \"Overlap\": " << args.overlap << " },\n";
+      meta << "    \"Preprocess\": { \"AverageReference\": " << (args.average_reference ? "true" : "false")
+           << ", \"NotchHz\": " << args.notch_hz
+           << ", \"NotchQ\": " << args.notch_q
+           << ", \"BandpassLowHz\": " << args.bandpass_low_hz
+           << ", \"BandpassHighHz\": " << args.bandpass_high_hz
+           << ", \"ZeroPhase\": " << (args.zero_phase ? "true" : "false")
+           << " }\n";
+      meta << "  },\n";
+      meta << "  \"Outputs\": [\n";
+      meta << "    \"iaf_by_channel.csv\",\n";
+      meta << "    \"iaf_summary.txt\",\n";
+      if (args.write_bandspec && std::isfinite(iaf_agg)) {
+        meta << "    \"iaf_band_spec.txt\",\n";
+      }
+      if (args.topomap) {
+        meta << "    \"topomap_iaf.bmp\",\n";
+      }
+      meta << "    \"iaf_run_meta.json\"\n";
+      meta << "  ]\n";
+      meta << "}\n";
+
+      if (!write_text_file_atomic(meta_path, meta.str())) {
         std::cerr << "Warning: failed to write iaf_run_meta.json to: " << meta_path << "\n";
-      } else {
-        meta << std::setprecision(12);
-
-        auto write_string_or_null = [&](const std::string& s) {
-          if (s.empty()) meta << "null";
-          else meta << "\"" << json_escape(s) << "\"";
-        };
-
-        meta << "{\n";
-        meta << "  \"Tool\": \"qeeg_iaf_cli\",\n";
-        meta << "  \"TimestampLocal\": \"" << json_escape(now_string_local()) << "\",\n";
-        meta << "  \"Input\": { \"Path\": ";
-        write_string_or_null(args.input_path);
-        meta << ", \"FsCsvHz\": " << args.fs_csv << " },\n";
-        meta << "  \"OutputDir\": \"" << json_escape(args.outdir) << "\",\n";
-        meta << "  \"SamplingFrequencyHz\": " << rec.fs_hz << ",\n";
-        meta << "  \"ChannelCount\": " << rec.n_channels() << ",\n";
-        meta << "  \"MontageSpec\": \"" << json_escape(args.montage_spec) << "\",\n";
-        meta << "  \"AggregateMode\": \"" << json_escape(args.aggregate) << "\",\n";
-        meta << "  \"Metric\": \"" << json_escape(args.metric) << "\",\n";
-        meta << "  \"AggregateIAFHz\": " << iaf_agg << ",\n";
-        meta << "  \"AggregatePAFHz\": " << paf_agg << ",\n";
-        meta << "  \"AggregateCoGHz\": " << cog_agg << ",\n";
-        meta << "  \"Options\": {\n";
-        meta << "    \"AlphaMinHz\": " << args.alpha_min_hz << ",\n";
-        meta << "    \"AlphaMaxHz\": " << args.alpha_max_hz << ",\n";
-        meta << "    \"Detrend1f\": " << (args.detrend_1_f ? "true" : "false") << ",\n";
-        meta << "    \"DetrendRangeHz\": [" << args.detrend_min_hz << ", " << args.detrend_max_hz << "],\n";
-        meta << "    \"SmoothHz\": " << args.smooth_hz << ",\n";
-        meta << "    \"MinProminenceDb\": " << args.min_prom_db << ",\n";
-        meta << "    \"RequireLocalMax\": " << (args.require_local_max ? "true" : "false") << ",\n";
-        meta << "    \"Welch\": { \"Nperseg\": " << args.nperseg << ", \"Overlap\": " << args.overlap << " },\n";
-        meta << "    \"Preprocess\": { \"AverageReference\": " << (args.average_reference ? "true" : "false") << ", \"NotchHz\": " << args.notch_hz << ", \"NotchQ\": " << args.notch_q << ", \"BandpassLowHz\": " << args.bandpass_low_hz << ", \"BandpassHighHz\": " << args.bandpass_high_hz << ", \"ZeroPhase\": " << (args.zero_phase ? "true" : "false") << " }\n";
-        meta << "  },\n";
-        meta << "  \"Outputs\": [\n";
-        meta << "    \"iaf_by_channel.csv\",\n";
-        meta << "    \"iaf_summary.txt\",\n";
-        if (args.write_bandspec && std::isfinite(iaf_agg)) {
-          meta << "    \"iaf_band_spec.txt\",\n";
-        }
-        if (args.topomap) {
-          meta << "    \"topomap_iaf.bmp\",\n";
-        }
-        meta << "    \"iaf_run_meta.json\"\n";
-        meta << "  ]\n";
-        meta << "}\n";
       }
     }
     std::cout << "Done. Outputs written to: " << args.outdir << "\n";

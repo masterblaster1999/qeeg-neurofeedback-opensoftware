@@ -520,6 +520,85 @@ void ensure_directory(const std::string& path) {
   std::filesystem::create_directories(std::filesystem::u8path(path));
 }
 
+bool write_text_file(const std::string& path, const std::string& content) {
+  const std::filesystem::path p = std::filesystem::u8path(path);
+  std::error_code ec;
+  if (p.has_parent_path()) {
+    std::filesystem::create_directories(p.parent_path(), ec);
+  }
+
+  std::ofstream out(p, std::ios::binary);
+  if (!out) return false;
+  if (!content.empty()) out.write(content.data(), static_cast<std::streamsize>(content.size()));
+  out.flush();
+  out.close();
+  return static_cast<bool>(out);
+}
+
+namespace {
+
+static std::filesystem::path make_tmp_path_same_dir(const std::filesystem::path& target) {
+  const std::filesystem::path dir = target.has_parent_path() ? target.parent_path()
+                                                             : std::filesystem::path();
+  const std::string base = target.filename().u8string();
+  const std::string name = base + ".tmp." + random_hex_token(8);
+  return dir.empty() ? std::filesystem::u8path(name)
+                     : (dir / std::filesystem::u8path(name));
+}
+
+} // namespace
+
+bool write_text_file_atomic(const std::string& path, const std::string& content) {
+  const std::filesystem::path target = std::filesystem::u8path(path);
+
+  // Ensure destination directory exists.
+  std::error_code ec;
+  if (target.has_parent_path()) {
+    std::filesystem::create_directories(target.parent_path(), ec);
+  }
+
+  // Create a temporary file in the same directory (best-effort).
+  std::filesystem::path tmp = make_tmp_path_same_dir(target);
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    if (!std::filesystem::exists(tmp, ec)) break;
+    tmp = make_tmp_path_same_dir(target);
+  }
+
+  {
+    std::ofstream out(tmp, std::ios::binary);
+    if (!out) return false;
+    if (!content.empty()) out.write(content.data(), static_cast<std::streamsize>(content.size()));
+    out.flush();
+    out.close();
+    if (!out) {
+      std::error_code rm_ec;
+      std::filesystem::remove(tmp, rm_ec);
+      return false;
+    }
+  }
+
+  // Rename into place.
+  ec.clear();
+  std::filesystem::rename(tmp, target, ec);
+  if (ec) {
+    // On some platforms (notably Windows), rename may fail if the destination
+    // exists. Best-effort fallback: remove existing destination and rename.
+    std::error_code rm_ec;
+    std::filesystem::remove(target, rm_ec);
+    ec.clear();
+    std::filesystem::rename(tmp, target, ec);
+  }
+
+  if (ec) {
+    // Best-effort cleanup.
+    std::error_code rm_ec;
+    std::filesystem::remove(tmp, rm_ec);
+    return false;
+  }
+
+  return true;
+}
+
 namespace {
 
 static bool localtime_safe(std::time_t t, std::tm* out) {
@@ -626,6 +705,159 @@ std::string now_string_utc() {
   return oss.str();
 }
 
+
+namespace {
+
+static bool parse_2dig(const std::string& s, size_t pos, int* out) {
+  if (!out) return false;
+  if (pos + 2 > s.size()) return false;
+  const char a = s[pos];
+  const char b = s[pos + 1];
+  if (a < '0' || a > '9' || b < '0' || b > '9') return false;
+  *out = (a - '0') * 10 + (b - '0');
+  return true;
+}
+
+static bool parse_4dig(const std::string& s, size_t pos, int* out) {
+  if (!out) return false;
+  if (pos + 4 > s.size()) return false;
+  int v = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    const char c = s[pos + i];
+    if (c < '0' || c > '9') return false;
+    v = v * 10 + (c - '0');
+  }
+  *out = v;
+  return true;
+}
+
+static bool is_leap_year(int y) {
+  // Gregorian leap year rules.
+  if (y % 4 != 0) return false;
+  if (y % 100 != 0) return true;
+  return (y % 400 == 0);
+}
+
+static int days_in_month(int y, int m) {
+  static const int mdays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (m < 1 || m > 12) return 0;
+  if (m == 2) return mdays[1] + (is_leap_year(y) ? 1 : 0);
+  return mdays[m - 1];
+}
+
+static bool valid_civil(int y, int m, int d) {
+  if (m < 1 || m > 12) return false;
+  const int dim = days_in_month(y, m);
+  if (dim <= 0) return false;
+  return d >= 1 && d <= dim;
+}
+
+// Convert a civil date to days since Unix epoch (1970-01-01).
+//
+// This uses Howard Hinnant's well-known, dependency-free civil date algorithm.
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+  // Shift March-based year to simplify leap handling.
+  y -= (m <= 2) ? 1 : 0;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(y - era * 400); // [0, 399]
+  const unsigned doy = (153 * (m + (m > 2 ?  -3 : 9)) + 2) / 5 + d - 1; // [0, 365]
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+  // 719468 is the number of days from 0000-03-01 to 1970-01-01.
+  return static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+} // namespace
+
+bool parse_iso8601_to_utc_millis(const std::string& ts, int64_t* out_utc_ms) {
+  if (!out_utc_ms) return false;
+  *out_utc_ms = 0;
+
+  // Minimum length for: YYYY-MM-DDTHH:MM:SSZ
+  if (ts.size() < 20) return false;
+
+  int year = 0;
+  int mon = 0;
+  int day = 0;
+  int hh = 0;
+  int mm = 0;
+  int ss = 0;
+
+  if (!parse_4dig(ts, 0, &year) || ts[4] != '-') return false;
+  if (!parse_2dig(ts, 5, &mon) || ts[7] != '-') return false;
+  if (!parse_2dig(ts, 8, &day)) return false;
+
+  const char t = ts[10];
+  if (t != 'T' && t != 't') return false;
+
+  if (!parse_2dig(ts, 11, &hh) || ts[13] != ':') return false;
+  if (!parse_2dig(ts, 14, &mm) || ts[16] != ':') return false;
+  if (!parse_2dig(ts, 17, &ss)) return false;
+
+  if (!valid_civil(year, mon, day)) return false;
+  if (hh < 0 || hh > 23) return false;
+  if (mm < 0 || mm > 59) return false;
+  if (ss < 0 || ss > 59) return false;
+
+  size_t i = 19;
+  int millis = 0;
+
+  // Optional fractional seconds.
+  if (i < ts.size() && ts[i] == '.') {
+    ++i;
+    if (i >= ts.size()) return false;
+    if (ts[i] < '0' || ts[i] > '9') return false;
+
+    int mult = 100;
+    size_t nd = 0;
+    while (i < ts.size()) {
+      const char c = ts[i];
+      if (c < '0' || c > '9') break;
+      if (nd < 3) {
+        millis += (c - '0') * mult;
+        mult /= 10;
+      }
+      ++nd;
+      ++i;
+    }
+  }
+
+  if (i >= ts.size()) return false;
+
+  // Time zone spec.
+  int offset_seconds = 0;
+  const char z = ts[i];
+  if ((z == 'Z' || z == 'z') && i + 1 == ts.size()) {
+    offset_seconds = 0;
+    i += 1;
+  } else if ((z == '+' || z == '-') && i + 6 == ts.size() && ts[i + 3] == ':') {
+    int oh = 0;
+    int om = 0;
+    if (!parse_2dig(ts, i + 1, &oh)) return false;
+    if (!parse_2dig(ts, i + 4, &om)) return false;
+    if (oh < 0 || oh > 23) return false;
+    if (om < 0 || om > 59) return false;
+    offset_seconds = oh * 3600 + om * 60;
+    if (z == '-') offset_seconds = -offset_seconds;
+    i += 6;
+  } else {
+    return false;
+  }
+
+  if (i != ts.size()) return false;
+
+  const int64_t days = days_from_civil(year, static_cast<unsigned>(mon), static_cast<unsigned>(day));
+  const int64_t local_seconds = days * 86400 + static_cast<int64_t>(hh) * 3600 + static_cast<int64_t>(mm) * 60 + static_cast<int64_t>(ss);
+
+  // ISO-8601 numeric UTC offsets are defined such that:
+  //   local_time = utc_time + offset
+  // so:
+  //   utc_time = local_time - offset
+  const int64_t utc_seconds = local_seconds - static_cast<int64_t>(offset_seconds);
+
+  *out_utc_ms = utc_seconds * 1000 + static_cast<int64_t>(millis);
+  return true;
+}
+
 std::string json_escape(const std::string& s) {
   // Minimal JSON string escape.
   //
@@ -657,6 +889,347 @@ std::string json_escape(const std::string& s) {
     }
   }
   return oss.str();
+}
+
+namespace {
+
+static void json_skip_ws(const std::string& s, size_t* i) {
+  while (i && *i < s.size() && std::isspace(static_cast<unsigned char>(s[*i])) != 0) {
+    ++(*i);
+  }
+}
+
+static bool json_parse_hex4(const std::string& s, size_t pos, unsigned* out) {
+  if (!out) return false;
+  if (pos + 4 > s.size()) return false;
+  unsigned v = 0;
+  for (size_t k = 0; k < 4; ++k) {
+    const char c = s[pos + k];
+    v <<= 4;
+    if (c >= '0' && c <= '9') v |= static_cast<unsigned>(c - '0');
+    else if (c >= 'a' && c <= 'f') v |= static_cast<unsigned>(10 + (c - 'a'));
+    else if (c >= 'A' && c <= 'F') v |= static_cast<unsigned>(10 + (c - 'A'));
+    else return false;
+  }
+  *out = v;
+  return true;
+}
+
+static void json_append_utf8(unsigned codepoint, std::string* out) {
+  if (!out) return;
+
+  // JSON \u escapes are UTF-16 code units. Surrogate codepoints are not valid
+  // scalar values in UTF-8; treat them as replacement characters.
+  if (codepoint > 0x10FFFFu || (codepoint >= 0xD800u && codepoint <= 0xDFFFu)) {
+    codepoint = 0xFFFDu; // U+FFFD replacement
+  }
+
+  if (codepoint <= 0x7Fu) {
+    out->push_back(static_cast<char>(codepoint));
+  } else if (codepoint <= 0x7FFu) {
+    out->push_back(static_cast<char>(0xC0u | ((codepoint >> 6) & 0x1Fu)));
+    out->push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+  } else if (codepoint <= 0xFFFFu) {
+    out->push_back(static_cast<char>(0xE0u | ((codepoint >> 12) & 0x0Fu)));
+    out->push_back(static_cast<char>(0x80u | ((codepoint >> 6) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+  } else {
+    out->push_back(static_cast<char>(0xF0u | ((codepoint >> 18) & 0x07u)));
+    out->push_back(static_cast<char>(0x80u | ((codepoint >> 12) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | ((codepoint >> 6) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+  }
+}
+
+static bool json_parse_string(const std::string& s, size_t* i, std::string* out) {
+  if (!i || *i >= s.size() || s[*i] != '"') return false;
+  ++(*i);
+  std::string r;
+  r.reserve(64);
+
+  while (*i < s.size()) {
+    const char c = s[*i];
+    ++(*i);
+
+    if (c == '"') {
+      if (out) *out = r;
+      return true;
+    }
+
+    if (c == '\\') {
+      if (*i >= s.size()) return false;
+      const char e = s[*i];
+      ++(*i);
+      switch (e) {
+        case '"': r.push_back('"'); break;
+        case '\\': r.push_back('\\'); break;
+        case '/': r.push_back('/'); break;
+        case 'b': r.push_back('\b'); break;
+        case 'f': r.push_back('\f'); break;
+        case 'n': r.push_back('\n'); break;
+        case 'r': r.push_back('\r'); break;
+        case 't': r.push_back('\t'); break;
+        case 'u': {
+          // \uXXXX (UTF-16 code unit). Combine surrogate pairs when present.
+          unsigned cp = 0;
+          if (!json_parse_hex4(s, *i, &cp)) return false;
+          *i += 4;
+
+          // High surrogate?
+          if (cp >= 0xD800u && cp <= 0xDBFFu) {
+            // Look for a following low surrogate escape sequence: \uYYYY
+            if ((*i + 6) <= s.size() && s[*i] == '\\' && s[*i + 1] == 'u') {
+              unsigned low = 0;
+              if (json_parse_hex4(s, *i + 2, &low) && low >= 0xDC00u && low <= 0xDFFFu) {
+                // Consume the second escape.
+                *i += 6;
+                const unsigned hi = cp;
+                const unsigned codepoint = 0x10000u + ((hi - 0xD800u) << 10) + (low - 0xDC00u);
+                json_append_utf8(codepoint, &r);
+                break;
+              }
+            }
+            // Invalid/missing low surrogate: replacement char.
+            json_append_utf8(0xFFFDu, &r);
+            break;
+          }
+
+          // Orphan low surrogate?
+          if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+            json_append_utf8(0xFFFDu, &r);
+            break;
+          }
+
+          json_append_utf8(cp, &r);
+          break;
+        }
+        default:
+          // Unknown escape: keep the literal char.
+          r.push_back(e);
+          break;
+      }
+      continue;
+    }
+
+    r.push_back(c);
+  }
+  return false;
+}
+
+static bool json_find_value_pos_top_level(const std::string& s,
+                                         const std::string& key,
+                                         size_t* out_pos) {
+  // Find a JSON object member matching `key` and return the position of its value.
+  //
+  // We intentionally avoid naive substring search for \"<key>\" because that can
+  // match occurrences inside JSON string values.
+  //
+  // We also restrict matches to the *top-level* object (depth 1) so that nested
+  // objects cannot shadow keys unexpectedly.
+  int depth = 0;
+  size_t i = 0;
+  while (i < s.size()) {
+    const char c = s[i];
+
+    if (c == '"') {
+      const size_t token_start = i;
+      std::string tok;
+      if (!json_parse_string(s, &i, &tok)) {
+        // Malformed string: advance to avoid an infinite loop.
+        i = token_start + 1;
+        continue;
+      }
+
+      if (depth == 1 && tok == key) {
+        size_t j = i;
+        json_skip_ws(s, &j);
+        if (j < s.size() && s[j] == ':') {
+          ++j;
+          json_skip_ws(s, &j);
+          if (out_pos) *out_pos = j;
+          return true;
+        }
+      }
+      continue;
+    }
+
+    if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      if (depth > 0) --depth;
+    }
+
+    ++i;
+  }
+  return false;
+}
+
+} // namespace
+
+std::string json_find_string_value(const std::string& s, const std::string& key) {
+  size_t pos = 0;
+  if (!json_find_value_pos_top_level(s, key, &pos)) return {};
+  if (pos >= s.size() || s[pos] != '"') return {};
+  std::string out;
+  if (!json_parse_string(s, &pos, &out)) return {};
+  return out;
+}
+
+bool json_find_bool_value(const std::string& s, const std::string& key, bool default_value) {
+  // Accepts:
+  //   {"key":true} / {"key":false}
+  //   {"key":"true"} / {"key":"false"}
+  //   {"key":1} / {"key":0}
+  size_t i = 0;
+  if (!json_find_value_pos_top_level(s, key, &i)) return default_value;
+  if (i >= s.size()) return default_value;
+
+  auto is_delim = [](char c) {
+    return c == ',' || c == '}' || c == ']' || std::isspace(static_cast<unsigned char>(c)) != 0;
+  };
+
+  if (s.compare(i, 4, "true") == 0 && (i + 4 == s.size() || is_delim(s[i + 4]))) return true;
+  if (s.compare(i, 5, "false") == 0 && (i + 5 == s.size() || is_delim(s[i + 5]))) return false;
+  if (s[i] == '1' && (i + 1 == s.size() || is_delim(s[i + 1]))) return true;
+  if (s[i] == '0' && (i + 1 == s.size() || is_delim(s[i + 1]))) return false;
+
+  if (s[i] == '"') {
+    std::string v;
+    size_t j = i;
+    if (!json_parse_string(s, &j, &v)) return default_value;
+    const std::string lv = to_lower(trim(v));
+    if (lv == "true" || lv == "1" || lv == "yes" || lv == "y") return true;
+    if (lv == "false" || lv == "0" || lv == "no" || lv == "n") return false;
+  }
+
+  return default_value;
+}
+
+int json_find_int_value(const std::string& s, const std::string& key, int default_value) {
+  // Accepts:
+  //   {"key":123}
+  //   {"key":"123"}
+  //   {"key":-5}
+  size_t i = 0;
+  if (!json_find_value_pos_top_level(s, key, &i)) return default_value;
+  if (i >= s.size()) return default_value;
+
+  std::string num;
+  if (s[i] == '"') {
+    size_t j = i;
+    if (!json_parse_string(s, &j, &num)) return default_value;
+    num = trim(num);
+  } else {
+    size_t j = i;
+    if (j < s.size() && (s[j] == '-' || s[j] == '+')) ++j;
+    while (j < s.size() && std::isdigit(static_cast<unsigned char>(s[j])) != 0) ++j;
+    if (j <= i) return default_value;
+    num = s.substr(i, j - i);
+    num = trim(num);
+  }
+
+  try {
+    return qeeg::to_int(num);
+  } catch (...) {
+    return default_value;
+  }
+}
+
+bool normalize_rel_path_safe(const std::string& raw, std::string* out_norm) {
+  if (!out_norm) return false;
+  *out_norm = std::string();
+
+  std::string s = trim(raw);
+  if (s.empty()) return false;
+
+  // Embedded NUL bytes are not valid in filesystem paths.
+  if (s.find('\0') != std::string::npos) return false;
+
+  // Allow both slash styles; normalize to URL/posix-style slashes.
+  std::replace(s.begin(), s.end(), '\\', '/');
+
+  // Reject Windows drive prefixes like "C:" early (even if followed by '/').
+  if (s.size() >= 2 && std::isalpha(static_cast<unsigned char>(s[0])) != 0 && s[1] == ':') {
+    return false;
+  }
+
+  // Strip any leading slashes so "/abs" cannot become an absolute path when joined.
+  while (!s.empty() && (s.front() == '/' || s.front() == '\\')) s.erase(s.begin());
+
+  // Strip trailing slashes so directory paths like "outdir/" are accepted.
+  while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+
+  std::filesystem::path p;
+  try {
+    p = std::filesystem::u8path(s);
+  } catch (...) {
+    return false;
+  }
+
+  if (p.empty()) return false;
+  if (p.is_absolute() || p.has_root_name() || p.has_root_directory()) return false;
+
+  for (const auto& part : p) {
+    const std::string comp = part.u8string();
+    if (comp.empty()) return false;
+    if (comp == "..") return false;
+  }
+
+  // Normalize "." segments lexically (no filesystem access).
+  const std::filesystem::path n = p.lexically_normal();
+  if (n.empty()) return false;
+
+  const std::string norm = n.generic_u8string();
+  if (norm.empty() || norm == ".") return false;
+  if (norm.find('\0') != std::string::npos) return false;
+
+  // Defense in depth: re-parse and re-check the normalized path.
+  std::filesystem::path pn;
+  try {
+    pn = std::filesystem::u8path(norm);
+  } catch (...) {
+    return false;
+  }
+  if (pn.empty()) return false;
+  if (pn.is_absolute() || pn.has_root_name() || pn.has_root_directory()) return false;
+  for (const auto& part : pn) {
+    const std::string comp = part.u8string();
+    if (comp.empty()) return false;
+    if (comp == "..") return false;
+  }
+
+  *out_norm = norm;
+  return true;
+}
+
+std::string url_encode_path(const std::string& path) {
+  // RFC 3986 percent-encoding (best-effort) for URL *paths*.
+  //
+  // We keep alphanumerics and the unreserved set "-._~" plus '/'.
+  // Everything else (including spaces, '#', '?', '%' etc.) is percent-encoded.
+  //
+  // On Windows, file paths commonly use '\\' separators. When such paths are
+  // accidentally embedded into URLs, browsers will treat '\\' as a literal
+  // character (or we would encode it as %5C), which breaks navigation.
+  // Normalize '\\' to '/' to keep links working cross-platform.
+  static const char* kHex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(path.size());
+  for (unsigned char uc : path) {
+    char c = static_cast<char>(uc);
+    if (c == '\\') c = '/';
+    const bool unreserved =
+        (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+        c == '-' || c == '.' || c == '_' || c == '~';
+    if (unreserved || c == '/') {
+      out.push_back(c);
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[(uc >> 4) & 0xF]);
+      out.push_back(kHex[uc & 0xF]);
+    }
+  }
+  return out;
 }
 
 

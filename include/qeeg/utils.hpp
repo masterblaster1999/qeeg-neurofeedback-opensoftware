@@ -110,6 +110,31 @@ double to_double(const std::string& s);
 bool file_exists(const std::string& path);
 void ensure_directory(const std::string& path);
 
+// Write a text file to disk (UTF-8 bytes, best-effort).
+//
+// Returns true on success, false on failure.
+//
+// Notes:
+// - Parent directories are created (best-effort).
+// - The file is written in binary mode to avoid newline translation.
+bool write_text_file(const std::string& path, const std::string& content);
+
+// Atomically write a text file by writing to a temporary file in the same
+// directory and renaming it into place (best-effort).
+//
+// This pattern reduces the chance that readers observe a partially-written
+// JSON/HTML file (e.g., if the process crashes mid-write).
+//
+// Notes:
+// - The temporary file is created in the destination directory so that the
+//   rename is most likely to remain on the same filesystem.
+// - On POSIX filesystems, rename within the same filesystem is typically
+//   atomic; on Windows, std::filesystem::rename semantics vary, so this
+//   function falls back to removing an existing destination and renaming
+//   again (not perfectly atomic, but best-effort).
+// - Any temporary file is removed on failure (best-effort).
+bool write_text_file_atomic(const std::string& path, const std::string& content);
+
 // Return a human-readable local timestamp string (best-effort).
 //
 // Format: ISO-8601 local time with numeric UTC offset, e.g.
@@ -124,6 +149,22 @@ std::string now_string_local();
 //   2026-01-15T18:37:42Z
 std::string now_string_utc();
 
+// Parse an ISO-8601 / RFC3339-style timestamp and convert it to UTC milliseconds
+// since the Unix epoch (1970-01-01T00:00:00Z).
+//
+// Supported forms (best-effort):
+//   - YYYY-MM-DDTHH:MM:SSZ
+//   - YYYY-MM-DDTHH:MM:SS.sssZ
+//   - YYYY-MM-DDTHH:MM:SS±HH:MM
+//   - YYYY-MM-DDTHH:MM:SS.sss±HH:MM
+//
+// Notes:
+// - Fractional seconds are truncated to milliseconds.
+// - This is intentionally lightweight (no locale dependence, no DST rules).
+//
+// Returns true on success and writes the UTC timestamp to out_utc_ms.
+bool parse_iso8601_to_utc_millis(const std::string& ts, int64_t* out_utc_ms);
+
 
 // Escape a string for safe inclusion in JSON string values.
 //
@@ -131,6 +172,57 @@ std::string now_string_utc();
 // (e.g., run metadata) without pulling in a full JSON dependency.
 // The returned string does NOT include surrounding quotes.
 std::string json_escape(const std::string& s);
+
+// Tiny JSON extractors for simple {"key": value}-style objects.
+//
+// These helpers are intentionally small and dependency-free. They are NOT a
+// general JSON parser; they are intended for reading small JSON objects
+// produced by this project (e.g., UI server request bodies).
+//
+// Behavior (best-effort):
+// - Searches only the top-level object (depth 1).
+// - Ignores occurrences of keys inside JSON string values.
+// - For string values, supports standard JSON escapes including \uXXXX
+//   sequences and UTF-16 surrogate pairs.
+//
+// Value semantics:
+// - json_find_string_value(): returns empty string if missing or not a string
+// - json_find_bool_value(): returns default_value if missing/unparseable;
+//   accepts true/false, 1/0, and quoted variants like "yes"/"no"
+// - json_find_int_value(): returns default_value if missing/unparseable;
+//   accepts numbers or quoted numbers
+std::string json_find_string_value(const std::string& s, const std::string& key);
+bool json_find_bool_value(const std::string& s, const std::string& key, bool default_value);
+int json_find_int_value(const std::string& s, const std::string& key, int default_value);
+
+// Percent-encode a URL path for safe use in HTML href/src attributes.
+//
+// This treats the input as UTF-8 bytes and encodes any byte that is not an
+// RFC 3986 "unreserved" character or a forward slash '/'.
+//
+// Notes:
+// - Existing '%' characters are encoded as "%25" to avoid accidental decoding.
+// - This is intended for the URL *path* portion (not application/x-www-form-urlencoded).
+// - Windows path separators ('\\') are normalized to '/'.
+std::string url_encode_path(const std::string& path);
+
+// Normalize and validate a relative path string for safe joining.
+//
+// Intended for run meta Outputs[] entries and UI-discovered artifacts.
+// This helper is intentionally conservative: it rejects ".." traversal
+// segments and Windows drive prefixes ("C:").
+//
+// Normalizations (best-effort):
+// - trims leading/trailing whitespace
+// - converts '\\' to '/' (to tolerate Windows-style paths)
+// - strips leading '/' so "/abs" cannot be treated as an absolute path when joined
+// - strips trailing '/' so directory paths like "outdir/" are accepted
+// - lexically normalizes '.' segments (no filesystem access)
+//
+// On success, writes a normalized POSIX-style relative path (with '/' separators)
+// to out_norm and returns true.
+bool normalize_rel_path_safe(const std::string& raw, std::string* out_norm);
+
 
 // Generate a random hexadecimal token (2*n_bytes characters).
 //

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -88,6 +89,7 @@ static std::vector<std::string> discover_cli_tools_in_bin_dir(const std::filesys
 static std::string infer_group_from_name(const std::string& tool) {
   // Heuristic grouping for tools that are auto-discovered but not part of the
   // curated metadata list.
+  if (tool.find("pipeline") != std::string::npos || tool.find("bundle") != std::string::npos) return "Workflows";
   if (tool.find("_ui_") != std::string::npos) return "UI";
   if (tool.find("_nf_") != std::string::npos) return "Neurofeedback";
   if (tool.find("microstates") != std::string::npos) return "Microstates";
@@ -128,6 +130,10 @@ static std::vector<ToolSpec> default_tools() {
     {"qeeg_convert_cli", "Inspect & Convert",
      "Convert/normalize inputs to CSV and optionally remap/rename channels.",
      "qeeg_convert_cli --input session.edf --output session.csv --events-out events.csv"},
+
+    {"qeeg_pipeline_cli", "Workflows",
+     "Chain multiple qeeg_*_cli tools into one workspace (preprocess -> bandpower -> ratios -> optional topomaps/region summaries).",
+     "qeeg_pipeline_cli --input session.edf --outdir out_work --topomaps --region-summary --write-ui"},
 
     {"qeeg_export_edf_cli", "Inspect & Convert",
      "Export to EDF/EDF+ (optionally embed events) for round-trip friendliness.",
@@ -627,6 +633,14 @@ struct RunInfo {
   std::filesystem::path meta_path;   // absolute
   std::filesystem::path meta_dir;    // absolute
   std::string input_path;            // as stored in JSON (best-effort)
+  std::string timestamp_local;        // best-effort
+  std::string timestamp_utc;          // best-effort
+  int64_t timestamp_sort_utc_ms{-1}; // internal: parsed UTC ms
+  std::string version;                // best-effort (QeegVersion/Version)
+  std::string git_describe;           // best-effort
+  std::string build_type;             // best-effort
+  std::string compiler;               // best-effort
+  std::string cpp_standard;           // best-effort
   std::vector<std::string> outputs;  // as stored in JSON
   std::filesystem::file_time_type mtime{};
 };
@@ -645,25 +659,54 @@ static std::unordered_map<std::string, RunInfo> scan_latest_runs_by_tool(
     if (!it->is_regular_file(ec)) continue;
     const auto p = it->path();
     if (!ends_with(p.filename().u8string(), "_run_meta.json")) continue;
-
-    const std::string tool = read_run_meta_tool(p.u8string());
+    const RunMetaSummary meta = read_run_meta_summary(p.u8string());
+    const std::string tool = meta.tool;
     if (tool.empty()) continue;
 
     RunInfo info;
     info.meta_path = p;
     info.meta_dir = p.parent_path();
-    info.input_path = read_run_meta_input_path(p.u8string());
-    info.outputs = read_run_meta_outputs(p.u8string());
+    info.input_path = meta.input_path;
+    info.timestamp_local = meta.timestamp_local;
+    info.timestamp_utc = meta.timestamp_utc;
+    info.timestamp_sort_utc_ms = -1;
+    int64_t ts_ms = 0;
+    if (parse_iso8601_to_utc_millis(info.timestamp_utc, &ts_ms) ||
+        parse_iso8601_to_utc_millis(info.timestamp_local, &ts_ms)) {
+      info.timestamp_sort_utc_ms = ts_ms;
+    }
+    info.version = meta.version;
+    info.git_describe = meta.git_describe;
+    info.build_type = meta.build_type;
+    info.compiler = meta.compiler;
+    info.cpp_standard = meta.cpp_standard;
+    info.outputs = meta.outputs;
     info.mtime = std::filesystem::last_write_time(p, ec);
     if (ec) info.mtime = std::filesystem::file_time_type{};
-
     auto jt = best.find(tool);
     if (jt == best.end()) {
       best[tool] = info;
       continue;
     }
-    // Keep the newest by last_write_time when available.
-    if (info.mtime > jt->second.mtime) {
+
+    // Keep the newest by TimestampUTC/TimestampLocal when parseable; fall back to mtime.
+    const bool a_has_ts = info.timestamp_sort_utc_ms >= 0;
+    const bool b_has_ts = jt->second.timestamp_sort_utc_ms >= 0;
+    bool take = false;
+
+    if (a_has_ts && b_has_ts) {
+      if (info.timestamp_sort_utc_ms > jt->second.timestamp_sort_utc_ms) {
+        take = true;
+      } else if (info.timestamp_sort_utc_ms == jt->second.timestamp_sort_utc_ms && info.mtime > jt->second.mtime) {
+        take = true;
+      }
+    } else if (a_has_ts && !b_has_ts) {
+      take = true;
+    } else if (!a_has_ts && !b_has_ts) {
+      if (info.mtime > jt->second.mtime) take = true;
+    }
+
+    if (take) {
       best[tool] = info;
     }
   }
@@ -680,6 +723,39 @@ static std::string rel_link(const std::filesystem::path& from_dir,
     return target.generic_u8string();
   }
   return rel.generic_u8string();
+}
+
+static std::string human_size(uintmax_t n) {
+  const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+  double v = static_cast<double>(n);
+  size_t u = 0;
+  while (v >= 1024.0 && u < 4) {
+    v /= 1024.0;
+    ++u;
+  }
+  std::ostringstream oss;
+  if (u == 0) {
+    oss << static_cast<uintmax_t>(v) << ' ' << units[u];
+  } else {
+    oss << std::fixed << std::setprecision(v >= 10.0 ? 1 : 2) << v << ' ' << units[u];
+  }
+  return oss.str();
+}
+
+static bool parse_safe_rel_path(const std::string& raw, std::filesystem::path* out_rel) {
+  if (!out_rel) return false;
+  *out_rel = std::filesystem::path();
+
+  std::string norm;
+  if (!qeeg::normalize_rel_path_safe(raw, &norm)) return false;
+
+  try {
+    *out_rel = std::filesystem::u8path(norm);
+  } catch (...) {
+    return false;
+  }
+
+  return !out_rel->empty();
 }
 
 static void write_html(std::ostream& o, const UiDashboardArgs& args) {
@@ -856,6 +932,7 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
     << "    .pill.live.running{color:var(--good)}\n"
     << "    .pill.live.queued{color:var(--muted)}\n"
     << "    .pill.live.stopping{color:var(--accent)}\n"
+    << "    .pill.bad{color:var(--bad);border-color:rgba(255,92,122,0.35);background:rgba(255,92,122,0.10)}\n"
     << "    table{width:100%;border-collapse:collapse}\n"
     << "    th,td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px;vertical-align:top}\n"
     << "    th{color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-size:11px}\n"
@@ -1070,8 +1147,9 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
         const std::filesystem::path exe = resolve_exe_path(bin_dir, t.name);
         if (!exe.empty()) {
           const std::string href = rel_link(out_dir, exe);
+          const std::string href_url = url_encode_path(href);
           o << "      <div style=\"color:var(--muted);font-size:12px;margin:0 0 10px\">"
-            << "Binary: <a href=\"" << html_escape(href) << "\"><code>" << html_escape(href) << "</code></a>";
+            << "Binary: <a href=\"" << html_escape(href_url) << "\"><code>" << html_escape(href) << "</code></a>";
           o << "</div>\n";
         } else {
           o << "      <div style=\"color:var(--muted);font-size:12px;margin:0 0 10px\">"
@@ -1207,9 +1285,11 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
       } else {
         const RunInfo& ri = itrun->second;
         // Link to the run meta file.
+        const std::string meta_href = rel_link(out_dir, ri.meta_path);
+        const std::string meta_href_url = url_encode_path(meta_href);
         o << "          <div style=\"color:var(--muted);font-size:12px;margin-bottom:6px\">"
-          << "Run meta: <a href=\"" << html_escape(rel_link(out_dir, ri.meta_path)) << "\">"
-          << html_escape(rel_link(out_dir, ri.meta_path)) << "</a></div>\n";
+          << "Run meta: <a href=\"" << html_escape(meta_href_url) << "\">"
+          << html_escape(meta_href) << "</a></div>\n";
 
         if (!ri.input_path.empty()) {
           std::string base = ri.input_path;
@@ -1224,6 +1304,40 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
             << html_escape(base) << "</code></div>\n";
         }
 
+        // Optional: timestamp/version/build info (added by qeeg::write_run_meta_json and newer run_meta writers).
+        const std::string ts_disp = !ri.timestamp_local.empty() ? ri.timestamp_local : ri.timestamp_utc;
+        const std::string ts_title = !ri.timestamp_utc.empty() ? ri.timestamp_utc : ts_disp;
+        if (!ts_disp.empty()) {
+          o << "          <div style=\"color:var(--muted);font-size:12px;margin-bottom:6px\">"
+            << "Generated: <code title=\"" << html_escape(ts_title) << "\">"
+            << html_escape(ts_disp) << "</code></div>\n";
+        }
+        if (!ri.version.empty()) {
+          o << "          <div style=\"color:var(--muted);font-size:12px;margin-bottom:6px\">"
+            << "Version: <code>" << html_escape(ri.version) << "</code>";
+          if (!ri.git_describe.empty()) {
+            o << " <span style=\"opacity:0.85\">(" << "git: <code>" << html_escape(ri.git_describe) << "</code>)</span>";
+          }
+          o << "</div>\n";
+        }
+
+
+        if (!ri.build_type.empty() || !ri.compiler.empty() || !ri.cpp_standard.empty()) {
+          o << "          <div style=\"color:var(--muted);font-size:12px;margin-bottom:6px\">"
+            << "Build: ";
+          bool first = true;
+          auto emit = [&](const std::string& s) {
+            if (s.empty()) return;
+            if (!first) o << " <span style=\"opacity:0.6\">&middot;</span> ";
+            first = false;
+            o << "<code>" << html_escape(s) << "</code>";
+          };
+          emit(ri.build_type);
+          emit(ri.compiler);
+          emit(ri.cpp_standard);
+          o << "</div>\n";
+        }
+
         // Always list the meta itself and outputs.
         if (ri.outputs.empty()) {
           o << "          <div style=\"color:var(--muted);font-size:13px\">No Outputs[] listed in the run meta.</div>\n";
@@ -1231,31 +1345,134 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
           // Separate images for lightweight previews.
           std::vector<std::filesystem::path> image_paths;
           std::vector<std::filesystem::path> text_paths;
-          for (const auto& rel : ri.outputs) {
-            const std::filesystem::path p = ri.meta_dir / std::filesystem::u8path(rel);
-            const std::string href = rel_link(out_dir, p);
-            o << "          <div class=\"outrow\">\n";
-            o << "            <button class=\"btn\" data-path=\"" << html_escape(href)
-              << "\" onclick=\"selectPathAuto(this.dataset.path)\">Use as input</button>\n";
-            o << "            <a href=\"" << html_escape(href)
-              << "\" target=\"_blank\" rel=\"noopener\">" << html_escape(href) << "</a>\n";
-            o << "          </div>\n";
-            const std::string ext = to_lower(p.extension().u8string());
-            if (ext == ".bmp" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".svg") {
-              image_paths.push_back(p);
+          for (const auto& rel_raw : ri.outputs) {
+            std::filesystem::path relp;
+            const bool safe = parse_safe_rel_path(rel_raw, &relp);
+
+            std::filesystem::path abs;
+            std::string href;
+            std::string inject_path;
+            std::string inject_dir;
+            bool inject_ws_rel = false;
+            bool exists = false;
+            bool is_dir = false;
+            uintmax_t sz = 0;
+            std::string ext;
+
+            if (safe) {
+              abs = ri.meta_dir / relp;
+              std::error_code oec;
+              exists = std::filesystem::exists(abs, oec);
+              oec.clear();
+              if (exists) {
+                is_dir = std::filesystem::is_directory(abs, oec);
+                oec.clear();
+                if (!is_dir) {
+                  const uintmax_t fs = std::filesystem::file_size(abs, oec);
+                  if (!oec) sz = fs;
+                  oec.clear();
+                }
+              }
+              href = rel_link(out_dir, abs);
+
+              // Compute a workspace-root-relative path for injecting into args / API.
+              //
+              // Links in the UI are relative to the directory containing the HTML
+              // (out_dir). If the HTML is written under a subdirectory of --root,
+              // those links can include "../" segments.
+              //
+              // Tools launched by qeeg_ui_server_cli run with cwd=--root, so we
+              // inject a root-relative path when possible.
+              if (!root.empty()) {
+                std::error_code iec;
+                const std::filesystem::path rel_ws = std::filesystem::relative(abs, root, iec);
+                if (!iec && !rel_ws.empty() && !rel_ws.is_absolute() && !rel_ws.has_root_path()) {
+                  bool ok = true;
+                  for (const auto& part : rel_ws) {
+                    const std::string comp = part.u8string();
+                    if (comp == "..") {
+                      ok = false;
+                      break;
+                    }
+                  }
+                  if (ok) {
+                    inject_path = rel_ws.generic_u8string();
+                    inject_dir = rel_ws.parent_path().generic_u8string();
+                    inject_ws_rel = true;
+                  }
+                }
+              }
+              if (inject_path.empty()) {
+                inject_path = abs.generic_u8string();
+                inject_dir = abs.parent_path().generic_u8string();
+                inject_ws_rel = false;
+              }
+
+              ext = to_lower(abs.extension().u8string());
             }
-            if (ext == ".csv" || ext == ".tsv" || ext == ".json" || ext == ".txt" || ext == ".log" || ext == ".md") {
-              text_paths.push_back(p);
+
+            o << "          <div class=\"outrow\">\n";
+            if (safe && exists) {
+              o << "            <button class=\"btn\" data-path=\"" << html_escape(inject_path)
+                << "\" title=\"Use as input: " << html_escape(inject_path)
+                << "\" onclick=\"selectPathAuto(this.dataset.path)\">Use as input</button>\n";
+
+              o << "            <button class=\"btn\" data-copy=\"" << html_escape(inject_path)
+                << "\" onclick=\"copyPath(this.dataset.copy)\">Copy</button>\n";
+
+              if (inject_ws_rel) {
+                // For directories, open the directory itself. For files, open
+                // the parent directory and reveal the file row.
+                if (is_dir) {
+                  o << "            <button class=\"btn\" data-dir=\"" << html_escape(inject_path)
+                    << "\" data-reveal=\"\" onclick=\"browseInWorkspace(this.dataset.dir, this.dataset.reveal)\">Reveal</button>\n";
+                } else {
+                  o << "            <button class=\"btn\" data-dir=\"" << html_escape(inject_dir)
+                    << "\" data-reveal=\"" << html_escape(inject_path)
+                    << "\" onclick=\"browseInWorkspace(this.dataset.dir, this.dataset.reveal)\">Reveal</button>\n";
+                }
+              } else {
+                o << "            <button class=\"btn\" disabled title=\"Reveal is available only for workspace-relative paths\">Reveal</button>\n";
+              }
+            } else {
+              o << "            <button class=\"btn\" disabled>Use as input</button>\n";
+            }
+
+            if (!safe) {
+              o << "            <code>" << html_escape(rel_raw) << "</code> <span class=\"pill bad\">unsafe path</span>\n";
+            } else if (!exists) {
+              o << "            <code>" << html_escape(href) << "</code> <span class=\"pill bad\">missing file</span>\n";
+            } else {
+              const std::string href_url = url_encode_path(href);
+              o << "            <a href=\"" << html_escape(href_url)
+                << "\" target=\"_blank\" rel=\"noopener\">" << html_escape(href) << "</a>\n";
+              if (is_dir) {
+                o << "            <span class=\"pill\">dir</span>\n";
+              } else if (sz > 0) {
+                o << "            <span class=\"pill\">" << html_escape(human_size(sz)) << "</span>\n";
+              }
+            }
+            o << "          </div>\n";
+
+            if (safe && exists && !is_dir) {
+              if (ext == ".bmp" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".svg") {
+                image_paths.push_back(abs);
+              }
+              if (ext == ".csv" || ext == ".tsv" || ext == ".json" || ext == ".txt" || ext == ".log" || ext == ".md") {
+                text_paths.push_back(abs);
+              }
             }
           }
+
           // Preview a small subset of images (avoid bloating the page).
           const size_t max_previews = 6;
           if (!image_paths.empty()) {
             o << "          <div style=\"display:flex;flex-wrap:wrap;gap:8px;margin-top:10px\">\n";
             for (size_t k = 0; k < image_paths.size() && k < max_previews; ++k) {
               const std::string src = rel_link(out_dir, image_paths[k]);
-              o << "            <a href=\"" << html_escape(src) << "\">"
-                << "<img src=\"" << html_escape(src) << "\" style=\"width:96px;height:96px;object-fit:contain;border-radius:10px;border:1px solid var(--border);background:#000\">"
+              const std::string src_url = url_encode_path(src);
+              o << "            <a href=\"" << html_escape(src_url) << "\">"
+                << "<img src=\"" << html_escape(src_url) << "\" style=\"width:96px;height:96px;object-fit:contain;border-radius:10px;border:1px solid var(--border);background:#000\">"
                 << "</a>\n";
             }
             o << "          </div>\n";
@@ -8367,12 +8584,15 @@ void write_qeeg_tools_ui_html(const UiDashboardArgs& args) {
     ensure_directory(out_dir.u8string());
   }
 
-  std::ofstream f(out_html, std::ios::binary);
-  if (!f) {
-    throw std::runtime_error("Failed to open output HTML for writing: " + args.output_html);
-  }
+  // Render to memory, then atomically write to disk so readers (including the
+  // UI server) are less likely to observe a partially-written HTML file.
+  std::ostringstream oss;
+  write_html(oss, args);
+  const std::string html = oss.str();
 
-  write_html(f, args);
+  if (!write_text_file_atomic(args.output_html, html)) {
+    throw std::runtime_error("Failed to write output HTML: " + args.output_html);
+  }
 }
 
 } // namespace qeeg

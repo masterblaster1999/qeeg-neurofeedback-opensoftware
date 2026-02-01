@@ -1,6 +1,7 @@
 #include "qeeg/cli_input.hpp"
 #include "qeeg/run_meta.hpp"
 #include "qeeg/subprocess.hpp"
+#include "qeeg/ui_dashboard.hpp"
 #include "qeeg/utils.hpp"
 
 #include <cstdlib>
@@ -36,6 +37,21 @@ struct Args {
   std::string bandpower_args;
   std::string bandratios_args;
 
+  // Optional post-processing steps.
+  bool with_topomaps{false};
+  bool topomaps_annotate{false};
+  std::string topomap_montage{"builtin:standard_1020_19"};
+  std::string topomap_args;
+
+  bool with_region_summary{false};
+  std::string region_args;
+
+  // Optional: write a local HTML dashboard that links to this workspace.
+  bool write_ui{false};
+  bool ui_embed_help{false};
+  bool ui_open{false};
+  std::string ui_title{"QEEG Pipeline Workspace"};
+
   bool dry_run{false};
 };
 
@@ -49,7 +65,13 @@ static void print_help() {
       << "Default workflow (basic):\n"
       << "  1) qeeg_preprocess_cli   -> 01_preprocess/preprocessed.<ext>\n"
       << "  2) qeeg_bandpower_cli    -> 02_bandpower/bandpowers.csv\n"
-      << "  3) qeeg_bandratios_cli   -> 03_bandratios/bandratios.csv (optional)\n\n"
+      << "  3) qeeg_bandratios_cli   -> 03_bandratios/bandratios.csv (optional)\n"
+      << "Optional post-processing:\n"
+      << "  4) qeeg_topomap_cli      -> 04_topomaps_bandpower/* (optional; --topomaps)\n"
+      << "  5) qeeg_topomap_cli      -> 05_topomaps_bandratios/* (optional; --topomaps)\n"
+      << "  6) qeeg_region_summary_cli -> 06_regions_bandpower/* (optional; --region-summary)\n"
+      << "  7) qeeg_region_summary_cli -> 07_regions_bandratios/* (optional; --region-summary)\n"
+      << "  8) qeeg_ui.html          -> Workspace dashboard (optional; --write-ui)\n\n"
       << "Usage:\n"
       << "  qeeg_pipeline_cli --input file.edf --outdir out_work\n"
       << "  qeeg_pipeline_cli --input out_preprocess --skip-preprocess --outdir out_work\n"
@@ -72,8 +94,44 @@ static void print_help() {
       << "  --preprocess-args STR   Extra args appended to qeeg_preprocess_cli\n"
       << "  --bandpower-args STR    Extra args appended to qeeg_bandpower_cli\n"
       << "  --bandratios-args STR   Extra args appended to qeeg_bandratios_cli\n"
-      << "  --dry-run               Print commands without executing\n"
+      << "  --topomaps              Run qeeg_topomap_cli on bandpowers (and bandratios if present).\n"
+      << "  --topomaps-annotate     Like --topomaps, but also passes --annotate to qeeg_topomap_cli.\n"
+      << "  --topomap-montage SPEC  Montage for topomaps (default: builtin:standard_1020_19).\n"
+      << "  --topomap-args STR      Extra args appended to qeeg_topomap_cli (e.g. \"--robust\").\n"
+      << "  --region-summary        Run qeeg_region_summary_cli on bandpowers (and bandratios if present).\n"
+      << "  --region-args STR       Extra args appended to qeeg_region_summary_cli.\n"
+      << "  --write-ui              Generate <outdir>/qeeg_ui.html linking to the workspace outputs.\n"
+      << "  --ui-help               When used with --write-ui, embed tool --help outputs in the UI.\n"
+      << "  --ui-title TEXT         Title for the generated UI (default: QEEG Pipeline Workspace).\n"
+      << "  --open-ui               Open the generated UI in your default browser (implies --write-ui).\n"
+      << "  --dry-run               Print commands without executing or writing outputs\n"
       << "  -h, --help              Show help\n";
+}
+
+static std::filesystem::path self_dir(char** argv) {
+  if (!argv || !argv[0]) return std::filesystem::current_path();
+  std::error_code ec;
+  std::filesystem::path p = std::filesystem::u8path(argv[0]);
+  if (p.empty()) return std::filesystem::current_path();
+  if (p.is_relative()) {
+    p = std::filesystem::absolute(p, ec);
+  }
+  if (ec) return std::filesystem::current_path();
+  return p.parent_path();
+}
+
+static void try_open_browser(const std::filesystem::path& html_path) {
+  const std::string p = html_path.u8string();
+#if defined(_WIN32)
+  std::string cmd = "cmd /c start \"\" \"" + p + "\"";
+  std::system(cmd.c_str());
+#elif defined(__APPLE__)
+  std::string cmd = "open \"" + p + "\"";
+  std::system(cmd.c_str());
+#else
+  std::string cmd = "xdg-open \"" + p + "\"";
+  std::system(cmd.c_str());
+#endif
 }
 
 static Args parse_args(int argc, char** argv) {
@@ -105,6 +163,33 @@ static Args parse_args(int argc, char** argv) {
       a.bandpower_args = argv[++i];
     } else if (arg == "--bandratios-args" && i + 1 < argc) {
       a.bandratios_args = argv[++i];
+    } else if (arg == "--topomaps") {
+      a.with_topomaps = true;
+    } else if (arg == "--topomaps-annotate") {
+      a.with_topomaps = true;
+      a.topomaps_annotate = true;
+    } else if (arg == "--topomap-montage" && i + 1 < argc) {
+      a.with_topomaps = true;
+      a.topomap_montage = argv[++i];
+    } else if (arg == "--topomap-args" && i + 1 < argc) {
+      a.with_topomaps = true;
+      a.topomap_args = argv[++i];
+    } else if (arg == "--region-summary") {
+      a.with_region_summary = true;
+    } else if (arg == "--region-args" && i + 1 < argc) {
+      a.with_region_summary = true;
+      a.region_args = argv[++i];
+    } else if (arg == "--write-ui") {
+      a.write_ui = true;
+    } else if (arg == "--ui-help") {
+      a.write_ui = true;
+      a.ui_embed_help = true;
+    } else if (arg == "--ui-title" && i + 1 < argc) {
+      a.write_ui = true;
+      a.ui_title = argv[++i];
+    } else if (arg == "--open-ui") {
+      a.write_ui = true;
+      a.ui_open = true;
     } else if (arg == "--dry-run") {
       a.dry_run = true;
     } else {
@@ -210,15 +295,33 @@ int main(int argc, char** argv) {
     }
 
     const std::filesystem::path root = std::filesystem::u8path(args.outdir);
-    ensure_directory(root.u8string());
+    if (!args.dry_run) {
+      ensure_directory(root.u8string());
+    }
 
     const std::filesystem::path pre_dir = root / "01_preprocess";
     const std::filesystem::path bp_dir = root / "02_bandpower";
     const std::filesystem::path br_dir = root / "03_bandratios";
 
-    if (!args.skip_preprocess) ensure_directory(pre_dir.u8string());
-    ensure_directory(bp_dir.u8string());
-    if (!args.skip_bandratios) ensure_directory(br_dir.u8string());
+    const std::filesystem::path topo_bp_dir = root / "04_topomaps_bandpower";
+    const std::filesystem::path topo_br_dir = root / "05_topomaps_bandratios";
+    const std::filesystem::path regions_bp_dir = root / "06_regions_bandpower";
+    const std::filesystem::path regions_br_dir = root / "07_regions_bandratios";
+
+    if (!args.dry_run) {
+      if (!args.skip_preprocess) ensure_directory(pre_dir.u8string());
+      ensure_directory(bp_dir.u8string());
+      if (!args.skip_bandratios) ensure_directory(br_dir.u8string());
+
+      if (args.with_topomaps) {
+        ensure_directory(topo_bp_dir.u8string());
+        if (!args.skip_bandratios) ensure_directory(topo_br_dir.u8string());
+      }
+      if (args.with_region_summary) {
+        ensure_directory(regions_bp_dir.u8string());
+        if (!args.skip_bandratios) ensure_directory(regions_br_dir.u8string());
+      }
+    }
 
     // Resolve the initial input to a concrete recording path for the pipeline run meta.
     // (Individual tools also resolve inputs, but keeping a resolved path here makes the
@@ -301,8 +404,136 @@ int main(int argc, char** argv) {
       }
     }
 
+    // --- Optional: topomaps ---
+    if (args.with_topomaps) {
+      // Bandpowers -> topomaps
+      {
+        std::vector<std::string> targs;
+        targs.push_back("--input");
+        targs.push_back(bp_dir.u8string());
+        targs.push_back("--outdir");
+        targs.push_back(topo_bp_dir.u8string());
+        if (!trim(args.topomap_montage).empty()) {
+          targs.push_back("--montage");
+          targs.push_back(args.topomap_montage);
+        }
+        if (args.topomaps_annotate) {
+          targs.push_back("--annotate");
+        }
+        targs.push_back("--html-report");
+
+        const auto extra = split_extra_args(args.topomap_args);
+        targs.insert(targs.end(), extra.begin(), extra.end());
+
+        const int rc = run_step(args, "topomaps_bandpower", "qeeg_topomap_cli", targs, root.u8string());
+        if (rc != 0) {
+          std::cerr << "[pipeline] topomaps (bandpower) failed with exit code " << rc << "\n";
+          return rc;
+        }
+      }
+
+      // Bandratios -> topomaps
+      if (!args.skip_bandratios) {
+        std::vector<std::string> targs;
+        targs.push_back("--input");
+        targs.push_back(br_dir.u8string());
+        targs.push_back("--outdir");
+        targs.push_back(topo_br_dir.u8string());
+        if (!trim(args.topomap_montage).empty()) {
+          targs.push_back("--montage");
+          targs.push_back(args.topomap_montage);
+        }
+        if (args.topomaps_annotate) {
+          targs.push_back("--annotate");
+        }
+        targs.push_back("--html-report");
+
+        const auto extra = split_extra_args(args.topomap_args);
+        targs.insert(targs.end(), extra.begin(), extra.end());
+
+        const int rc = run_step(args, "topomaps_bandratios", "qeeg_topomap_cli", targs, root.u8string());
+        if (rc != 0) {
+          std::cerr << "[pipeline] topomaps (bandratios) failed with exit code " << rc << "\n";
+          return rc;
+        }
+      }
+    }
+
+    // --- Optional: region summaries ---
+    if (args.with_region_summary) {
+      // Bandpowers -> region summary
+      {
+        std::vector<std::string> rargs;
+        rargs.push_back("--input");
+        rargs.push_back(bp_dir.u8string());
+        rargs.push_back("--outdir");
+        rargs.push_back(regions_bp_dir.u8string());
+        rargs.push_back("--html-report");
+
+        const auto extra = split_extra_args(args.region_args);
+        rargs.insert(rargs.end(), extra.begin(), extra.end());
+
+        const int rc = run_step(args, "region_summary_bandpower", "qeeg_region_summary_cli", rargs, root.u8string());
+        if (rc != 0) {
+          std::cerr << "[pipeline] region summary (bandpower) failed with exit code " << rc << "\n";
+          return rc;
+        }
+      }
+
+      // Bandratios -> region summary
+      if (!args.skip_bandratios) {
+        std::vector<std::string> rargs;
+        rargs.push_back("--input");
+        rargs.push_back(br_dir.u8string());
+        rargs.push_back("--outdir");
+        rargs.push_back(regions_br_dir.u8string());
+        rargs.push_back("--html-report");
+
+        const auto extra = split_extra_args(args.region_args);
+        rargs.insert(rargs.end(), extra.begin(), extra.end());
+
+        const int rc = run_step(args, "region_summary_bandratios", "qeeg_region_summary_cli", rargs, root.u8string());
+        if (rc != 0) {
+          std::cerr << "[pipeline] region summary (bandratios) failed with exit code " << rc << "\n";
+          return rc;
+        }
+      }
+    }
+
+    // --- Optional: write a local UI dashboard ---
+    if (args.write_ui && !args.dry_run) {
+      try {
+        qeeg::UiDashboardArgs u;
+        u.root = root.u8string();
+        u.output_html = (root / "qeeg_ui.html").u8string();
+        u.title = args.ui_title;
+        u.scan_run_meta = true;
+
+        u.toolbox = args.toolbox;
+
+        // If the caller provided --bin-dir, use it; otherwise, when we need to
+        // embed help, default to the directory containing this executable.
+        if (!trim(args.bin_dir).empty()) {
+          u.bin_dir = args.bin_dir;
+        } else if (args.ui_embed_help) {
+          u.bin_dir = self_dir(argv).u8string();
+        }
+
+        u.embed_help = args.ui_embed_help;
+        u.scan_bin_dir = !trim(u.bin_dir).empty();
+
+        qeeg::write_qeeg_tools_ui_html(u);
+        std::cout << "Wrote UI dashboard: " << u.output_html << "\n";
+        if (args.ui_open) {
+          try_open_browser(std::filesystem::u8path(u.output_html));
+        }
+      } catch (const std::exception& e) {
+        std::cerr << "[pipeline] Warning: failed to write qeeg_ui.html: " << e.what() << "\n";
+      }
+    }
+
     // --- Write pipeline run meta ---
-    {
+    if (!args.dry_run) {
       const std::string meta_name = "pipeline_run_meta.json";
       const std::string meta_path = (root / meta_name).u8string();
 
@@ -317,12 +548,34 @@ int main(int argc, char** argv) {
         outs.push_back("03_bandratios/bandratios_run_meta.json");
       }
 
+      if (args.with_topomaps) {
+        outs.push_back("04_topomaps_bandpower/topomap_run_meta.json");
+        if (!args.skip_bandratios) {
+          outs.push_back("05_topomaps_bandratios/topomap_run_meta.json");
+        }
+      }
+
+      if (args.with_region_summary) {
+        outs.push_back("06_regions_bandpower/region_summary_run_meta.json");
+        if (!args.skip_bandratios) {
+          outs.push_back("07_regions_bandratios/region_summary_run_meta.json");
+        }
+      }
+
+      if (args.write_ui) {
+        outs.push_back("qeeg_ui.html");
+      }
+
       if (!write_run_meta_json(meta_path, "qeeg_pipeline_cli", root.u8string(), resolved_in.path, outs)) {
         std::cerr << "[pipeline] Warning: failed to write pipeline_run_meta.json: " << meta_path << "\n";
       }
     }
 
-    std::cout << "Wrote workspace: " << root.u8string() << "\n";
+    if (args.dry_run) {
+      std::cout << "Dry run complete. Planned workspace: " << root.u8string() << "\n";
+    } else {
+      std::cout << "Wrote workspace: " << root.u8string() << "\n";
+    }
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << "\n";

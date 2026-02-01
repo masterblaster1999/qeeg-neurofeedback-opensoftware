@@ -82,6 +82,10 @@
       "type": "string",
       "const": "qeeg_nf_cli"
     },
+    "QeegVersion": {
+      "type": "string",
+      "description": "Alias of Version for cross-tool consistency (matches qeeg::write_run_meta_json)."
+    },
     "Version": {
       "type": "string"
     },
@@ -100,6 +104,9 @@
     "TimestampLocal": {
       "type": "string"
     },
+    "TimestampUTC": {
+      "type": "string"
+    },
     "OutputDir": {
       "type": "string"
     },
@@ -111,6 +118,10 @@
     },
     "demo": {
       "type": "boolean"
+    },
+    "InputPath": {
+      "type": "string",
+      "description": "Alias of input_path for cross-tool consistency (matches qeeg::write_run_meta_json)."
     },
     "input_path": {
       "type": "string"
