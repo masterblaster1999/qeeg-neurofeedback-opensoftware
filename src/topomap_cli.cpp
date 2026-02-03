@@ -7,13 +7,16 @@
 #include "qeeg/utils.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -31,6 +34,12 @@ struct Args {
   // Rendering options
   bool annotate{false};
   bool html_report{false};
+
+  bool json_index{false};
+  std::string json_index_path{}; // default: <outdir>/topomap_index.json
+
+  bool list_montages{false};
+  bool list_montages_json{false};
 
   // Topomap interpolation options
   int grid{256};
@@ -71,6 +80,8 @@ static void print_help() {
     << "Options:\n"
     << "  --outdir DIR            Output directory (default: out_topomap)\n"
     << "  --montage SPEC          builtin:standard_1020_19 (default), builtin:standard_1010_61, or montage CSV (name,x,y)\n"
+    << "  --list-montages         Print built-in montage keys and exit\n"
+    << "  --list-montages-json    Print built-in montage keys as JSON and exit\n"
     << "  --metric NAME           Render only this column (repeatable). Default renders all numeric columns.\n"
     << "  --exclude NAME          Exclude a column (repeatable).\n"
     << "  --grid N                Topomap grid size (default: 256)\n"
@@ -81,6 +92,7 @@ static void print_help() {
     << "  --spline-lambda X       Spline regularization (default: 1e-5)\n"
     << "  --annotate              Draw head outline + electrode markers + colorbar\n"
     << "  --html-report           Write topomap_report.html linking to the generated BMPs\n"
+    << "  --json-index [PATH]     Write topomap_index.json for downstream tooling (default: <outdir>/topomap_index.json)\n"
     << "  --vmin X --vmax Y       Fixed colormap limits for all maps (overrides auto/robust scaling)\n"
     << "  --robust                Use percentile scaling (default 5th..95th of interpolated grid values)\n"
     << "  --robust-range LO HI    Percentiles for --robust (e.g., 0.02 0.98)\n"
@@ -116,6 +128,20 @@ static Args parse_args(int argc, char** argv) {
       a.annotate = true;
     } else if (arg == "--html-report") {
       a.html_report = true;
+    } else if (arg == "--json-index") {
+      a.json_index = true;
+      // Optional argument: path. If omitted, default will be <outdir>/topomap_index.json
+      if ((i + 1) < argc) {
+        const std::string next = argv[i + 1];
+        if (!next.empty() && next[0] != '-') {
+          a.json_index_path = next;
+          ++i;
+        }
+      }
+    } else if (arg == "--list-montages") {
+      a.list_montages = true;
+    } else if (arg == "--list-montages-json") {
+      a.list_montages_json = true;
     } else if (arg == "--metric" && i + 1 < argc) {
       a.metrics.push_back(argv[++i]);
     } else if (arg == "--exclude" && i + 1 < argc) {
@@ -465,11 +491,251 @@ static void write_html_report(const Args& args,
   std::cout << "Wrote HTML report: " << outpath << "\n";
 }
 
+
+// ---- Machine-readable JSON index -------------------------------------------
+
+struct IndexChannel {
+  std::string channel; // original label from the input table
+  std::string key;     // normalized key (qeeg::normalize_channel_name)
+  double x{0.0};
+  double y{0.0};
+  double value{0.0};
+};
+
+struct IndexMap {
+  std::string metric;   // original metric column name
+  std::string file;     // relative to outdir (usually just a filename)
+  double vmin{0.0};
+  double vmax{1.0};
+  int n_channels{0};
+  std::vector<IndexChannel> channels; // channels used (finite values with montage positions)
+};
+
+static std::string json_number(double x, int digits = 10) {
+  if (!std::isfinite(x)) return "null";
+  std::ostringstream oss;
+  oss.setf(std::ios::fixed);
+  oss << std::setprecision(digits) << x;
+  return oss.str();
+}
+
+static std::string posix_slashes(std::string s) {
+  for (char& c : s) {
+    if (c == '\\') c = '/';
+  }
+  return s;
+}
+
+static std::string safe_relpath_posix(const std::filesystem::path& target_abs,
+                                      const std::filesystem::path& base_abs) {
+  try {
+    std::filesystem::path rel = std::filesystem::relative(target_abs, base_abs);
+    std::string s = rel.generic_string();
+    if (s.empty()) return s;
+
+    // Reject obvious escape paths. Keep the output safe for downstream tools that treat
+    // these as paths relative to the index file.
+    if (starts_with(s, "../") || s == ".." || s.find("/../") != std::string::npos) {
+      return posix_slashes(target_abs.generic_string());
+    }
+
+    // Avoid drive-prefixed paths leaking into a "relative" output.
+    if (s.size() >= 2 && std::isalpha(static_cast<unsigned char>(s[0])) && s[1] == ':') {
+      return posix_slashes(target_abs.generic_string());
+    }
+    return posix_slashes(s);
+  } catch (...) {
+    return posix_slashes(target_abs.generic_string());
+  }
+}
+
+static void write_topomap_index_json(const std::string& index_path,
+                                     const Args& args,
+                                     const Montage& montage,
+                                     const TopomapOptions& topt,
+                                     const std::vector<IndexMap>& maps,
+                                     const std::string& run_meta_filename,
+                                     const std::string& report_html_filename_or_empty) {
+  std::filesystem::path idx_path = std::filesystem::path(index_path);
+  if (idx_path.empty()) {
+    throw std::runtime_error("write_topomap_index_json: empty index_path");
+  }
+
+  std::filesystem::path idx_dir = idx_path.parent_path();
+  if (idx_dir.empty()) idx_dir = std::filesystem::path(".");
+
+  const std::filesystem::path idx_dir_abs = std::filesystem::absolute(idx_dir);
+  const std::filesystem::path outdir_abs = std::filesystem::absolute(std::filesystem::path(args.outdir));
+
+  const std::string outdir_rel = safe_relpath_posix(outdir_abs, idx_dir_abs);
+  const std::filesystem::path run_meta_abs = outdir_abs / run_meta_filename;
+  const std::string run_meta_rel = safe_relpath_posix(run_meta_abs, idx_dir_abs);
+
+  std::string report_rel;
+  if (!report_html_filename_or_empty.empty()) {
+    const std::filesystem::path rep_abs = outdir_abs / report_html_filename_or_empty;
+    report_rel = safe_relpath_posix(rep_abs, idx_dir_abs);
+  }
+
+  std::ofstream out(index_path);
+  if (!out) throw std::runtime_error("Failed to write JSON index: " + index_path);
+
+  const std::string schema_url =
+    "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_topomap_index.schema.json";
+
+  out << "{\n";
+  out << "  \"$schema\": \"" << json_escape(schema_url) << "\",\n";
+  out << "  \"schema_version\": 1,\n";
+  out << "  \"generated_utc\": \"" << json_escape(now_string_utc()) << "\",\n";
+  out << "  \"tool\": \"qeeg_topomap_cli\",\n";
+  out << "  \"input_path\": \"" << json_escape(args.input_csv) << "\",\n";
+  out << "  \"outdir\": \"" << json_escape(outdir_rel) << "\",\n";
+  out << "  \"run_meta_json\": \"" << json_escape(run_meta_rel) << "\",\n";
+  if (!report_rel.empty()) {
+    out << "  \"report_html\": \"" << json_escape(report_rel) << "\",\n";
+  } else {
+    out << "  \"report_html\": null,\n";
+  }
+
+  // Render/interpolation metadata.
+  out << "  \"render\": {\n";
+  out << "    \"annotate\": " << (args.annotate ? "true" : "false") << "\n";
+  out << "  },\n";
+
+  const std::string method =
+    (topt.method == TopomapInterpolation::SPHERICAL_SPLINE) ? "spline" : "idw";
+
+  out << "  \"interpolation\": {\n";
+  out << "    \"method\": \"" << json_escape(method) << "\",\n";
+  out << "    \"grid\": " << topt.grid_size << ",\n";
+  out << "    \"idw_power\": " << json_number(topt.idw_power, 6) << ",\n";
+  out << "    \"spline_terms\": " << topt.spline.n_terms << ",\n";
+  out << "    \"spline_m\": " << topt.spline.m << ",\n";
+  out << "    \"spline_lambda\": " << json_number(topt.spline.lambda, 10) << "\n";
+  out << "  },\n";
+
+  const std::string scale_mode = args.have_vlim ? "fixed" : (args.robust ? "robust" : "auto");
+  out << "  \"scaling\": {\n";
+  out << "    \"mode\": \"" << json_escape(scale_mode) << "\",\n";
+  out << "    \"fixed_vmin\": " << (args.have_vlim ? json_number(args.vmin, 10) : "null") << ",\n";
+  out << "    \"fixed_vmax\": " << (args.have_vlim ? json_number(args.vmax, 10) : "null") << ",\n";
+  out << "    \"robust_lo\": " << (args.robust ? json_number(args.robust_lo, 10) : "null") << ",\n";
+  out << "    \"robust_hi\": " << (args.robust ? json_number(args.robust_hi, 10) : "null") << "\n";
+  out << "  },\n";
+
+  // Montage coordinates (for UI previews / QA).
+  {
+    std::vector<std::string> names = montage.channel_names();
+    std::sort(names.begin(), names.end());
+    out << "  \"montage\": {\n";
+    out << "    \"spec\": \"" << json_escape(args.montage_spec) << "\",\n";
+    out << "    \"n_channels\": " << names.size() << ",\n";
+    out << "    \"channels\": [\n";
+    for (size_t i = 0; i < names.size(); ++i) {
+      Vec2 p;
+      (void)montage.get(names[i], &p);
+      out << "      {\"key\": \"" << json_escape(names[i]) << "\", \"x\": " << json_number(p.x, 8)
+          << ", \"y\": " << json_number(p.y, 8) << "}";
+      if (i + 1 < names.size()) out << ",";
+      out << "\n";
+    }
+    out << "    ]\n";
+    out << "  },\n";
+  }
+
+  // Maps (ordered as rendered).
+  out << "  \"maps\": [\n";
+  for (size_t mi = 0; mi < maps.size(); ++mi) {
+    const IndexMap& m = maps[mi];
+    const std::filesystem::path bmp_abs = outdir_abs / m.file;
+    const std::string bmp_rel = safe_relpath_posix(bmp_abs, idx_dir_abs);
+
+    out << "    {\n";
+    out << "      \"metric\": \"" << json_escape(m.metric) << "\",\n";
+    out << "      \"file\": \"" << json_escape(bmp_rel) << "\",\n";
+    out << "      \"vmin\": " << json_number(m.vmin, 10) << ",\n";
+    out << "      \"vmax\": " << json_number(m.vmax, 10) << ",\n";
+    out << "      \"n_channels\": " << m.n_channels << ",\n";
+    out << "      \"channels\": [\n";
+
+    for (size_t ci = 0; ci < m.channels.size(); ++ci) {
+      const IndexChannel& c = m.channels[ci];
+      out << "        {\"channel\": \"" << json_escape(c.channel) << "\", "
+          << "\"key\": \"" << json_escape(c.key) << "\", "
+          << "\"x\": " << json_number(c.x, 8) << ", "
+          << "\"y\": " << json_number(c.y, 8) << ", "
+          << "\"value\": " << json_number(c.value, 10) << "}";
+      if (ci + 1 < m.channels.size()) out << ",";
+      out << "\n";
+    }
+
+    out << "      ]\n";
+    out << "    }";
+    if (mi + 1 < maps.size()) out << ",";
+    out << "\n";
+  }
+  out << "  ]\n";
+  out << "}\n";
+
+  std::cout << "Wrote JSON index: " << index_path << "\n";
+}
+
+static void print_montages_text() {
+  std::cout << "builtin:standard_1020_19\t19 channels\n";
+  std::cout << "builtin:standard_1010_61\t61 channels\n";
+}
+
+static void print_montages_json() {
+  const Montage m19 = Montage::builtin_standard_1020_19();
+  const Montage m61 = Montage::builtin_standard_1010_61();
+
+  std::ostream& out = std::cout;
+
+  auto write_montage = [](std::ostream& out, const std::string& key, const Montage& m) {
+    std::vector<std::string> names = m.channel_names();
+    std::sort(names.begin(), names.end());
+    out << "    {\n";
+    out << "      \"key\": \"" << json_escape(key) << "\",\n";
+    out << "      \"n_channels\": " << names.size() << ",\n";
+    out << "      \"channels\": [\n";
+    for (size_t i = 0; i < names.size(); ++i) {
+      Vec2 p;
+      (void)m.get(names[i], &p);
+      out << "        {\"key\": \"" << json_escape(names[i]) << "\", \"x\": " << json_number(p.x, 8)
+          << ", \"y\": " << json_number(p.y, 8) << "}";
+      if (i + 1 < names.size()) out << ",";
+      out << "\n";
+    }
+    out << "      ]\n";
+    out << "    }";
+  };
+
+  out << "{\n";
+  out << "  \"schema_version\": 1,\n";
+  out << "  \"generated_utc\": \"" << json_escape(now_string_utc()) << "\",\n";
+  out << "  \"montages\": [\n";
+  write_montage(out, "builtin:standard_1020_19", m19);
+  out << ",\n";
+  write_montage(out, "builtin:standard_1010_61", m61);
+  out << "\n";
+  out << "  ]\n";
+  out << "}\n";
+}
+
+
 } // namespace
 
 int main(int argc, char** argv) {
   try {
     Args args = parse_args(argc, argv);
+    if (args.list_montages || args.list_montages_json) {
+      if (args.list_montages_json) {
+        print_montages_json();
+      } else {
+        print_montages_text();
+      }
+      return 0;
+    }
     if (args.input_csv.empty()) {
       print_help();
       throw std::runtime_error("--input is required");
@@ -523,22 +789,42 @@ int main(int argc, char** argv) {
     std::vector<std::string> outputs;
     std::vector<std::string> rendered_metrics;
     std::vector<std::string> rendered_files;
+    std::vector<IndexMap> index_maps;
+    index_maps.reserve(table.metrics.size());
+
 
     for (size_t mi = 0; mi < table.metrics.size(); ++mi) {
       const std::string metric = table.metrics[mi];
       const auto& vals = table.values[mi];
 
-      // Guard: ensure there are at least 3 finite values with montage positions.
-      size_t n_good = 0;
+      // Gather channels used (finite values with montage positions).
+      IndexMap idx;
+      idx.metric = metric;
+      idx.channels.clear();
+      idx.channels.reserve(table.channels.size());
+
       for (size_t i = 0; i < table.channels.size() && i < vals.size(); ++i) {
-        if (!std::isfinite(vals[i])) continue;
+        const double v = vals[i];
+        if (!std::isfinite(v)) continue;
         Vec2 p;
         if (!montage.get(table.channels[i], &p)) continue;
-        ++n_good;
+
+        IndexChannel c;
+        c.channel = table.channels[i];
+        c.key = normalize_channel_name(table.channels[i]);
+        c.x = p.x;
+        c.y = p.y;
+        c.value = v;
+        idx.channels.push_back(std::move(c));
       }
-      if (n_good < 3) {
+
+      std::sort(idx.channels.begin(), idx.channels.end(),
+                [](const IndexChannel& a, const IndexChannel& b) { return a.key < b.key; });
+
+      idx.n_channels = static_cast<int>(idx.channels.size());
+      if (idx.n_channels < 3) {
         std::cerr << "Skipping metric '" << metric << "' (need >= 3 channels with finite values and montage positions; got "
-                  << n_good << ")\n";
+                  << idx.n_channels << ")\n";
         continue;
       }
 
@@ -559,6 +845,9 @@ int main(int argc, char** argv) {
         vmin = lim.first;
         vmax = lim.second;
       }
+
+      idx.vmin = vmin;
+      idx.vmax = vmax;
 
       // Sanitize metric name for file output (cross-platform, conservative).
       std::string safe = metric;
@@ -584,6 +873,8 @@ int main(int argc, char** argv) {
       outputs.push_back(bmp);
       rendered_metrics.push_back(metric);
       rendered_files.push_back(bmp);
+      idx.file = bmp;
+      index_maps.push_back(std::move(idx));
     }
 
     if (rendered_files.empty()) {
@@ -593,6 +884,30 @@ int main(int argc, char** argv) {
     if (args.html_report) {
       write_html_report(args, table, rendered_metrics, rendered_files);
       outputs.push_back("topomap_report.html");
+    }
+
+    if (args.json_index) {
+      const std::string index_path = args.json_index_path.empty()
+                                     ? (args.outdir + "/topomap_index.json")
+                                     : args.json_index_path;
+      const std::string run_meta_name = "topomap_run_meta.json";
+      const std::string report_name = args.html_report ? "topomap_report.html" : std::string();
+      write_topomap_index_json(index_path, args, montage, topt, index_maps, run_meta_name, report_name);
+
+      // If the index lives inside --outdir, include it in Outputs for UI discovery.
+      try {
+        const std::filesystem::path outdir_abs = std::filesystem::absolute(std::filesystem::path(args.outdir));
+        const std::filesystem::path idx_abs = std::filesystem::absolute(std::filesystem::path(index_path));
+        std::filesystem::path rel = std::filesystem::relative(idx_abs, outdir_abs);
+        std::string rel_s = posix_slashes(rel.generic_string());
+        if (!rel_s.empty() && !starts_with(rel_s, "../") && rel_s != ".." && rel_s.find("/../") == std::string::npos) {
+          outputs.push_back(rel_s);
+        } else {
+          std::cerr << "Note: --json-index path is outside --outdir; not adding to run meta Outputs\n";
+        }
+      } catch (...) {
+        std::cerr << "Note: Failed to compute relative path for JSON index; not adding to run meta Outputs\n";
+      }
     }
 
     // Write lightweight run metadata so qeeg_ui_cli / qeeg_ui_server_cli can discover outputs.

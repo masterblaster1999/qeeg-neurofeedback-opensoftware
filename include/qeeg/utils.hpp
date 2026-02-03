@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -92,6 +93,35 @@ std::string normalize_channel_name(std::string s);
 
 bool starts_with(const std::string& s, const std::string& prefix);
 bool ends_with(const std::string& s, const std::string& suffix);
+
+// Validate a CLI tool name coming from an untrusted source (e.g., UI server API).
+//
+// Accepts:
+//   qeeg_*_cli         (POSIX-style)
+//   qeeg_*_cli.exe     (Windows)
+// Rejects:
+//   any path separators, whitespace, dots, quotes, or other punctuation
+//   qeeg_test_* tools
+//
+// This prevents path traversal like "qeeg_map_cli/../evil_cli" from escaping
+// the configured --bin-dir when resolving the executable.
+inline bool is_safe_qeeg_cli_tool_name(const std::string& tool) {
+  std::string base = tool;
+  if (ends_with(base, ".exe")) {
+    base = base.substr(0, base.size() - 4);
+  }
+  if (base.empty()) return false;
+  for (char c : base) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    if (std::isalnum(uc) != 0) continue;
+    if (c == '_') continue;
+    return false;
+  }
+  if (!starts_with(base, "qeeg_")) return false;
+  if (ends_with(base, "_cli") == false) return false;
+  if (starts_with(base, "qeeg_test_")) return false;
+  return true;
+}
 
 // Strict numeric parsing helpers.
 //
@@ -194,6 +224,18 @@ std::string json_escape(const std::string& s);
 std::string json_find_string_value(const std::string& s, const std::string& key);
 bool json_find_bool_value(const std::string& s, const std::string& key, bool default_value);
 int json_find_int_value(const std::string& s, const std::string& key, int default_value);
+
+// Parse a top-level JSON array of strings.
+//
+// Example:
+//   ["qeeg_map_cli","qeeg_topomap_cli"]
+//
+// Supports standard JSON string escapes including \uXXXX and UTF-16 surrogate
+// pairs. Whitespace is permitted between tokens.
+//
+// Returns true on success and fills `out`. On failure, returns false and writes
+// a best-effort error message into `err` (if provided).
+bool json_parse_string_array(const std::string& s, std::vector<std::string>* out, std::string* err = nullptr);
 
 // Percent-encode a URL path for safe use in HTML href/src attributes.
 //

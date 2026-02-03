@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_topomap_index.schema.json",
+  "title": "qEEG Topomap Index",
+  "description": "Machine-readable index produced by qeeg_topomap_cli (--json-index).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "generated_utc",
+    "tool",
+    "input_path",
+    "outdir",
+    "run_meta_json",
+    "report_html",
+    "render",
+    "interpolation",
+    "scaling",
+    "montage",
+    "maps"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "generated_utc": {
+      "type": "string"
+    },
+    "tool": {
+      "type": "string"
+    },
+    "input_path": {
+      "type": "string"
+    },
+    "outdir": {
+      "type": "string"
+    },
+    "run_meta_json": {
+      "type": "string"
+    },
+    "report_html": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "render": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "annotate"
+      ],
+      "properties": {
+        "annotate": {
+          "type": "boolean"
+        }
+      }
+    },
+    "interpolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "grid",
+        "idw_power",
+        "spline_terms",
+        "spline_m",
+        "spline_lambda"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
+            "idw",
+            "spline"
+          ]
+        },
+        "grid": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 4096
+        },
+        "idw_power": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "spline_terms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "spline_m": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "spline_lambda": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "scaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "fixed_vmin",
+        "fixed_vmax",
+        "robust_lo",
+        "robust_hi"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "fixed",
+            "robust",
+            "auto"
+          ]
+        },
+        "fixed_vmin": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "fixed_vmax": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "robust_lo": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "robust_hi": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "montage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "spec",
+        "n_channels",
+        "channels"
+      ],
+      "properties": {
+        "spec": {
+          "type": "string"
+        },
+        "n_channels": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512
+        },
+        "channels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "key",
+              "x",
+              "y"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "x": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "y": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "maps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "metric",
+          "file",
+          "vmin",
+          "vmax",
+          "n_channels",
+          "channels"
+        ],
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "vmin": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "vmax": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "n_channels": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 512
+          },
+          "channels": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "channel",
+                "key",
+                "x",
+                "y",
+                "value"
+              ],
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "x": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "y": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "value": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

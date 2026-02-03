@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_loreta_connectivity_protocol.schema.json",
+  "title": "qEEG LORETA Connectivity Protocol Candidates",
+  "description": "Ranked ROI-to-ROI connectivity edges produced by qeeg_loreta_connectivity_cli (--protocol-json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "generated_utc",
+    "tool",
+    "input_path",
+    "outdir",
+    "connectivity_index_json",
+    "atlas",
+    "params",
+    "edges"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "generated_utc": { "type": "string" },
+    "tool": { "type": "string" },
+    "input_path": { "type": "string" },
+    "outdir": { "type": "string" },
+    "connectivity_index_json": { "type": ["string", "null"] },
+    "atlas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" }
+      }
+    },
+    "params": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["top_n", "only_z", "threshold_abs"],
+      "properties": {
+        "top_n": { "type": "integer", "minimum": 0 },
+        "only_z": { "type": "boolean" },
+        "threshold_abs": { "type": "number", "minimum": 0 }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "rank",
+          "roi_a",
+          "roi_b",
+          "measure",
+          "band",
+          "value_kind",
+          "value",
+          "abs_value",
+          "suggested_direction"
+        ],
+        "properties": {
+          "rank": { "type": "integer", "minimum": 1 },
+          "roi_a": { "type": "string" },
+          "roi_b": { "type": "string" },
+          "measure": { "type": "string" },
+          "band": { "type": "string" },
+          "value_kind": { "type": "string", "enum": ["raw", "zscore"] },
+          "value": { "type": ["number", "null"] },
+          "abs_value": { "type": ["number", "null"] },
+          "suggested_direction": { "type": ["string", "null"], "enum": ["increase", "decrease", null] }
+        }
+      }
+    }
+  }
+}

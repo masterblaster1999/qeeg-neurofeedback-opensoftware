@@ -338,7 +338,7 @@ endif()
 
 # Sockets (OSC) on Windows
 if (WIN32)
-  target_link_libraries(qeeg PUBLIC ws2_32)
+  target_link_libraries(qeeg PUBLIC ws2_32 shell32)
 endif()
 
 if (QEEG_BUILD_CLI)
@@ -350,6 +350,12 @@ if (QEEG_BUILD_CLI)
 
   add_executable(qeeg_region_summary_cli src/region_summary_cli.cpp)
   target_link_libraries(qeeg_region_summary_cli PRIVATE qeeg)
+
+  add_executable(qeeg_loreta_metrics_cli src/loreta_metrics_cli.cpp)
+  target_link_libraries(qeeg_loreta_metrics_cli PRIVATE qeeg)
+
+  add_executable(qeeg_loreta_connectivity_cli src/loreta_connectivity_cli.cpp)
+  target_link_libraries(qeeg_loreta_connectivity_cli PRIVATE qeeg)
 
   add_executable(qeeg_connectivity_map_cli src/connectivity_map_cli.cpp)
   target_link_libraries(qeeg_connectivity_map_cli PRIVATE qeeg)
@@ -481,6 +487,8 @@ if (QEEG_BUILD_CLI)
   qeeg_add_cli_entry(qeeg_cli_entry_map src/main.cpp qeeg_map_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_topomap src/topomap_cli.cpp qeeg_topomap_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_region_summary src/region_summary_cli.cpp qeeg_region_summary_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_loreta_metrics src/loreta_metrics_cli.cpp qeeg_loreta_metrics_cli_entry)
+  qeeg_add_cli_entry(qeeg_cli_entry_loreta_connectivity src/loreta_connectivity_cli.cpp qeeg_loreta_connectivity_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_connectivity_map src/connectivity_map_cli.cpp qeeg_connectivity_map_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_bandpower src/bandpower_cli.cpp qeeg_bandpower_cli_entry)
   qeeg_add_cli_entry(qeeg_cli_entry_bandratios src/bandratios_cli.cpp qeeg_bandratios_cli_entry)
@@ -519,6 +527,8 @@ if (QEEG_BUILD_CLI)
     $<TARGET_OBJECTS:qeeg_cli_entry_map>
     $<TARGET_OBJECTS:qeeg_cli_entry_topomap>
     $<TARGET_OBJECTS:qeeg_cli_entry_region_summary>
+    $<TARGET_OBJECTS:qeeg_cli_entry_loreta_metrics>
+    $<TARGET_OBJECTS:qeeg_cli_entry_loreta_connectivity>
     $<TARGET_OBJECTS:qeeg_cli_entry_connectivity_map>
     $<TARGET_OBJECTS:qeeg_cli_entry_bandpower>
     $<TARGET_OBJECTS:qeeg_cli_entry_bandratios>
@@ -600,6 +610,8 @@ if (QEEG_BUILD_CLI)
     qeeg_map_cli
     qeeg_topomap_cli
     qeeg_region_summary_cli
+    qeeg_loreta_metrics_cli
+    qeeg_loreta_connectivity_cli
     qeeg_connectivity_map_cli
     qeeg_bandpower_cli
     qeeg_bandratios_cli
@@ -892,6 +904,61 @@ if(QEEG_BUILD_TESTS)
                            PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
 
+      # Smoke test the multi-session neurofeedback sessions dashboard renderer.
+      add_test(NAME qeeg_test_nf_sessions_dashboard_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_nf_sessions_dashboard.py)
+
+      set_tests_properties(qeeg_test_nf_sessions_dashboard_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+                                      TIMEOUT 60)
+
+
+      # Smoke test qeeg_topomap_cli JSON index and the topomap HTML report renderer.
+      add_test(NAME qeeg_test_topomap_index_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_topomap_index.py
+                 --topomap-cli $<TARGET_FILE:qeeg_topomap_cli>)
+
+      set_tests_properties(qeeg_test_topomap_index_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+                                      TIMEOUT 60)
+
+
+      # Smoke test qeeg_region_summary_cli JSON index output.
+      add_test(NAME qeeg_test_region_summary_index_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_region_summary_index.py
+                 --region-cli $<TARGET_FILE:qeeg_region_summary_cli>)
+
+      set_tests_properties(qeeg_test_region_summary_index_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+                                      TIMEOUT 60)
+
+
+      # Smoke test qeeg_loreta_metrics_cli JSON index output.
+      add_test(NAME qeeg_test_loreta_metrics_index_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_loreta_metrics_index.py
+                 --loreta-cli $<TARGET_FILE:qeeg_loreta_metrics_cli>)
+
+      set_tests_properties(qeeg_test_loreta_metrics_index_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+                                      TIMEOUT 60)
+
+
+      # Smoke test qeeg_loreta_connectivity_cli JSON index output.
+      add_test(NAME qeeg_test_loreta_connectivity_index_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_loreta_connectivity_index.py
+                 --loreta-conn-cli $<TARGET_FILE:qeeg_loreta_connectivity_cli>)
+
+      set_tests_properties(qeeg_test_loreta_connectivity_index_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+                                      TIMEOUT 60)
+
+
+
       # Smoke test the dependency-free real-time qEEG dashboard server.
       add_test(NAME qeeg_test_rt_dashboard_selftest
                COMMAND ${Python3_EXECUTABLE} -B
@@ -1035,6 +1102,14 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_cmdline_split PRIVATE qeeg)
   add_test(NAME qeeg_test_cmdline_split COMMAND qeeg_test_cmdline_split)
 
+  add_executable(qeeg_test_cli_tool_name tests/test_cli_tool_name.cpp)
+  target_link_libraries(qeeg_test_cli_tool_name PRIVATE qeeg)
+  add_test(NAME qeeg_test_cli_tool_name COMMAND qeeg_test_cli_tool_name)
+
+  add_executable(qeeg_test_json_string_array tests/test_json_string_array.cpp)
+  target_link_libraries(qeeg_test_json_string_array PRIVATE qeeg)
+  add_test(NAME qeeg_test_json_string_array COMMAND qeeg_test_json_string_array)
+
   add_executable(qeeg_test_cli_input_selectors tests/test_cli_input_selectors.cpp)
   target_link_libraries(qeeg_test_cli_input_selectors PRIVATE qeeg)
   add_test(NAME qeeg_test_cli_input_selectors COMMAND qeeg_test_cli_input_selectors)
@@ -1054,6 +1129,10 @@ if(QEEG_BUILD_TESTS)
   add_executable(qeeg_test_random_token tests/test_random_token.cpp)
   target_link_libraries(qeeg_test_random_token PRIVATE qeeg)
   add_test(NAME qeeg_test_random_token COMMAND qeeg_test_random_token)
+
+  add_executable(qeeg_test_open_default_app tests/test_open_default_app.cpp)
+  target_link_libraries(qeeg_test_open_default_app PRIVATE qeeg)
+  add_test(NAME qeeg_test_open_default_app COMMAND qeeg_test_open_default_app)
 
   add_executable(qeeg_test_nf_protocols tests/test_nf_protocols.cpp)
   target_link_libraries(qeeg_test_nf_protocols PRIVATE qeeg)

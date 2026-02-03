@@ -1135,6 +1135,70 @@ int json_find_int_value(const std::string& s, const std::string& key, int defaul
   }
 }
 
+bool json_parse_string_array(const std::string& s, std::vector<std::string>* out, std::string* err) {
+  if (out) out->clear();
+  if (err) *err = std::string();
+
+  size_t i = 0;
+  json_skip_ws(s, &i);
+  if (i >= s.size() || s[i] != '[') {
+    if (err) *err = "expected '['";
+    return false;
+  }
+  ++i;
+
+  std::vector<std::string> tmp;
+  json_skip_ws(s, &i);
+  if (i < s.size() && s[i] == ']') {
+    ++i;
+    json_skip_ws(s, &i);
+    if (i != s.size()) {
+      if (err) *err = "trailing data";
+      return false;
+    }
+    if (out) *out = tmp;
+    return true;
+  }
+
+  while (i < s.size()) {
+    json_skip_ws(s, &i);
+    if (i >= s.size() || s[i] != '"') {
+      if (err) *err = "expected string";
+      return false;
+    }
+    std::string v;
+    if (!json_parse_string(s, &i, &v)) {
+      if (err) *err = "invalid string";
+      return false;
+    }
+    tmp.push_back(v);
+
+    json_skip_ws(s, &i);
+    if (i >= s.size()) {
+      if (err) *err = "unterminated array";
+      return false;
+    }
+    if (s[i] == ',') {
+      ++i;
+      continue;
+    }
+    if (s[i] == ']') {
+      ++i;
+      break;
+    }
+    if (err) *err = "expected ',' or ']'";
+    return false;
+  }
+
+  json_skip_ws(s, &i);
+  if (i != s.size()) {
+    if (err) *err = "trailing data";
+    return false;
+  }
+  if (out) *out = tmp;
+  return true;
+}
+
 bool normalize_rel_path_safe(const std::string& raw, std::string* out_norm) {
   if (!out_norm) return false;
   *out_norm = std::string();

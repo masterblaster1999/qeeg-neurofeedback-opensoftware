@@ -2,7 +2,7 @@
 """Render qEEG topomap outputs into a self-contained HTML report.
 
 This repo contains CLI tools that render scalp topographic maps ("topomaps") as
-BMP images, for example:
+image files, for example:
 
   - qeeg_map_cli (when invoked with --annotate / topomap output enabled)
   - qeeg_topomap_cli (renders topomaps from a per-channel CSV table)
@@ -12,6 +12,7 @@ Typical artifacts include:
   - topomap_<metric>.bmp
   - topomap_<metric>_z.bmp            (optional; when a reference / z-scoring is used)
   - topomap_run_meta.json             (optional; tool run metadata)
+  - topomap_index.json                (optional; machine-readable index from newer qeeg_topomap_cli)
 
 This script turns those artifacts into a single HTML file with inline CSS and
 embedded images (data URIs). The resulting HTML makes **no network requests**
@@ -22,7 +23,7 @@ Usage:
   # From an output directory containing topomap_*.bmp
   python3 scripts/render_topomap_report.py --input out_topomap
 
-  # Or point at a single BMP (the report will include all topomap_*.bmp in the same folder)
+  # Or point at a single image (the report will include all topomap_*.* in the same folder)
   python3 scripts/render_topomap_report.py --input out_topomap/topomap_alpha.bmp
 
 The default output is: <outdir>/topomap_report.html
@@ -66,40 +67,20 @@ def _guess_mime(path: str) -> str:
     return "application/octet-stream"
 
 
-def _read_file_bytes(path: str, *, max_bytes: int) -> bytes:
-    with open(path, "rb") as f:
-        b = f.read(max_bytes + 1)
-    if len(b) > max_bytes:
-        raise RuntimeError(f"File too large to embed ({len(b)} bytes): {path}\nTip: re-run with --no-embed or increase --max-embed-mb.")
-    return b
-
-
 def _file_to_data_uri(path: str, *, max_bytes: int) -> str:
     try:
-        b = _read_file_bytes(path, max_bytes=max_bytes)
+        size = int(os.path.getsize(path))
     except Exception:
+        size = 0
+    if size <= 0:
+        return ""
+    if size > max_bytes:
         return ""
     mime = _guess_mime(path)
-    return f"data:{mime};base64,{base64.b64encode(b).decode('ascii')}"
-
-
-def _bmp_dimensions(path: str) -> Tuple[Optional[int], Optional[int]]:
-    """Best-effort width/height for BMPs (returns (None, None) on failure)."""
-
-    try:
-        with open(path, "rb") as f:
-            hdr = f.read(26)
-        if len(hdr) < 26 or hdr[:2] != b"BM":
-            return None, None
-        w = int.from_bytes(hdr[18:22], "little", signed=True)
-        h = int.from_bytes(hdr[22:26], "little", signed=True)
-        if w <= 0:
-            return None, None
-        if h == 0:
-            return w, None
-        return w, abs(h)
-    except Exception:
-        return None, None
+    with open(path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
 
 
 def _pick_topomap_files_from_run_meta(outdir: str, run_meta: Optional[Dict[str, Any]]) -> List[str]:
@@ -113,28 +94,114 @@ def _pick_topomap_files_from_run_meta(outdir: str, run_meta: Optional[Dict[str, 
         if not isinstance(v, str):
             continue
         if _TOPOMAP_IMG_RE.match(v):
-            p = os.path.join(outdir, v)
+            p = os.path.join(outdir, v.replace("/", os.sep))
             if os.path.exists(p) and os.path.isfile(p):
                 files.append(p)
-    return sorted(set(files))
+    # stable unique
+    seen: set[str] = set()
+    out: List[str] = []
+    for p in files:
+        ap = os.path.abspath(p)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        out.append(ap)
+    return out
 
 
-def _collect_topomap_files(outdir: str, run_meta: Optional[Dict[str, Any]]) -> List[str]:
-    # Prefer run_meta ordering when available.
-    files = _pick_topomap_files_from_run_meta(outdir, run_meta)
-    if files:
-        return files
+def _resolve_index_file(index_path: str, file_field: str) -> str:
+    """Resolve an index map file entry to an absolute path."""
 
+    if not file_field:
+        return ""
+    f = str(file_field).strip()
+    if not f:
+        return ""
+    # Index uses POSIX separators; make it OS-friendly.
+    f_os = f.replace("/", os.sep).replace("\\", os.sep)
+    if os.path.isabs(f_os):
+        return os.path.abspath(f_os)
+    base = os.path.dirname(os.path.abspath(index_path)) or "."
+    return os.path.abspath(os.path.join(base, f_os))
+
+
+def _read_topomap_index(outdir: str, index_override: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Return (index_dict_or_None, index_path_or_None)."""
+
+    candidates: List[str] = []
+    if index_override:
+        candidates.append(index_override)
+    candidates.append(os.path.join(outdir, "topomap_index.json"))
+
+    for p in candidates:
+        try:
+            idx = _read_json_if_exists(p)
+        except Exception:
+            idx = None
+        if isinstance(idx, dict) and isinstance(idx.get("maps"), list):
+            return idx, os.path.abspath(p)
+    return None, None
+
+
+def _collect_topomap_files(
+    outdir: str,
+    run_meta: Optional[Dict[str, Any]],
+    index: Optional[Dict[str, Any]],
+    index_path: Optional[str],
+) -> List[str]:
+    """Collect topomap image files, preferring index/run_meta ordering when present."""
+
+    outdir = os.path.abspath(outdir)
+
+    # Discover all topomap_* images in the directory (for completeness).
     try:
         names = os.listdir(outdir)
     except Exception:
         names = []
-    out: List[str] = []
-    for n in sorted(names):
+    discovered: List[str] = []
+    for n in sorted(names, key=lambda s: (str(s).lower(), str(s))):
         if _TOPOMAP_IMG_RE.match(n or ""):
             p = os.path.join(outdir, n)
             if os.path.isfile(p):
-                out.append(p)
+                discovered.append(os.path.abspath(p))
+    discovered_set = set(discovered)
+
+    ordered: List[str] = []
+
+    # 1) Prefer index ordering.
+    if isinstance(index, dict) and isinstance(index.get("maps"), list) and index_path:
+        for m in index.get("maps", []):
+            if not isinstance(m, dict):
+                continue
+            f = m.get("file")
+            if not isinstance(f, str):
+                continue
+            p = _resolve_index_file(index_path, f)
+            ap = os.path.abspath(p)
+            if ap in discovered_set:
+                ordered.append(ap)
+
+    # 2) Next, prefer run_meta ordering.
+    for p in _pick_topomap_files_from_run_meta(outdir, run_meta):
+        ap = os.path.abspath(p)
+        if ap in discovered_set:
+            ordered.append(ap)
+
+    # De-duplicate ordered list.
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in ordered:
+        ap = os.path.abspath(p)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        out.append(ap)
+
+    # Append remaining discovered files not in the ordered set.
+    for p in discovered:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
     return out
 
 
@@ -154,11 +221,29 @@ def _parse_metric_and_variant(filename: str) -> Tuple[str, str]:
 
 
 def _pretty_metric(metric: str) -> str:
-    # Keep underscores (common in ratio names), but also provide a nicer label.
     s = str(metric or "metric")
-    if not s:
-        s = "metric"
-    return s
+    return s or "metric"
+
+
+def _rm_get(run_meta: Optional[Dict[str, Any]], *keys: str) -> str:
+    if not isinstance(run_meta, dict):
+        return ""
+    for k in keys:
+        if not k:
+            continue
+        v = run_meta.get(k)
+        if v is None:
+            continue
+        if isinstance(v, (str, int, float)):
+            t = str(v)
+            if t:
+                return t
+    # legacy nested: Input.Path
+    if "Input" in keys and isinstance(run_meta.get("Input"), dict):
+        v = run_meta["Input"].get("Path")
+        if isinstance(v, str) and v:
+            return v
+    return ""
 
 
 @dataclass
@@ -169,58 +254,101 @@ class _MapImg:
     rel_for_link: str
     data_uri: str
     size_bytes: int
-    width: Optional[int] = None
-    height: Optional[int] = None
+    # Index metadata (optional)
+    vmin: Optional[float] = None
+    vmax: Optional[float] = None
+    n_channels: Optional[int] = None
 
 
-def _guess_paths(inp: str, out: Optional[str]) -> Tuple[str, List[str], str, Optional[Dict[str, Any]]]:
-    """Return (outdir, img_paths, html_path, run_meta_dict_or_None)."""
+def _guess_paths(inp: str, out: Optional[str], index_override: Optional[str]) -> Tuple[str, List[str], str, Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
+    """Return (outdir, img_paths, html_path, run_meta_dict_or_None, index_dict_or_None, index_path_or_None)."""
 
     run_meta: Optional[Dict[str, Any]] = None
+    index: Optional[Dict[str, Any]] = None
+    index_path: Optional[str] = None
 
     if _is_dir(inp):
         outdir = os.path.abspath(inp)
         run_meta = _read_json_if_exists(os.path.join(outdir, "topomap_run_meta.json"))
-        imgs = _collect_topomap_files(outdir, run_meta)
+        index, index_path = _read_topomap_index(outdir, index_override)
+        imgs = _collect_topomap_files(outdir, run_meta, index, index_path)
         if not imgs:
-            raise SystemExit(f"Could not find any topomap_*.bmp under: {outdir}")
+            raise SystemExit(f"Could not find any topomap_* images under: {outdir}")
         if out is None:
             out = os.path.join(outdir, "topomap_report.html")
-        return outdir, imgs, os.path.abspath(out), run_meta
+        return outdir, imgs, os.path.abspath(out), run_meta, index, index_path
 
     # File path passed.
     p = os.path.abspath(inp)
     outdir = os.path.dirname(p) or "."
     run_meta = _read_json_if_exists(os.path.join(outdir, "topomap_run_meta.json"))
-    imgs = _collect_topomap_files(outdir, run_meta)
+    index, index_path = _read_topomap_index(outdir, index_override)
+    imgs = _collect_topomap_files(outdir, run_meta, index, index_path)
     if not imgs and os.path.exists(p) and os.path.isfile(p) and _TOPOMAP_IMG_RE.match(os.path.basename(p)):
         imgs = [p]
     if not imgs:
-        raise SystemExit(f"Could not find any topomap_*.bmp in: {outdir}")
+        raise SystemExit(f"Could not find any topomap_* images in: {outdir}")
     if out is None:
         out = os.path.join(outdir, "topomap_report.html")
-    return outdir, imgs, os.path.abspath(out), run_meta
+    return outdir, imgs, os.path.abspath(out), run_meta, index, index_path
 
 
-def _render(outdir: str, img_paths: Sequence[str], run_meta: Optional[Dict[str, Any]], *, out_html: str, embed: bool, max_embed_bytes: int) -> str:
+def _render(
+    outdir: str,
+    img_paths: Sequence[str],
+    run_meta: Optional[Dict[str, Any]],
+    index: Optional[Dict[str, Any]],
+    index_path: Optional[str],
+    *,
+    out_html: str,
+    embed: bool,
+    max_embed_bytes: int,
+) -> str:
+    # Optional per-file metadata from the index
+    idx_meta_by_abs: Dict[str, Dict[str, Any]] = {}
+    if isinstance(index, dict) and isinstance(index.get("maps"), list) and index_path:
+        for m in index.get("maps", []):
+            if not isinstance(m, dict):
+                continue
+            f = m.get("file")
+            if not isinstance(f, str):
+                continue
+            ap = os.path.abspath(_resolve_index_file(index_path, f))
+            idx_meta_by_abs[ap] = m
+
     # Group by metric -> {raw,z}
     groups: Dict[str, Dict[str, _MapImg]] = {}
 
     for p in img_paths:
         metric, variant = _parse_metric_and_variant(p)
         rel = _posix_relpath(p, os.path.dirname(out_html) or ".")
-        size = 0
         try:
             size = int(os.path.getsize(p))
         except Exception:
             size = 0
-        w: Optional[int] = None
-        h: Optional[int] = None
-        if os.path.splitext(p)[1].lower() == ".bmp":
-            w, h = _bmp_dimensions(p)
+
         data = ""
         if embed:
             data = _file_to_data_uri(p, max_bytes=max_embed_bytes)
+
+        meta = idx_meta_by_abs.get(os.path.abspath(p))
+        vmin: Optional[float] = None
+        vmax: Optional[float] = None
+        n_ch: Optional[int] = None
+        if isinstance(meta, dict):
+            try:
+                vmin = float(meta.get("vmin")) if meta.get("vmin") is not None else None
+            except Exception:
+                vmin = None
+            try:
+                vmax = float(meta.get("vmax")) if meta.get("vmax") is not None else None
+            except Exception:
+                vmax = None
+            try:
+                n_ch = int(meta.get("n_channels")) if meta.get("n_channels") is not None else None
+            except Exception:
+                n_ch = None
+
         img = _MapImg(
             metric=metric,
             variant=variant,
@@ -228,15 +356,16 @@ def _render(outdir: str, img_paths: Sequence[str], run_meta: Optional[Dict[str, 
             rel_for_link=rel,
             data_uri=data,
             size_bytes=size,
-            width=w,
-            height=h,
+            vmin=vmin,
+            vmax=vmax,
+            n_channels=n_ch,
         )
         groups.setdefault(metric, {})[variant] = img
 
-    # HTML sections
-    tool = str(run_meta.get("Tool")) if isinstance(run_meta, dict) and run_meta.get("Tool") else ""
-    ver = str(run_meta.get("Version")) if isinstance(run_meta, dict) and run_meta.get("Version") else ""
-    inp_path = str(run_meta.get("input_path")) if isinstance(run_meta, dict) and run_meta.get("input_path") else ""
+    # HTML header metadata
+    tool = _rm_get(run_meta, "Tool")
+    ver = _rm_get(run_meta, "QeegVersion", "Version")
+    inp_path = _rm_get(run_meta, "InputPath", "input_path", "Input")
 
     header_meta_rows: List[str] = []
     if tool:
@@ -249,62 +378,100 @@ def _render(outdir: str, img_paths: Sequence[str], run_meta: Optional[Dict[str, 
     header_meta_rows.append(f"<tr><th>Generated</th><td><code>{_e(utc_now_iso())}</code></td></tr>")
     header_meta_rows.append(f"<tr><th>Embedded images</th><td><code>{'yes' if embed else 'no'}</code></td></tr>")
 
-    meta_table = (
-        '<table class="kv">'
-        + "".join(header_meta_rows)
-        + "</table>"
-    )
-
-    # Gallery
-    metric_keys = sorted(groups.keys(), key=lambda s: (s.lower(), s))
-    cards: List[str] = []
-    for metric in metric_keys:
-        d = groups.get(metric, {})
-        # Order: raw, z
-        parts: List[str] = []
-        for variant in ["raw", "z"]:
-            if variant not in d:
-                continue
-            im = d[variant]
-            label = "Raw" if variant == "raw" else "Z"
-            # Choose src
-            if embed and im.data_uri:
-                src = im.data_uri
-            else:
-                src = im.rel_for_link
-            dim = ""
-            if im.width and im.height:
-                dim = f"{im.width}×{im.height}"
-            elif im.width and not im.height:
-                dim = f"{im.width}×?"
-            size_kb = ""
-            if im.size_bytes > 0:
-                size_kb = f"{im.size_bytes/1024.0:.1f} KB"
-            info_bits = " · ".join([x for x in [dim, size_kb] if x])
-            info = f"<div class=\"img-meta\">{_e(info_bits)}</div>" if info_bits else ""
-            parts.append(
-                '<figure class="map-fig">'
-                f'<div class="fig-h">{_e(label)} <a class="raw-link" href="{_e(im.rel_for_link)}">open file</a></div>'
-                f'<img class="map-img" alt="topomap { _e(metric) } { _e(label) }" src="{_e(src)}">'
-                f'{info}'
-                '</figure>'
+    # Index-derived metadata (if present)
+    if isinstance(index, dict):
+        mnt = index.get("montage")
+        if isinstance(mnt, dict):
+            spec = mnt.get("spec")
+            if isinstance(spec, str) and spec:
+                header_meta_rows.append(f"<tr><th>Montage</th><td><code>{_e(spec)}</code></td></tr>")
+            n = mnt.get("n_channels")
+            if isinstance(n, int):
+                header_meta_rows.append(f"<tr><th>Montage channels</th><td><code>{n}</code></td></tr>")
+        interp = index.get("interpolation")
+        if isinstance(interp, dict):
+            method = interp.get("method")
+            grid = interp.get("grid")
+            if isinstance(method, str) and method:
+                header_meta_rows.append(f"<tr><th>Interpolation</th><td><code>{_e(method)}</code></td></tr>")
+            if isinstance(grid, int):
+                header_meta_rows.append(f"<tr><th>Grid</th><td><code>{grid}</code></td></tr>")
+        scaling = index.get("scaling")
+        if isinstance(scaling, dict):
+            mode = scaling.get("mode")
+            if isinstance(mode, str) and mode:
+                header_meta_rows.append(f"<tr><th>Scaling</th><td><code>{_e(mode)}</code></td></tr>")
+        if index_path and os.path.isfile(index_path):
+            rel = _posix_relpath(index_path, os.path.dirname(out_html) or ".")
+            header_meta_rows.append(
+                f"<tr><th>Index</th><td><a href=\"{_e(rel)}\"><code>{_e(os.path.basename(index_path))}</code></a></td></tr>"
             )
 
+    meta_table = "<table class=\"kv\">" + "".join(header_meta_rows) + "</table>"
+
+    # Metric ordering: prefer index order, then alphabetical.
+    metric_keys: List[str] = []
+    if isinstance(index, dict) and isinstance(index.get("maps"), list):
+        seen_m: set[str] = set()
+        for m in index.get("maps", []):
+            if not isinstance(m, dict):
+                continue
+            metric = m.get("metric")
+            if not isinstance(metric, str) or not metric:
+                continue
+            if metric in groups and metric not in seen_m:
+                metric_keys.append(metric)
+                seen_m.add(metric)
+    for m in sorted(groups.keys(), key=lambda s: (s.lower(), s)):
+        if m not in metric_keys:
+            metric_keys.append(m)
+
+    cards: List[str] = []
+    for metric in metric_keys:
+        variants = groups.get(metric, {})
         pretty = _pretty_metric(metric)
-        card = (
-            '<div class="map-card">'
-            f'<h3 class="metric">{_e(pretty)}</h3>'
-            '<div class="map-row">'
-            + "".join(parts)
-            + '</div>'
-            '</div>'
+
+        figs: List[str] = []
+        for variant, label in (("raw", "raw"), ("z", "z")):
+            img = variants.get(variant)
+            if not img:
+                continue
+            src = img.data_uri if (embed and img.data_uri) else img.rel_for_link
+
+            bits: List[str] = []
+            if img.n_channels is not None:
+                bits.append(f"n={img.n_channels}")
+            if img.vmin is not None and img.vmax is not None:
+                bits.append(f"vmin={img.vmin:.6g}, vmax={img.vmax:.6g}")
+            if img.size_bytes:
+                bits.append(f"{img.size_bytes/1024.0:.1f} KiB")
+            info = f"<div class=\"img-meta\">{_e(' · '.join(bits))}</div>" if bits else ""
+
+            figs.append(
+                f"""<figure class=\"map-fig\">
+  <div class=\"fig-h\"><span>{_e(label)}</span><a class=\"raw-link\" href=\"{_e(img.rel_for_link)}\">file</a></div>
+  <img class=\"map-img\" alt=\"topomap {_e(metric)} {_e(label)}\" src=\"{_e(src)}\">
+  {info}
+</figure>"""
+            )
+
+        if not figs:
+            continue
+
+        cards.append(
+            f"""<section class=\"map-card\">
+  <h3><code>{_e(pretty)}</code></h3>
+  <div class=\"map-row\">
+    {''.join(figs)}
+  </div>
+</section>"""
         )
-        cards.append(card)
 
-    cards_html = "".join(cards)
+    cards_html = "\n".join(cards)
 
-    css = BASE_CSS + r"""
-.kv { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    css = BASE_CSS + "\n" + r""".muted { color: var(--muted); }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 24px 16px 60px 16px; }
+.kv { width: 100%; border-collapse: collapse; margin: 14px 0 10px 0; }
 .kv th, .kv td { border-bottom: 1px solid var(--grid); padding: 8px 10px; vertical-align: top; text-align: left; }
 .kv th { width: 140px; color: var(--muted); font-weight: 600; }
 
@@ -321,7 +488,7 @@ def _render(outdir: str, img_paths: Sequence[str], run_meta: Optional[Dict[str, 
 .img-meta { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
 .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
-"""
+"""  # noqa: E501
 
     title = "Topomap report"
 
@@ -356,9 +523,10 @@ def _render(outdir: str, img_paths: Sequence[str], run_meta: Optional[Dict[str, 
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Render qEEG topomap BMP outputs into a self-contained HTML report.")
-    ap.add_argument("--input", required=True, help="Input directory (preferred) or one topomap_*.bmp file.")
+    ap = argparse.ArgumentParser(description="Render qEEG topomap image outputs into a self-contained HTML report.")
+    ap.add_argument("--input", required=True, help="Input directory (preferred) or one topomap_* image file.")
     ap.add_argument("--out", default=None, help="Output HTML file (default: <outdir>/topomap_report.html)")
+    ap.add_argument("--index", default=None, help="Optional explicit topomap_index.json (preserves render order + adds metadata)")
     ap.add_argument("--no-embed", action="store_true", help="Do not embed images as data URIs (link to files instead).")
 
     ap.add_argument(
@@ -370,10 +538,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--open", action="store_true", help="Open the report in your default browser.")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
-    outdir, img_paths, out_html, run_meta = _guess_paths(args.input, args.out)
+    outdir, img_paths, out_html, run_meta, index, index_path = _guess_paths(args.input, args.out, args.index)
     max_bytes = int(max(0.1, float(args.max_embed_mb)) * 1024 * 1024)
 
-    _render(outdir, img_paths, run_meta, out_html=out_html, embed=not args.no_embed, max_embed_bytes=max_bytes)
+    _render(outdir, img_paths, run_meta, index, index_path, out_html=out_html, embed=not args.no_embed, max_embed_bytes=max_bytes)
 
     if args.open:
         try:

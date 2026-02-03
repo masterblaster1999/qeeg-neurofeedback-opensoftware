@@ -37,6 +37,8 @@
 int qeeg_map_cli_entry(int argc, char** argv);
 int qeeg_topomap_cli_entry(int argc, char** argv);
 int qeeg_region_summary_cli_entry(int argc, char** argv);
+int qeeg_loreta_metrics_cli_entry(int argc, char** argv);
+int qeeg_loreta_connectivity_cli_entry(int argc, char** argv);
 int qeeg_connectivity_map_cli_entry(int argc, char** argv);
 int qeeg_bandpower_cli_entry(int argc, char** argv);
 int qeeg_bandratios_cli_entry(int argc, char** argv);
@@ -92,6 +94,8 @@ static std::unordered_map<std::string, EntryFn> make_tools() {
   m["qeeg_map_cli"] = &qeeg_map_cli_entry;
   m["qeeg_topomap_cli"] = &qeeg_topomap_cli_entry;
   m["qeeg_region_summary_cli"] = &qeeg_region_summary_cli_entry;
+  m["qeeg_loreta_metrics_cli"] = &qeeg_loreta_metrics_cli_entry;
+  m["qeeg_loreta_connectivity_cli"] = &qeeg_loreta_connectivity_cli_entry;
   m["qeeg_connectivity_map_cli"] = &qeeg_connectivity_map_cli_entry;
   m["qeeg_bandpower_cli"] = &qeeg_bandpower_cli_entry;
   m["qeeg_bandratios_cli"] = &qeeg_bandratios_cli_entry;

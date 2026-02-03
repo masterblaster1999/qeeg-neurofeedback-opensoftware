@@ -16,6 +16,7 @@ Inputs (per session folder):
 
 Outputs:
   - nf_sessions_dashboard.html (default output name; configurable via --out)
+  - nf_sessions_dashboard_index.json (optional; when --json-index is provided)
 
 Typical usage:
 
@@ -37,6 +38,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as _dt
+import json
 import math
 import os
 import sys
@@ -60,6 +62,12 @@ try:
     )
 except Exception as _exc:  # pragma: no cover
     raise SystemExit(f"ERROR: failed to import scripts/report_common.py: {_exc}")
+
+# Canonical JSON Schema locations for machine-readable outputs.
+#
+# These URLs match the $id fields in the corresponding schema documents under /schemas.
+_JSON_INDEX_SCHEMA = "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_sessions_dashboard_index.schema.json"
+_JSON_INDEX_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -594,20 +602,20 @@ def _svg_spark(values: Sequence[float], labels: Sequence[str], *, title: str, yf
         )
 
     return f"""
-+<svg class=\"spark\" viewBox=\"0 0 {W} {H}\" role=\"img\" aria-label=\"{_e(title)}\">
-+  <rect class=\"spark-frame\" x=\"0\" y=\"0\" width=\"{W}\" height=\"{H}\" />
-+  <text class=\"spark-title\" x=\"{pad_l}\" y=\"18\">{_e(title)}</text>
-+
-+  <line class=\"spark-axis\" x1=\"{x0}\" y1=\"{y1}\" x2=\"{x1}\" y2=\"{y1}\" />
-+  <line class=\"spark-axis\" x1=\"{x0}\" y1=\"{y0}\" x2=\"{x0}\" y2=\"{y1}\" />
-+
-+  <text class=\"spark-y\" x=\"10\" y=\"{y0 + 10:.2f}\">{_e(mx_lbl)}</text>
-+  <text class=\"spark-y\" x=\"10\" y=\"{y1:.2f}\">{_e(mn_lbl)}</text>
-+
-+  <polyline class=\"spark-line\" points=\"{_e(' '.join(pts))}\" />
-+  {''.join(circles)}
-+</svg>
-+""".strip()
+<svg class=\"spark\" viewBox=\"0 0 {W} {H}\" role=\"img\" aria-label=\"{_e(title)}\">
+  <rect class=\"spark-frame\" x=\"0\" y=\"0\" width=\"{W}\" height=\"{H}\" />
+  <text class=\"spark-title\" x=\"{pad_l}\" y=\"18\">{_e(title)}</text>
+
+  <line class=\"spark-axis\" x1=\"{x0}\" y1=\"{y1}\" x2=\"{x1}\" y2=\"{y1}\" />
+  <line class=\"spark-axis\" x1=\"{x0}\" y1=\"{y0}\" x2=\"{x0}\" y2=\"{y1}\" />
+
+  <text class=\"spark-y\" x=\"10\" y=\"{y0 + 10:.2f}\">{_e(mx_lbl)}</text>
+  <text class=\"spark-y\" x=\"10\" y=\"{y1:.2f}\">{_e(mn_lbl)}</text>
+
+  <polyline class=\"spark-line\" points=\"{_e(' '.join(pts))}\" />
+  {''.join(circles)}
+</svg>
+""".strip()
 
 
 def _build_dashboard(sessions: Sequence[_Session], out_path: Path, roots: Sequence[str]) -> str:
@@ -705,98 +713,232 @@ def _build_dashboard(sessions: Sequence[_Session], out_path: Path, roots: Sequen
     )
 
     css = BASE_CSS + r"""
-+/* Sessions dashboard tweaks */
-+.data-table { min-width: 980px; }
-+
-+.stats {
-+  display: grid;
-+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-+  gap: 10px;
-+  margin-top: 12px;
-+}
-+.stat {
-+  border: 1px solid var(--grid);
-+  border-radius: 12px;
-+  padding: 10px 12px;
-+  background: rgba(255,255,255,0.02);
-+}
-+.stat .num { font-size: 20px; font-weight: 700; }
-+.stat .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
-+
-+.spark { width: 100%; height: auto; margin-top: 10px; }
-+.spark-frame { fill: rgba(17,24,39,0.60); stroke: var(--grid); stroke-width: 1; }
-+.spark-title { fill: #dce7ff; font-weight: 700; font-size: 13px; }
-+.spark-axis { stroke: rgba(255,255,255,0.08); stroke-width: 1; }
-+.spark-y { fill: var(--muted); font-size: 12px; }
-+.spark-line { fill: none; stroke: var(--accent); stroke-width: 2.5; opacity: 0.92; }
-+.spark-pt { fill: rgba(127,179,255,0.65); stroke: rgba(255,255,255,0.22); stroke-width: 1; }
-+"""
+/* Sessions dashboard tweaks */
+.data-table { min-width: 980px; }
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.stat {
+  border: 1px solid var(--grid);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(255,255,255,0.02);
+}
+.stat .num { font-size: 20px; font-weight: 700; }
+.stat .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+.spark { width: 100%; height: auto; margin-top: 10px; }
+.spark-frame { fill: rgba(17,24,39,0.60); stroke: var(--grid); stroke-width: 1; }
+.spark-title { fill: #dce7ff; font-weight: 700; font-size: 13px; }
+.spark-axis { stroke: rgba(255,255,255,0.08); stroke-width: 1; }
+.spark-y { fill: var(--muted); font-size: 12px; }
+.spark-line { fill: none; stroke: var(--accent); stroke-width: 2.5; opacity: 0.92; }
+.spark-pt { fill: rgba(127,179,255,0.65); stroke: rgba(255,255,255,0.22); stroke-width: 1; }
+"""
 
     return f"""<!doctype html>
-+<html lang=\"en\">
-+<head>
-+<meta charset=\"utf-8\">
-+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-+<title>Neurofeedback sessions dashboard</title>
-+<style>{css}</style>
-+</head>
-+<body>
-+<header>
-+  <h1>Neurofeedback sessions dashboard</h1>
-+  <div class=\"meta\">Generated {now} — {n_sess} sessions</div>
-+</header>
-+<main>
-+  <div class=\"card\">
-+    <h2>About</h2>
-+    <div class=\"note\">
-+      Aggregated view of <code>qeeg_nf_cli</code> outputs (<code>nf_feedback.csv</code>) across multiple sessions.
-+      For research/educational inspection only; not a medical device.
-+    </div>
-+    <div class=\"note\">
-+      Scanned roots:
-+      <ul>{roots_html}</ul>
-+    </div>
-+
-+    <div class=\"stats\">
-+      <div class=\"stat\"><div class=\"num\">{n_sess}</div><div class=\"lbl\">Sessions</div></div>
-+      <div class=\"stat\"><div class=\"num\">{_e(_fmt_num(tot_dur))}</div><div class=\"lbl\">Total duration (s)</div></div>
-+      <div class=\"stat\"><div class=\"num\">{_e(_fmt_frac(avg_reward))}</div><div class=\"lbl\">Avg reward</div></div>
-+      <div class=\"stat\"><div class=\"num\">{_e(_fmt_frac(avg_art))}</div><div class=\"lbl\">Avg artifact</div></div>
-+    </div>
-+  </div>
-+
-+  <div class=\"card\">
-+    <h2>Trends</h2>
-+    <div class=\"note\">Each point is one session (ordered by timestamp when available).</div>
-+    {reward_chart if reward_chart else '<div class="note muted">Reward trend unavailable (missing reward columns).</div>'}
-+    {artifact_chart if artifact_chart else '<div class="note muted">Artifact trend unavailable (missing artifact columns).</div>'}
-+    {thr_chart if thr_chart else '<div class="note muted">Threshold trend unavailable (missing threshold).</div>'}
-+  </div>
-+
-+  <div class=\"card\">
-+    <h2>Sessions (sortable)</h2>
-+    <div class=\"note\">Click headers to sort. Use the filter box to search across all columns.</div>
-+    <div class=\"table-filter\">
-+      <div class=\"table-controls\">
-+        <input type=\"search\" placeholder=\"Filter rows…\" oninput=\"filterTable(this)\" />
-+        <button type=\"button\" onclick=\"downloadTableCSV(this, 'nf_sessions_filtered.csv', true)\">Download CSV</button>
-+        <span class=\"filter-count muted\"></span>
-+      </div>
-+      <div class=\"table-wrap\">
-+        <table class=\"data-table sticky\">
-+          <thead><tr>{ths}</tr></thead>
-+          <tbody>{''.join(rows)}</tbody>
-+        </table>
-+      </div>
-+    </div>
-+  </div>
-+
-+  <div class=\"footer\">Tip: open links in a browser. This HTML makes no network requests.</div>
-+</main>
-+<script>{JS_SORT_TABLE}</script>
-+</body>
-+</html>
-+"""
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>Neurofeedback sessions dashboard</title>
+<style>{css}</style>
+</head>
+<body>
+<header>
+  <h1>Neurofeedback sessions dashboard</h1>
+  <div class=\"meta\">Generated {now} — {n_sess} sessions</div>
+</header>
+<main>
+  <div class=\"card\">
+    <h2>About</h2>
+    <div class=\"note\">
+      Aggregated view of <code>qeeg_nf_cli</code> outputs (<code>nf_feedback.csv</code>) across multiple sessions.
+      For research/educational inspection only; not a medical device.
+    </div>
+    <div class=\"note\">
+      Scanned roots:
+      <ul>{roots_html}</ul>
+    </div>
+
+    <div class=\"stats\">
+      <div class=\"stat\"><div class=\"num\">{n_sess}</div><div class=\"lbl\">Sessions</div></div>
+      <div class=\"stat\"><div class=\"num\">{_e(_fmt_num(tot_dur))}</div><div class=\"lbl\">Total duration (s)</div></div>
+      <div class=\"stat\"><div class=\"num\">{_e(_fmt_frac(avg_reward))}</div><div class=\"lbl\">Avg reward</div></div>
+      <div class=\"stat\"><div class=\"num\">{_e(_fmt_frac(avg_art))}</div><div class=\"lbl\">Avg artifact</div></div>
+    </div>
+  </div>
+
+  <div class=\"card\">
+    <h2>Trends</h2>
+    <div class=\"note\">Each point is one session (ordered by timestamp when available).</div>
+    {reward_chart if reward_chart else '<div class="note muted">Reward trend unavailable (missing reward columns).</div>'}
+    {artifact_chart if artifact_chart else '<div class="note muted">Artifact trend unavailable (missing artifact columns).</div>'}
+    {thr_chart if thr_chart else '<div class="note muted">Threshold trend unavailable (missing threshold).</div>'}
+  </div>
+
+  <div class=\"card\">
+    <h2>Sessions (sortable)</h2>
+    <div class=\"note\">Click headers to sort. Use the filter box to search across all columns.</div>
+    <div class=\"table-filter\">
+      <div class=\"table-controls\">
+        <input type=\"search\" placeholder=\"Filter rows…\" oninput=\"filterTable(this)\" />
+        <button type=\"button\" onclick=\"downloadTableCSV(this, 'nf_sessions_filtered.csv', true)\">Download CSV</button>
+        <span class=\"filter-count muted\"></span>
+      </div>
+      <div class=\"table-wrap\">
+        <table class=\"data-table sticky\">
+          <thead><tr>{ths}</tr></thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class=\"footer\">Tip: open links in a browser. This HTML makes no network requests.</div>
+</main>
+<script>{JS_SORT_TABLE}</script>
+</body>
+</html>
+"""
+
+
+def _num_or_none(x: float) -> Optional[float]:
+    """Return a JSON-safe finite float, or None when NaN/Inf."""
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _stats_to_json(st: _SessionStats) -> Dict[str, object]:
+    return {
+        "n_frames": int(st.n_frames),
+        "duration_sec": _num_or_none(st.duration_sec),
+        "dt_median_sec": _num_or_none(st.dt_median_sec),
+        "reward_frac": _num_or_none(st.reward_frac),
+        "artifact_frac": _num_or_none(st.artifact_frac),
+        "artifact_ready_frac": _num_or_none(st.artifact_ready_frac),
+        "metric_mean": _num_or_none(st.metric_mean),
+        "metric_min": _num_or_none(st.metric_min),
+        "metric_max": _num_or_none(st.metric_max),
+        "metric_last": _num_or_none(st.metric_last),
+        "threshold_mean": _num_or_none(st.threshold_mean),
+        "threshold_min": _num_or_none(st.threshold_min),
+        "threshold_max": _num_or_none(st.threshold_max),
+        "threshold_last": _num_or_none(st.threshold_last),
+        "reward_rate_mean": _num_or_none(st.reward_rate_mean),
+        "reward_rate_last": _num_or_none(st.reward_rate_last),
+        "bad_channels_mean": _num_or_none(st.bad_channels_mean),
+        "phase_counts": {str(k): int(v) for k, v in (st.phase_counts or {}).items()},
+        "derived_durations": {str(k): _num_or_none(v) for k, v in (st.derived_durations or {}).items()},
+    }
+
+
+def _write_json_index(
+    json_index_path: Path,
+    *,
+    dashboard_html: Path,
+    roots: Sequence[str],
+    sessions: Sequence[_Session],
+) -> None:
+    """Write a machine-readable JSON index of sessions.
+
+    This mirrors the pattern used by scripts/render_reports_dashboard.py --json-index.
+
+    IMPORTANT: This JSON is strict (no NaN/Infinity). Any non-finite numeric values are
+    encoded as null for interoperability.
+    """
+
+    out_dir = json_index_path.resolve().parent
+
+    roots_abs = [str(Path(r).resolve()) for r in roots]
+    roots_rel = [posix_relpath(str(Path(r).resolve()), str(out_dir)) for r in roots]
+
+    dash_rel = posix_relpath(str(dashboard_html.resolve()), str(out_dir))
+
+    ok_n = 0
+    error_n = 0
+    sess_items: List[Dict[str, object]] = []
+
+    for i, s in enumerate(sessions):
+        sess_dir = posix_relpath(str(s.outdir), str(out_dir))
+        csv_rel = posix_relpath(str(s.csv_path), str(out_dir))
+
+        sum_path = s.outdir / "nf_summary.json"
+        meta_path = s.outdir / "nf_run_meta.json"
+
+        sum_rel = posix_relpath(str(sum_path), str(out_dir)) if sum_path.is_file() else None
+        meta_rel = posix_relpath(str(meta_path), str(out_dir)) if meta_path.is_file() else None
+
+        derived_rel = (
+            posix_relpath(str(s.derived_events_path), str(out_dir))
+            if (s.derived_events_path and s.derived_events_path.is_file())
+            else None
+        )
+
+        rep_rel = (
+            posix_relpath(str(s.report_html), str(out_dir))
+            if (s.report_html and s.report_html.is_file())
+            else None
+        )
+
+        ok = not str(s.note).startswith("ERROR")
+        if ok:
+            ok_n += 1
+        else:
+            error_n += 1
+
+        sess_items.append(
+            {
+                "index": int(i + 1),
+                "session_dir": str(sess_dir),
+                "timestamp_utc": str(s.timestamp_utc or ""),
+                "protocol": str(s.protocol or ""),
+                "metric_spec": str(s.metric_spec or ""),
+                "nf_feedback_csv": str(csv_rel),
+                "nf_summary_json": sum_rel,
+                "nf_run_meta_json": meta_rel,
+                "derived_events": derived_rel,
+                "report_html": rep_rel,
+                "note": str(s.note or ""),
+                "ok": bool(ok),
+                "stats": _stats_to_json(s.stats),
+            }
+        )
+
+    payload: Dict[str, object] = {
+        "$schema": _JSON_INDEX_SCHEMA,
+        "schema_version": int(_JSON_INDEX_SCHEMA_VERSION),
+        "generated_utc": utc_now_iso(),
+        "roots": roots_abs,
+        "roots_rel": roots_rel,
+        "dashboard_html": dash_rel,
+        "sessions_summary": {
+            "total": int(len(sessions)),
+            "ok": int(ok_n),
+            "error": int(error_n),
+        },
+        "sessions": sess_items,
+    }
+
+    # Best-effort file metadata (useful for bundles / caching).
+    try:
+        st = dashboard_html.stat()
+        payload["dashboard_exists"] = True
+        payload["dashboard_mtime_utc"] = _mtime_iso_utc(dashboard_html)
+        payload["dashboard_size_bytes"] = int(st.st_size)
+    except Exception:
+        payload["dashboard_exists"] = False
+
+    with open(str(json_index_path), "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, allow_nan=False)
+        f.write("\n")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -810,6 +952,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--out",
         default=None,
         help="Output HTML path (default: <first-root>/nf_sessions_dashboard.html).",
+    )
+    ap.add_argument(
+        "--json-index",
+        default=None,
+        help=(
+            "Optional JSON index output path (machine-readable session summary; "
+            "includes $schema hint + schema_version)."
+        ),
     )
     ap.add_argument(
         "--max-sessions",
@@ -925,6 +1075,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     html_doc = _build_dashboard(sessions, out_p, roots)
     out_p.write_text(html_doc, encoding="utf-8")
     print(f"Wrote: {out_p}")
+
+    if args.json_index:
+        ji_p = Path(str(args.json_index)).resolve()
+        ji_p.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_index(ji_p, dashboard_html=out_p, roots=roots, sessions=sessions)
+        print(f"Wrote: {ji_p}")
 
     if args.open:
         try:

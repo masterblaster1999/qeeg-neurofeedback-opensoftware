@@ -37,7 +37,9 @@
 #else
   #include <arpa/inet.h>
   #include <netinet/in.h>
+  #include <sys/select.h>
   #include <sys/socket.h>
+  #include <sys/time.h>
   #include <sys/types.h>
   #include <sys/wait.h>
   #include <signal.h>
@@ -319,7 +321,7 @@ static CaptureResult capture_process_output_limited(const std::vector<std::strin
 
     execv(argv[0], argv.data());
     std::perror("execv");
-    std::exit(127);
+    _exit(127);
   }
 
   // Parent.
@@ -360,17 +362,6 @@ static std::string now_compact_local() {
   return oss.str();
 }
 
-static bool looks_like_qeeg_cli(const std::string& tool) {
-  std::string base = tool;
-  if (qeeg::ends_with(base, ".exe")) {
-    base = base.substr(0, base.size() - 4);
-  }
-  if (!qeeg::starts_with(base, "qeeg_")) return false;
-  if (!qeeg::ends_with(base, "_cli")) return false;
-  if (qeeg::starts_with(base, "qeeg_test_")) return false;
-  return true;
-}
-
 static std::filesystem::path resolve_exe_path(const std::filesystem::path& bin_dir,
                                               const std::string& tool) {
   std::filesystem::path p = bin_dir / tool;
@@ -380,6 +371,49 @@ static std::filesystem::path resolve_exe_path(const std::filesystem::path& bin_d
   pe += ".exe";
   if (std::filesystem::exists(pe)) return pe;
   return {};
+}
+
+static std::string normalize_tool_name(std::string name) {
+  // Remove a trailing .exe (case-insensitive) for stable tool names.
+  if (name.size() >= 4) {
+    const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(name[name.size() - 4])));
+    const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(name[name.size() - 3])));
+    const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(name[name.size() - 2])));
+    const char d = static_cast<char>(std::tolower(static_cast<unsigned char>(name[name.size() - 1])));
+    if (a == '.' && b == 'e' && c == 'x' && d == 'e') {
+      name.resize(name.size() - 4);
+    }
+  }
+  return name;
+}
+
+static void sort_unique(std::vector<std::string>* v) {
+  if (!v) return;
+  std::sort(v->begin(), v->end());
+  v->erase(std::unique(v->begin(), v->end()), v->end());
+}
+
+static std::vector<std::string> list_qeeg_tools_in_bin_dir(const std::filesystem::path& bin_dir) {
+  std::vector<std::string> out;
+  std::error_code ec;
+  if (bin_dir.empty() || !std::filesystem::exists(bin_dir, ec) || !std::filesystem::is_directory(bin_dir, ec)) {
+    return out;
+  }
+
+  for (std::filesystem::directory_iterator it(bin_dir, ec), end; it != end && !ec; it.increment(ec)) {
+    const std::filesystem::directory_entry& de = *it;
+    ec.clear();
+    if (!de.is_regular_file(ec)) {
+      ec.clear();
+      continue;
+    }
+
+    const std::string file = de.path().filename().u8string();
+    if (!qeeg::is_safe_qeeg_cli_tool_name(file)) continue;
+    out.push_back(normalize_tool_name(file));
+  }
+  sort_unique(&out);
+  return out;
 }
 
 struct HttpRequest {
@@ -1423,7 +1457,34 @@ class UiServer {
       try_open_browser_url(url);
     }
 
+    // Main loop: periodically refresh job state so concurrency-limited queues
+    // progress even when the UI isn't polling /api/runs.
     for (;;) {
+      // Tick job state (non-blocking) and start any queued jobs if slots are free.
+      update_jobs();
+
+      // Wait for an incoming connection or a short timeout so we can keep
+      // updating job state in the background.
+      fd_set rfds;
+      FD_ZERO(&rfds);
+      FD_SET(srv, &rfds);
+      timeval tv{};
+      tv.tv_sec = 0;
+      tv.tv_usec = 250000; // 250ms
+
+#ifdef _WIN32
+      const int sel = select(0, &rfds, NULL, NULL, &tv);
+      if (sel == SOCKET_ERROR) continue;
+#else
+      const int sel = select(srv + 1, &rfds, NULL, NULL, &tv);
+      if (sel < 0) {
+        if (errno == EINTR) continue;
+        continue;
+      }
+#endif
+      if (sel == 0) continue;
+      if (!FD_ISSET(srv, &rfds)) continue;
+
       bool is_loopback = false;
 #ifdef _WIN32
       sockaddr_in peer{};
@@ -1571,6 +1632,14 @@ class UiServer {
       handle_status(c);
       return;
     }
+    if (req.path == "/api/tools") {
+      if (req.method != "GET") {
+        send_json(c, 405, "{\"error\":\"method not allowed\"}");
+        return;
+      }
+      handle_tools(c);
+      return;
+    }
     if (req.path == "/api/help") {
       if (req.method != "GET") {
         send_json(c, 405, "{\"error\":\"method not allowed\"}");
@@ -1695,6 +1764,20 @@ class UiServer {
       return;
     }
 
+    if (req.path == "/api/functions") {
+      if (req.method == "GET") {
+        handle_functions_get(c);
+        return;
+      }
+      if (req.method == "POST") {
+        handle_functions_set(c, req.body);
+        return;
+      }
+      send_json(c, 405, "{\"error\":\"method not allowed\"}");
+      return;
+    }
+
+
     {
       int id = 0;
       if (try_parse_id_path(req.path, "/api/job/", &id)) {
@@ -1813,10 +1896,123 @@ class UiServer {
       int c
 #endif
   ) {
+    // Keep counts fresh for status displays.
+    update_jobs();
     std::ostringstream oss;
     oss << "{\"ok\":true,\"time\":\"" << qeeg::json_escape(qeeg::now_string_local()) << "\"";
+
+    // Expose a small amount of server configuration so the dashboard can offer
+    // better one-click defaults (e.g., bundle generation).
+    oss << ",\"root\":\"" << qeeg::json_escape(root_.u8string()) << "\"";
+    oss << ",\"bin_dir\":\"" << qeeg::json_escape(bin_dir_.u8string()) << "\"";
+    if (!toolbox_exe_.empty()) {
+      oss << ",\"toolbox_exe\":\"" << qeeg::json_escape(toolbox_exe_.u8string()) << "\"";
+    }
+    oss << ",\"max_parallel\":" << max_parallel_;
+
+    const size_t active_jobs = count_active_jobs();
+    size_t queued_jobs = 0;
+    for (const auto& j : jobs_) {
+      if (j.status == "queued") ++queued_jobs;
+    }
+    oss << ",\"jobs_total\":" << jobs_.size();
+    oss << ",\"active_jobs\":" << active_jobs;
+    oss << ",\"queued_jobs\":" << queued_jobs;
+
     if (!api_token_.empty()) {
       oss << ",\"token\":\"" << qeeg::json_escape(api_token_) << "\"";
+    }
+#ifdef _WIN32
+    oss << ",\"platform\":\"windows\"";
+#else
+    oss << ",\"platform\":\"posix\"";
+#endif
+    oss << "}";
+    send_json(c, 200, oss.str());
+  }
+
+
+  void handle_tools(
+#ifdef _WIN32
+      SOCKET c
+#else
+      int c
+#endif
+  ) {
+    std::vector<std::string> bin_tools = list_qeeg_tools_in_bin_dir(bin_dir_);
+
+    bool toolbox_ok = false;
+    std::vector<std::string> toolbox_tools;
+    std::string toolbox_error;
+
+    if (!toolbox_exe_.empty()) {
+      std::vector<std::string> argv_s;
+      argv_s.push_back(toolbox_exe_.u8string());
+      argv_s.push_back("--list-tools");
+      argv_s.push_back("--json");
+
+      const CaptureResult cap = capture_process_output_limited(argv_s, root_, 512 * 1024);
+      if (!cap.ok) {
+        toolbox_error = cap.error.empty() ? "toolbox exec failed" : cap.error;
+      } else {
+        // The toolbox is expected to print a JSON array of strings.
+        // Tolerate leading banners by extracting the first JSON array from the output.
+        const std::string& txt = cap.text;
+        const size_t a = txt.find('[');
+        const size_t b = txt.rfind(']');
+        if (a == std::string::npos || b == std::string::npos || b < a) {
+          toolbox_error = "toolbox output did not contain a JSON array";
+        } else {
+          const std::string slice = txt.substr(a, b - a + 1);
+          std::vector<std::string> parsed;
+          std::string perr;
+          if (!qeeg::json_parse_string_array(slice, &parsed, &perr)) {
+            toolbox_error = perr.empty() ? "failed to parse toolbox JSON" : ("parse failed: " + perr);
+          } else {
+            for (const auto& t0 : parsed) {
+              if (!qeeg::is_safe_qeeg_cli_tool_name(t0)) continue;
+              toolbox_tools.push_back(normalize_tool_name(t0));
+            }
+            sort_unique(&toolbox_tools);
+            toolbox_ok = true;
+          }
+        }
+      }
+    }
+
+    std::vector<std::string> all = bin_tools;
+    all.insert(all.end(), toolbox_tools.begin(), toolbox_tools.end());
+    sort_unique(&all);
+
+    std::ostringstream oss;
+    oss << "{\"ok\":true";
+    oss << ",\"tools\":[";
+    for (size_t i = 0; i < all.size(); ++i) {
+      if (i) oss << ',';
+      oss << '"' << qeeg::json_escape(all[i]) << '"';
+    }
+    oss << ']';
+
+    // Provide source breakdown for debugging.
+    oss << ",\"bin\":[";
+    for (size_t i = 0; i < bin_tools.size(); ++i) {
+      if (i) oss << ',';
+      oss << '"' << qeeg::json_escape(bin_tools[i]) << '"';
+    }
+    oss << ']';
+
+    if (!toolbox_exe_.empty()) {
+      oss << ",\"toolbox_exe\":\"" << qeeg::json_escape(toolbox_exe_.u8string()) << "\"";
+      oss << ",\"toolbox_ok\":" << (toolbox_ok ? "true" : "false");
+      if (!toolbox_ok && !toolbox_error.empty()) {
+        oss << ",\"toolbox_error\":\"" << qeeg::json_escape(toolbox_error) << "\"";
+      }
+      oss << ",\"toolbox\":[";
+      for (size_t i = 0; i < toolbox_tools.size(); ++i) {
+        if (i) oss << ',';
+        oss << '"' << qeeg::json_escape(toolbox_tools[i]) << '"';
+      }
+      oss << ']';
     }
     oss << "}";
     send_json(c, 200, oss.str());
@@ -1837,7 +2033,7 @@ class UiServer {
       send_json(c, 400, "{\"error\":\"missing tool\"}");
       return;
     }
-    if (!looks_like_qeeg_cli(tool)) {
+    if (!qeeg::is_safe_qeeg_cli_tool_name(tool)) {
       send_json(c, 403, "{\"error\":\"tool not allowed\"}");
       return;
     }
@@ -1889,6 +2085,11 @@ class UiServer {
     oss << "{\"ok\":true,\"tool\":\"" << qeeg::json_escape(tool)
         << "\",\"help\":\"" << qeeg::json_escape(ent.text) << "\"";
     if (ent.truncated) oss << ",\"truncated\":true";
+#ifdef _WIN32
+    oss << ",\"platform\":\"windows\"";
+#else
+    oss << ",\"platform\":\"posix\"";
+#endif
     oss << "}";
     send_json(c, 200, oss.str());
   }
@@ -2090,18 +2291,23 @@ class UiServer {
       // Child: redirect stdout/stderr to log file.
       FILE* f = std::fopen(log_path.u8string().c_str(), "wb");
       if (f) {
-        int fd = fileno(f);
+        const int fd = fileno(f);
         if (fd >= 0) {
-          dup2(fd, 1);
-          dup2(fd, 2);
+          (void)dup2(fd, 1);
+          (void)dup2(fd, 2);
         }
+        std::fclose(f);
       }
+
       // Work in root so relative paths make sense.
-      chdir(root_.u8string().c_str());
+      if (chdir(root_.u8string().c_str()) != 0) {
+        std::perror("chdir");
+      }
+
       execv(argv[0], argv.data());
       // execv failed.
       std::perror("execv");
-      std::exit(127);
+      _exit(127);
     }
 
     // Parent.
@@ -2338,32 +2544,93 @@ class UiServer {
       return;
     }
 
-    // Collect run directories (we sort by directory name, which starts with a compact timestamp).
-    std::vector<std::string> dir_names;
-    for (auto it = std::filesystem::directory_iterator(ui_runs, ec);
-         it != std::filesystem::directory_iterator();
+    // Collect run directories by locating per-run metadata files.
+    //
+    // We intentionally support both the historical flat layout:
+    //   ui_runs/<timestamp>_<tool>_idX/
+    // and the grouped layout used by workflow macros:
+    //   ui_runs/<group_dir>/<tool>_idX/
+    struct HistRunDir {
+      std::string run_dir_rel;
+      std::filesystem::path run_dir_abs;
+      std::string sort_stamp;  // YYYYMMDD_HHMMSS (best-effort)
+      std::string sort_group;  // top-level directory under ui_runs
+      int sort_job_id = 0;     // parsed from "_idX" suffix (best-effort)
+    };
+
+    auto parse_job_id = [](const std::string& leaf) -> int {
+      const size_t pos = leaf.rfind("_id");
+      if (pos == std::string::npos) return 0;
+      const std::string num = leaf.substr(pos + 3);
+      if (num.empty()) return 0;
+      try {
+        return qeeg::to_int(num);
+      } catch (...) {
+        return 0;
+      }
+    };
+
+    std::vector<HistRunDir> run_dirs;
+    for (auto it = std::filesystem::recursive_directory_iterator(ui_runs, ec);
+         it != std::filesystem::recursive_directory_iterator();
          it.increment(ec)) {
       if (ec) break;
-      if (!it->is_directory(ec)) {
-        ec.clear();
-        continue;
-      }
-      const std::string name = it->path().filename().u8string();
-      if (name.empty()) continue;
-      dir_names.push_back(name);
+      if (!it->is_regular_file(ec)) continue;
+      const auto p = it->path();
+      if (p.filename().u8string() != "ui_server_run_meta.json") continue;
+
+      const std::filesystem::path run_dir_abs = p.parent_path();
+      if (!path_is_within_root(root_canon_, run_dir_abs)) continue;
+
+      std::error_code ec2;
+      const std::filesystem::path rel = std::filesystem::relative(run_dir_abs, root_, ec2);
+      if (ec2 || rel.empty()) continue;
+      const std::string run_dir_rel = rel.generic_u8string();
+      if (run_dir_rel == "ui_runs" || !starts_with(run_dir_rel, "ui_runs/")) continue;
+
+      // Sort key: the top-level directory under ui_runs usually starts with a
+      // compact timestamp (YYYYMMDD_HHMMSS).
+      std::string rest = run_dir_rel.substr(std::string("ui_runs/").size());
+      std::string top = rest;
+      const size_t slash = rest.find('/');
+      if (slash != std::string::npos) top = rest.substr(0, slash);
+      std::string stamp = top;
+      if (stamp.size() > 15) stamp.resize(15);
+
+      HistRunDir h;
+      h.run_dir_rel = run_dir_rel;
+      h.run_dir_abs = run_dir_abs;
+      h.sort_stamp = stamp;
+      h.sort_group = top;
+      h.sort_job_id = parse_job_id(run_dir_abs.filename().u8string());
+      run_dirs.push_back(std::move(h));
     }
-    std::sort(dir_names.begin(), dir_names.end(),
-              [](const std::string& a, const std::string& b) { return a > b; });
+
+    // De-dup by run_dir_rel (defensive).
+    std::sort(run_dirs.begin(), run_dirs.end(), [](const HistRunDir& a, const HistRunDir& b) {
+      return a.run_dir_rel < b.run_dir_rel;
+    });
+    run_dirs.erase(std::unique(run_dirs.begin(), run_dirs.end(), [](const HistRunDir& a, const HistRunDir& b) {
+      return a.run_dir_rel == b.run_dir_rel;
+    }), run_dirs.end());
+
+    // Newest first.
+    std::sort(run_dirs.begin(), run_dirs.end(), [](const HistRunDir& a, const HistRunDir& b) {
+      if (a.sort_stamp != b.sort_stamp) return a.sort_stamp > b.sort_stamp;
+      if (a.sort_group != b.sort_group) return a.sort_group > b.sort_group;
+      if (a.sort_job_id != b.sort_job_id) return a.sort_job_id > b.sort_job_id;
+      return a.run_dir_rel > b.run_dir_rel;
+    });
 
     std::ostringstream oss;
     oss << "{\"ok\":true,\"runs\":[";
     bool first = true;
     size_t emitted = 0;
 
-    for (const auto& name : dir_names) {
+    for (const auto& h : run_dirs) {
       if (emitted >= limit) break;
-      const std::string run_dir_rel = std::string("ui_runs/") + name;
-      const std::filesystem::path run_dir_abs = ui_runs / std::filesystem::u8path(name);
+      const std::string& run_dir_rel = h.run_dir_rel;
+      const std::filesystem::path& run_dir_abs = h.run_dir_abs;
       if (!path_is_within_root(root_canon_, run_dir_abs)) continue;
 
       const std::filesystem::path meta_abs = run_dir_abs / "ui_server_run_meta.json";
@@ -3689,6 +3956,132 @@ class UiServer {
   }
 
 
+  void handle_functions_get(
+#ifdef _WIN32
+      SOCKET c,
+#else
+      int c,
+#endif
+      const std::string& /*query_string*/ = std::string()) {
+    // Persist UI function/workflow definitions under the served root so they can be shared and
+    // survive browser refreshes.
+    constexpr uintmax_t kMaxFunctions = 1024 * 1024; // 1MB
+
+    const std::filesystem::path p = root_ / "qeeg_ui_functions.json";
+    if (!path_is_within_root(root_canon_, p)) {
+      send_json(c, 403, "{\"error\":\"forbidden\"}");
+      return;
+    }
+
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(p, ec);
+    if (ec) {
+      send_json(c, 500, "{\"error\":\"cannot stat functions\"}");
+      return;
+    }
+
+    std::string data;
+    if (exists) {
+      if (std::filesystem::is_directory(p, ec)) {
+        send_json(c, 400, "{\"error\":\"functions is a directory\"}");
+        return;
+      }
+      if (std::filesystem::is_symlink(p, ec)) {
+        send_json(c, 403, "{\"error\":\"functions symlink not allowed\"}");
+        return;
+      }
+      if (!read_file_binary_bounded(p, kMaxFunctions, &data)) {
+        send_json(c, 413, "{\"error\":\"functions too large or unreadable\"}");
+        return;
+      }
+    }
+
+    std::string json = trim(data);
+    if (json.find('\0') != std::string::npos) json.clear();
+
+    // Validate minimal JSON (we only accept an object).
+    char first = 0;
+    for (char ch : json) {
+      if (std::isspace(static_cast<unsigned char>(ch)) != 0) continue;
+      first = ch;
+      break;
+    }
+    if (json.empty() || first != '{') {
+      json = "{}";
+    }
+
+    std::ostringstream oss;
+    oss << "{\"ok\":true"
+        << ",\"exists\":" << (exists ? "true" : "false")
+        << ",\"bytes\":" << static_cast<uintmax_t>(data.size())
+        << ",\"functions\":" << json
+        << "}";
+    send_json(c, 200, oss.str());
+  }
+
+  void handle_functions_set(
+#ifdef _WIN32
+      SOCKET c,
+#else
+      int c,
+#endif
+      const std::string& body) {
+    constexpr uintmax_t kMaxFunctions = 1024 * 1024; // 1MB
+
+    std::string json = trim(body);
+    if (json.empty()) json = "{}"; // allow clearing
+
+    if (json.find('\0') != std::string::npos) {
+      send_json(c, 400, "{\"error\":\"invalid functions payload\"}");
+      return;
+    }
+
+    if (static_cast<uintmax_t>(json.size()) > kMaxFunctions) {
+      send_json(c, 413, "{\"error\":\"functions too large (max 1MB)\"}");
+      return;
+    }
+
+    char first = 0;
+    for (char ch : json) {
+      if (std::isspace(static_cast<unsigned char>(ch)) != 0) continue;
+      first = ch;
+      break;
+    }
+    if (first != '{') {
+      send_json(c, 400, "{\"error\":\"functions must be a JSON object\"}");
+      return;
+    }
+
+    const std::filesystem::path p = root_ / "qeeg_ui_functions.json";
+    if (!path_is_within_root(root_canon_, p)) {
+      send_json(c, 403, "{\"error\":\"forbidden\"}");
+      return;
+    }
+
+    std::error_code ec;
+    if (std::filesystem::exists(p, ec)) {
+      if (std::filesystem::is_directory(p, ec)) {
+        send_json(c, 400, "{\"error\":\"functions is a directory\"}");
+        return;
+      }
+      if (std::filesystem::is_symlink(p, ec)) {
+        send_json(c, 403, "{\"error\":\"functions symlink not allowed\"}");
+        return;
+      }
+    }
+
+    if (!qeeg::write_text_file_atomic(p.u8string(), json)) {
+      send_json(c, 500, "{\"error\":\"cannot write functions\"}");
+      return;
+    }
+
+    std::ostringstream oss;
+    oss << "{\"ok\":true,\"bytes\":" << static_cast<uintmax_t>(json.size()) << "}";
+    send_json(c, 200, oss.str());
+  }
+
+
+
   void handle_delete_run(
 #ifdef _WIN32
       SOCKET c,
@@ -3835,6 +4228,11 @@ class UiServer {
           << ",\"queue_len\":" << queue_len;
     }
 
+#ifdef _WIN32
+    oss << ",\"platform\":\"windows\"";
+#else
+    oss << ",\"platform\":\"posix\"";
+#endif
     oss << "}";
     send_json(c, 200, oss.str());
   }
@@ -3969,6 +4367,11 @@ class UiServer {
         << ",\"eof\":" << (eof ? "true" : "false")
         << ",\"truncated\":" << (truncated ? "true" : "false")
         << ",\"text\":\"" << qeeg::json_escape(chunk) << "\"";
+#ifdef _WIN32
+    oss << ",\"platform\":\"windows\"";
+#else
+    oss << ",\"platform\":\"posix\"";
+#endif
     oss << "}";
     send_json(c, 200, oss.str());
   }
@@ -4307,11 +4710,13 @@ class UiServer {
       const std::string& body) {
     const std::string tool = json_find_string_value(body, "tool");
     const std::string args = json_find_string_value(body, "args");
+    const std::string group_dir = json_find_string_value(body, "group_dir");
+    const std::string run_name = json_find_string_value(body, "run_name");
     if (tool.empty()) {
       send_json(c, 400, "{\"error\":\"missing tool\"}");
       return;
     }
-    if (!looks_like_qeeg_cli(tool)) {
+    if (!qeeg::is_safe_qeeg_cli_tool_name(tool)) {
       send_json(c, 403, "{\"error\":\"tool not allowed\"}");
       return;
     }
@@ -4353,8 +4758,45 @@ class UiServer {
     // Create run directory under root.
     const std::string stamp = now_compact_local();
     const std::string safe_tool = sanitize_component(qeeg::to_lower(tool));
-    const std::string run_dir_rel =
-        std::string("ui_runs/") + (stamp + "_" + safe_tool + "_id" + std::to_string(job_id));
+
+    // Optional grouping: the caller may pass a stable group directory name
+    // (single path component) to keep multi-step workflows together under:
+    //   ui_runs/<group_dir>/<tool>_idX/
+    std::string safe_group_dir = sanitize_component(qeeg::to_lower(group_dir));
+    if (!safe_group_dir.empty()) {
+      // Prevent odd roots like ".." and keep names filesystem-friendly.
+      while (!safe_group_dir.empty() && (safe_group_dir.front() == '.' || safe_group_dir.front() == '_' || safe_group_dir.front() == '-')) {
+        safe_group_dir.erase(safe_group_dir.begin());
+      }
+      const size_t kMax = 96;
+      if (safe_group_dir.size() > kMax) safe_group_dir.resize(kMax);
+      if (safe_group_dir == "ui_runs") safe_group_dir.clear();
+    }
+
+    // Optional per-run naming: the caller may provide a stable name that
+    // influences the on-disk run directory name (still suffixed with _idX).
+    // This is useful for multi-step workflows that want deterministic ordering
+    // inside a group folder (e.g., step01_map, step02_bandpower, ...).
+    std::string safe_run_name = sanitize_component(qeeg::to_lower(run_name));
+    if (!safe_run_name.empty()) {
+      while (!safe_run_name.empty() && (safe_run_name.front() == '.' || safe_run_name.front() == '_' || safe_run_name.front() == '-')) {
+        safe_run_name.erase(safe_run_name.begin());
+      }
+      const size_t kMax = 96;
+      if (safe_run_name.size() > kMax) safe_run_name.resize(kMax);
+      if (safe_run_name == "ui_runs") safe_run_name.clear();
+    }
+
+    const std::string base_name = safe_run_name.empty() ? safe_tool : safe_run_name;
+
+    std::string run_dir_rel;
+    if (!safe_group_dir.empty()) {
+      run_dir_rel = std::string("ui_runs/") + safe_group_dir + "/" +
+                    (base_name + "_id" + std::to_string(job_id));
+    } else {
+      run_dir_rel =
+          std::string("ui_runs/") + (stamp + "_" + base_name + "_id" + std::to_string(job_id));
+    }
     const std::filesystem::path run_dir = root_ / std::filesystem::u8path(run_dir_rel);
     qeeg::ensure_directory(run_dir.u8string());
     const std::filesystem::path log_path = run_dir / "run.log";

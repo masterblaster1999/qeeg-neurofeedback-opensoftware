@@ -101,7 +101,7 @@ _KNOWN_CONN_BAND_FILES: Set[str] = {
 }
 
 _CONN_MATRIX_RE = re.compile(
-    r"^(coherence|imcoh|plv|pli|wpli|wpli2_debiased)_matrix_.+\\.csv$",
+    r"^.+_matrix_.+\\.csv$",
     re.IGNORECASE,
 )
 
@@ -249,6 +249,12 @@ def _try_import_renderers() -> Dict[str, object]:
         pass
 
     try:
+        import render_loreta_metrics_report as _lm  # type: ignore
+        mods["loreta_metrics"] = _lm
+    except Exception:
+        pass
+
+    try:
         import render_bandpowers_report as _bp  # type: ignore
         mods["bandpowers"] = _bp
     except Exception:
@@ -351,6 +357,11 @@ def _render_report(kind: str, outdir: str, *, force: bool, renderer_mods: Dict[s
         report = os.path.join(outdir, "topomap_report.html")
         argv = ["--input", outdir, "--out", report]
         mod = renderer_mods.get("topomap")
+
+    elif kind == "loreta_metrics":
+        report = os.path.join(outdir, "loreta_metrics_report.html")
+        argv = ["--input", outdir, "--out", report]
+        mod = renderer_mods.get("loreta_metrics")
 
     elif kind == "bandpowers":
         report = os.path.join(outdir, "bandpowers_report.html")
@@ -487,6 +498,7 @@ def _build_dashboard(items: Sequence[ReportItem], out_path: str, roots: Sequence
         ("bandpowers", "Bandpower runs"),
         ("bandratios", "Band ratio runs"),
         ("topomap", "Topomap runs"),
+        ("loreta_metrics", "LORETA ROI metrics runs"),
         ("spectral_features", "Spectral feature runs"),
         ("connectivity", "Connectivity runs"),
         ("connectivity_pair", "Connectivity pair runs"),
@@ -928,6 +940,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     trace_dirs: Set[str] = set()
     spectrogram_dirs: Set[str] = set()
     topomap_dirs: Set[str] = set()
+    loreta_dirs: Set[str] = set()
     band_dirs: Set[str] = set()
     br_dirs: Set[str] = set()
     sf_dirs: Set[str] = set()
@@ -958,6 +971,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if _looks_like_topomap(filenames):
             topomap_dirs.add(os.path.abspath(dirpath))
+
+        if "loreta_metrics.csv" in s:
+            loreta_dirs.add(os.path.abspath(dirpath))
 
         if "bandpowers.csv" in s:
             band_dirs.add(os.path.abspath(dirpath))
@@ -1097,6 +1113,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             add_existing("spectrogram", d, "spectrogram_report.html")
         for d in sorted(topomap_dirs):
             add_existing("topomap", d, "topomap_report.html")
+        for d in sorted(loreta_dirs):
+            add_existing("loreta_metrics", d, "loreta_metrics_report.html")
         for d in sorted(nf_dirs):
             add_existing("nf", d, "nf_feedback_report.html")
         for d in sorted(pac_dirs):
@@ -1132,6 +1150,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             items.append(_render_report("spectrogram", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(topomap_dirs):
             items.append(_render_report("topomap", d, force=bool(args.force), renderer_mods=renderer_mods))
+        for d in sorted(loreta_dirs):
+            items.append(_render_report("loreta_metrics", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(nf_dirs):
             items.append(_render_report("nf", d, force=bool(args.force), renderer_mods=renderer_mods))
         for d in sorted(pac_dirs):

@@ -109,6 +109,11 @@ python3 scripts/render_bandratios_report.py --input out_ratios
 # From an output directory containing topomap_<metric>.bmp (qeeg_map_cli or qeeg_topomap_cli)
 python3 scripts/render_topomap_report.py --input out_topomap
 
+# From an output directory produced by qeeg_loreta_metrics_cli
+python3 scripts/render_loreta_metrics_report.py --input out_loreta
+
+# If present, loreta_protocol.json (from --protocol-json) is shown in the report.
+
 # From an output directory produced by qeeg_spectral_features_cli
 python3 scripts/render_spectral_features_report.py --input out_sf
 
@@ -152,7 +157,7 @@ python3 scripts/render_spectrogram_report.py --input out_spec
 python3 scripts/render_epoch_report.py --input out_epochs
 
 # Build a dashboard that links to all available reports (and renders any missing ones)
-python3 scripts/render_reports_dashboard.py out_quality out_traces out_spec out_bids_scan out_epochs out_iaf out_bp out_ratios out_topomap out_sf out_nf out_pac out_conn out_conn_pair out_ms out_qc out_art --out qeeg_reports_dashboard.html
+python3 scripts/render_reports_dashboard.py out_quality out_traces out_spec out_bids_scan out_epochs out_iaf out_bp out_ratios out_topomap out_loreta out_sf out_nf out_pac out_conn out_conn_pair out_ms out_qc out_art --out qeeg_reports_dashboard.html
 ```
 
 The generated dashboard tables are sortable (click headers), include a **global filter** that applies to all sections, and provide **Download CSV** buttons to export the currently visible rows.
@@ -546,6 +551,62 @@ cmake --build build-docs --target docs
 ./build/qeeg_version_cli --json  # includes version_major/minor/patch for scripts
 ```
 
+### LORETA ROI metrics (qeeg_loreta_metrics_cli)
+
+```bash
+# Basic LORETA ROI table normalization + report/index
+./build/qeeg_loreta_metrics_cli --input roi_metrics.csv --outdir out_loreta --atlas brodmann --html-report --json-index
+
+# Optional: derive a heuristic protocol candidate list (ranked ROI×metric by |value|)
+./build/qeeg_loreta_metrics_cli --input roi_metrics.csv --outdir out_loreta --atlas brodmann --html-report --json-index \
+  --protocol-json --protocol-only-z --protocol-top 20 --protocol-threshold 2.0
+```
+
+```bash
+# Long-form input (one row per ROI×metric×band).
+# Columns typically look like: ROI, metric, band, value (names can vary).
+./build/qeeg_loreta_metrics_cli --input roi_metrics_long.csv --outdir out_loreta --atlas brodmann --json-index \
+  --metric-column metric --band-column band --value-column value
+```
+
+Artifacts:
+- `loreta_metrics.csv` (wide ROI×metric table)
+- `loreta_metrics_long.csv` (long/stacked table)
+- `loreta_metrics_report.html` (optional)
+- `loreta_metrics_index.json` (optional, machine-readable)
+- `loreta_protocol.json` (optional, heuristic ranking; **not** a clinical prescription)
+
+
+
+### LORETA connectivity (qeeg_loreta_connectivity_cli)
+
+This tool ingests ROI-to-ROI connectivity exports (edge lists or square matrices) and emits
+standard `*_matrix_<band>.csv` artifacts compatible with `scripts/render_connectivity_report.py`
+and the reports dashboard.
+
+```bash
+# Edge-list input example (ROI_A, ROI_B, band, metric, value)
+./build/qeeg_loreta_connectivity_cli --input lps_edges.csv --outdir out_loreta_conn --atlas brodmann \
+  --json-index --protocol-json
+
+# If your input is already a square matrix CSV (labels in first row/column):
+./build/qeeg_loreta_connectivity_cli --input lps_matrix_theta.csv --outdir out_loreta_conn --mode matrix \
+  --measure-id lps_z --band theta --json-index --protocol-json
+```
+
+Artifacts:
+- `<measure>_matrix_<band>.csv` (one or more)
+- `loreta_connectivity_index.json` (optional, machine-readable)
+- `loreta_connectivity_protocol.json` (optional, heuristic ranking; **not** a clinical prescription)
+- `loreta_connectivity_run_meta.json`
+
+To render an HTML report for a directory:
+
+```bash
+python3 scripts/render_connectivity_report.py --input out_loreta_conn --output out_loreta_conn/connectivity_report.html
+```
+
+
 ### QEEG Tools UI (dashboard)
 
 If you want a single "home page" that lists all of the project's executables and links to any
@@ -797,6 +858,16 @@ For convenience, the "Run" panel defaults rewrite common output flags (like `--o
 and `--events-out`) to land under `{{RUN_DIR}}` so each UI-launched run stays self-contained. You can also save/load/delete
 per-tool argument presets; when served via `qeeg_ui_server_cli` they persist under `--root` in `qeeg_ui_presets.json`, otherwise
 they are stored in the browser's `localStorage`.
+
+
+### Workflows and headless export
+
+The dashboard includes a **Functions / Workflows** panel that can chain multiple CLI tools into a single, repeatable protocol. You can:
+
+- build a multi-step workflow (using placeholders like `{{SEL}}`, `{{SEL_DIR}}`, and `{{RUN_DIR}}`)
+- save it to the shared library (persisted under your `--root` as `qeeg_ui_functions.json`)
+- run it with one click on the current selection
+- open **Plan / Export** to preview the exact commands and copy a Bash/PowerShell script to run headless
 
 ### 0) Inspect a recording (quick summary)
 

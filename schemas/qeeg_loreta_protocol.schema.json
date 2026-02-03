@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_loreta_protocol.schema.json",
+  "title": "qEEG LORETA Protocol Candidates",
+  "description": "Heuristic protocol candidate list produced by qeeg_loreta_metrics_cli (--protocol-json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "generated_utc",
+    "tool",
+    "input_path",
+    "outdir",
+    "metrics_index_json",
+    "atlas",
+    "roi_column",
+    "params",
+    "targets"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "generated_utc": {
+      "type": "string"
+    },
+    "tool": {
+      "type": "string"
+    },
+    "input_path": {
+      "type": "string"
+    },
+    "outdir": {
+      "type": "string"
+    },
+    "metrics_index_json": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "atlas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "roi_column": {
+      "type": "string"
+    },
+    "params": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "top_n",
+        "only_z",
+        "threshold_abs"
+      ],
+      "properties": {
+        "top_n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "only_z": {
+          "type": "boolean"
+        },
+        "threshold_abs": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "rank",
+          "roi",
+          "metric",
+          "metric_kind",
+          "value_kind",
+          "band",
+          "value",
+          "abs_value",
+          "suggested_direction"
+        ],
+        "properties": {
+          "rank": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "roi": {
+            "type": "string"
+          },
+          "metric": {
+            "type": "string"
+          },
+          "metric_kind": {
+            "type": "string"
+          },
+          "value_kind": {
+            "type": "string",
+            "enum": [
+              "zscore",
+              "raw"
+            ]
+          },
+          "band": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "type": "number"
+          },
+          "abs_value": {
+            "type": "number",
+            "minimum": 0
+          },
+          "suggested_direction": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "increase",
+              "decrease",
+              "none",
+              null
+            ]
+          }
+        }
+      }
+    }
+  }
+}

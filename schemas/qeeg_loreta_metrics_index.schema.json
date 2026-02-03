@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_loreta_metrics_index.schema.json",
+  "title": "qEEG LORETA ROI Metrics Index",
+  "description": "Machine-readable index produced by qeeg_loreta_metrics_cli (--json-index).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "generated_utc",
+    "tool",
+    "input_path",
+    "outdir",
+    "run_meta_json",
+    "report_html",
+    "atlas",
+    "roi_column",
+    "csv_wide",
+    "csv_long",
+    "metrics",
+    "rois"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "protocol_json": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "generated_utc": {
+      "type": "string"
+    },
+    "tool": {
+      "type": "string"
+    },
+    "input_path": {
+      "type": "string"
+    },
+    "outdir": {
+      "type": "string"
+    },
+    "run_meta_json": {
+      "type": "string"
+    },
+    "report_html": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "atlas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "roi_column": {
+      "type": "string"
+    },
+    "csv_wide": {
+      "type": "string"
+    },
+    "csv_long": {
+      "type": "string"
+    },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "rois": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "roi",
+          "values"
+        ],
+        "properties": {
+          "roi": {
+            "type": "string"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

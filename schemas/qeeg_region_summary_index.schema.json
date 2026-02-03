@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_region_summary_index.schema.json",
+  "title": "qEEG Region Summary Index",
+  "description": "Machine-readable index produced by qeeg_region_summary_cli (--json-index).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "generated_utc",
+    "tool",
+    "input_path",
+    "outdir",
+    "run_meta_json",
+    "csv_wide",
+    "csv_long",
+    "report_html",
+    "metrics",
+    "groups"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "generated_utc": {
+      "type": "string"
+    },
+    "tool": {
+      "type": "string"
+    },
+    "input_path": {
+      "type": "string"
+    },
+    "outdir": {
+      "type": "string"
+    },
+    "run_meta_json": {
+      "type": "string"
+    },
+    "csv_wide": {
+      "type": "string"
+    },
+    "csv_long": {
+      "type": "string"
+    },
+    "report_html": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metrics": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "groups": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "group_type",
+          "group",
+          "n_channels",
+          "values",
+          "n_valid"
+        ],
+        "properties": {
+          "group_type": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "n_channels": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "n_valid": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

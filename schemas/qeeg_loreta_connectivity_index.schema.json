@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_loreta_connectivity_index.schema.json",
+  "title": "qEEG LORETA Connectivity Index",
+  "description": "Machine-readable index produced by qeeg_loreta_connectivity_cli (--json-index).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "generated_utc",
+    "tool",
+    "input_path",
+    "outdir",
+    "run_meta_json",
+    "protocol_json",
+    "atlas",
+    "measures"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "generated_utc": { "type": "string" },
+    "tool": { "type": "string" },
+    "input_path": { "type": "string" },
+    "outdir": { "type": "string" },
+    "run_meta_json": { "type": "string" },
+    "protocol_json": { "type": ["string", "null"] },
+    "atlas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" }
+      }
+    },
+    "measures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["measure", "value_kind", "bands", "matrices"],
+        "properties": {
+          "measure": { "type": "string" },
+          "value_kind": { "type": "string", "enum": ["raw", "zscore"] },
+          "bands": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "matrices": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["band", "matrix_csv", "n_rois", "n_edges", "min", "max", "mean"],
+              "properties": {
+                "band": { "type": "string" },
+                "matrix_csv": { "type": "string" },
+                "n_rois": { "type": "integer", "minimum": 0 },
+                "n_edges": { "type": "integer", "minimum": 0 },
+                "min": { "type": ["number", "null"] },
+                "max": { "type": ["number", "null"] },
+                "mean": { "type": ["number", "null"] }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

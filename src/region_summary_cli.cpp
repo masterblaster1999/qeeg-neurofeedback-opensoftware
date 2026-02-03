@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -42,6 +43,9 @@ struct Args {
 
   bool html_report{false};
 
+  bool json_index{false};
+  std::string json_index_path{}; // default: <outdir>/region_summary_index.json
+
   // Column selection
   std::vector<std::string> metrics;  // if empty: include all numeric columns
   std::vector<std::string> exclude;  // remove specific metrics
@@ -62,6 +66,7 @@ static void print_help() {
     << "  - region_summary.csv              Wide format (one row per group)\n"
     << "  - region_summary_long.csv         Long format (group,metric,mean,n)\n"
     << "  - region_report.html              Optional HTML table report\n"
+    << "  - region_summary_index.json       Optional machine-readable JSON index (--json-index)\n"
     << "  - region_summary_run_meta.json    UI discovery metadata\n\n"
     << "Usage:\n"
     << "  qeeg_region_summary_cli --input out_map/bandpowers.csv --outdir out_regions --html-report\n"
@@ -75,6 +80,7 @@ static void print_help() {
     << "  --metric NAME           Include only this metric column (repeatable)\n"
     << "  --exclude NAME          Exclude a metric column (repeatable)\n"
     << "  --html-report           Write region_report.html\n"
+    << "  --json-index [PATH]     Write region_summary_index.json for downstream tooling (default: <outdir>/region_summary_index.json)\n"
     << "  -h, --help              Show this help\n";
 }
 
@@ -95,6 +101,16 @@ static Args parse_args(int argc, char** argv) {
       a.exclude.push_back(argv[++i]);
     } else if (arg == "--html-report") {
       a.html_report = true;
+    } else if (arg == "--json-index") {
+      a.json_index = true;
+      // Optional argument: path. If omitted, default will be <outdir>/region_summary_index.json
+      if ((i + 1) < argc) {
+        const std::string next = argv[i + 1];
+        if (!next.empty() && next[0] != '-') {
+          a.json_index_path = next;
+          ++i;
+        }
+      }
     } else {
       throw std::runtime_error("Unknown or incomplete argument: " + arg);
     }
@@ -470,10 +486,26 @@ static void write_html_report(const Args& args,
       << "  <p>Input: <span class=\"mono\">" << svg_escape(args.input_csv) << "</span></p>\n"
       << "  <p>Groups are heuristic (lobe + hemisphere) based on standard 10-20 / 10-10 channel naming.</p>\n";
 
+  std::string json_link;
+  if (args.json_index) {
+    if (args.json_index_path.empty()) {
+      json_link = "region_summary_index.json";
+    } else {
+      const std::filesystem::path p = std::filesystem::u8path(args.json_index_path);
+      if (!p.empty() && !p.is_absolute() && p.parent_path().empty()) {
+        json_link = p.generic_string();
+      }
+    }
+  }
+
   out << "  <p>Downloads: "
       << "<a href=\"" << url_escape("region_summary.csv") << "\">region_summary.csv</a> | "
-      << "<a href=\"" << url_escape("region_summary_long.csv") << "\">region_summary_long.csv</a>"
-      << "</p>\n";
+      << "<a href=\"" << url_escape("region_summary_long.csv") << "\">region_summary_long.csv</a>";
+
+  if (!json_link.empty()) {
+    out << " | <a href=\"" << url_escape(json_link) << "\">" << svg_escape(json_link) << "</a>";
+  }
+  out << "</p>\n";
 
   out << "  <table>\n";
   out << "    <thead><tr><th>Group type</th><th>Group</th><th>Channels</th>";
@@ -502,6 +534,145 @@ static void write_html_report(const Args& args,
   out << "    </tbody>\n";
   out << "  </table>\n";
   out << "</body>\n</html>\n";
+}
+
+
+
+static std::string posix_slashes(std::string s) {
+  for (char& c : s) {
+    if (c == '\\') c = '/';
+  }
+  return s;
+}
+
+static std::string safe_relpath_posix(const std::filesystem::path& target_abs,
+                                      const std::filesystem::path& base_abs) {
+  try {
+    std::filesystem::path rel = std::filesystem::relative(target_abs, base_abs);
+    std::string s = posix_slashes(rel.generic_string());
+    if (s.empty()) return posix_slashes(target_abs.generic_string());
+    if (starts_with(s, "../") || s == ".." || s.find("/../") != std::string::npos) {
+      return posix_slashes(target_abs.generic_string());
+    }
+    return s;
+  } catch (...) {
+    return posix_slashes(target_abs.generic_string());
+  }
+}
+
+static std::string json_number(double x, int precision = 10) {
+  if (!std::isfinite(x)) return "null";
+  std::ostringstream oss;
+  oss.setf(std::ios::fixed);
+  oss << std::setprecision(precision) << x;
+  std::string s = oss.str();
+  if (s.find('.') != std::string::npos) {
+    while (!s.empty() && s.back() == '0') s.pop_back();
+    if (!s.empty() && s.back() == '.') s.pop_back();
+  }
+  if (s == "-0") s = "0";
+  return s;
+}
+
+static void write_region_summary_index_json(const std::string& index_path,
+                                            const Args& args,
+                                            const ChannelTable& t,
+                                            const std::map<std::pair<std::string, std::string>, Agg>& aggs,
+                                            const std::string& run_meta_name,
+                                            const std::string& wide_csv_name,
+                                            const std::string& long_csv_name,
+                                            const std::string& report_html_name) {
+  const std::filesystem::path idx_p = std::filesystem::u8path(index_path);
+  const std::filesystem::path idx_abs = std::filesystem::absolute(idx_p);
+  const std::filesystem::path idx_dir_abs = idx_abs.parent_path();
+
+  if (!idx_dir_abs.empty()) {
+    ensure_directory(idx_dir_abs.u8string());
+  }
+
+  const std::filesystem::path outdir_abs = std::filesystem::absolute(std::filesystem::u8path(args.outdir));
+  const std::filesystem::path run_meta_abs = outdir_abs / run_meta_name;
+  const std::filesystem::path wide_abs = outdir_abs / wide_csv_name;
+  const std::filesystem::path long_abs = outdir_abs / long_csv_name;
+
+  const std::string outdir_rel = safe_relpath_posix(outdir_abs, idx_dir_abs);
+  const std::string run_meta_rel = safe_relpath_posix(run_meta_abs, idx_dir_abs);
+  const std::string wide_rel = safe_relpath_posix(wide_abs, idx_dir_abs);
+  const std::string long_rel = safe_relpath_posix(long_abs, idx_dir_abs);
+
+  std::string report_rel;
+  if (!report_html_name.empty()) {
+    const std::filesystem::path rep_abs = outdir_abs / report_html_name;
+    report_rel = safe_relpath_posix(rep_abs, idx_dir_abs);
+  }
+
+  std::ofstream out(std::filesystem::u8path(index_path), std::ios::binary);
+  if (!out) throw std::runtime_error("Failed to write JSON index: " + index_path);
+  out << std::setprecision(12);
+
+  out << "{\n";
+  out << "  \"$schema\": \"https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_region_summary_index.schema.json\",\n";
+  out << "  \"schema_version\": 1,\n";
+  out << "  \"generated_utc\": \"" << json_escape(now_string_utc()) << "\",\n";
+  out << "  \"tool\": \"qeeg_region_summary_cli\",\n";
+  out << "  \"input_path\": \"" << json_escape(args.input_csv) << "\",\n";
+  out << "  \"outdir\": \"" << json_escape(outdir_rel) << "\",\n";
+  out << "  \"run_meta_json\": \"" << json_escape(run_meta_rel) << "\",\n";
+  out << "  \"csv_wide\": \"" << json_escape(wide_rel) << "\",\n";
+  out << "  \"csv_long\": \"" << json_escape(long_rel) << "\",\n";
+  if (report_html_name.empty()) {
+    out << "  \"report_html\": null,\n";
+  } else {
+    out << "  \"report_html\": \"" << json_escape(report_rel) << "\",\n";
+  }
+
+  out << "  \"metrics\": [\n";
+  for (size_t i = 0; i < t.metrics.size(); ++i) {
+    out << "    \"" << json_escape(t.metrics[i]) << "\"";
+    if (i + 1 < t.metrics.size()) out << ",";
+    out << "\n";
+  }
+  out << "  ],\n";
+
+  out << "  \"groups\": [\n";
+  size_t gi = 0;
+  for (const auto& kv : aggs) {
+    const auto& key = kv.first;
+    const Agg& a = kv.second;
+    out << "    {\n";
+    out << "      \"group_type\": \"" << json_escape(key.first) << "\",\n";
+    out << "      \"group\": \"" << json_escape(key.second) << "\",\n";
+    out << "      \"n_channels\": " << a.n_channels << ",\n";
+
+    out << "      \"values\": [";
+    for (size_t mi = 0; mi < t.metrics.size(); ++mi) {
+      double mean = std::numeric_limits<double>::quiet_NaN();
+      if (mi < a.sum.size() && mi < a.n_valid.size() && a.n_valid[mi] > 0) {
+        mean = a.sum[mi] / static_cast<double>(a.n_valid[mi]);
+      }
+      out << json_number(mean, 10);
+      if (mi + 1 < t.metrics.size()) out << ", ";
+    }
+    out << "],\n";
+
+    out << "      \"n_valid\": [";
+    for (size_t mi = 0; mi < t.metrics.size(); ++mi) {
+      int nv = 0;
+      if (mi < a.n_valid.size()) nv = a.n_valid[mi];
+      out << nv;
+      if (mi + 1 < t.metrics.size()) out << ", ";
+    }
+    out << "]\n";
+
+    out << "    }";
+    ++gi;
+    if (gi < aggs.size()) out << ",";
+    out << "\n";
+  }
+  out << "  ]\n";
+  out << "}\n";
+
+  std::cout << "Wrote JSON index: " << index_path << "\n";
 }
 
 } // namespace
@@ -567,15 +738,49 @@ int main(int argc, char** argv) {
       write_html_report(args, t, aggs);
     }
 
+    const std::string wide_csv_name = "region_summary.csv";
+    const std::string long_csv_name = "region_summary_long.csv";
+    const std::string report_html_name = "region_report.html";
+    const std::string run_meta_name = "region_summary_run_meta.json";
+
+    std::string index_path;
+    if (args.json_index) {
+      index_path = args.json_index_path.empty() ? (args.outdir + "/region_summary_index.json")
+                                               : args.json_index_path;
+    }
+
     // Run meta (for qeeg_ui_* discovery).
     {
       std::vector<std::string> outs;
-      outs.push_back("region_summary.csv");
-      outs.push_back("region_summary_long.csv");
-      if (args.html_report) outs.push_back("region_report.html");
-      const std::string meta = args.outdir + "/region_summary_run_meta.json";
-      outs.push_back("region_summary_run_meta.json");
+      outs.push_back(wide_csv_name);
+      outs.push_back(long_csv_name);
+      if (args.html_report) outs.push_back(report_html_name);
+
+      // Include the JSON index in discovery outputs when it lives under --outdir.
+      if (args.json_index && !index_path.empty()) {
+        try {
+          const std::filesystem::path outdir_abs = std::filesystem::absolute(std::filesystem::u8path(args.outdir));
+          const std::filesystem::path idx_abs = std::filesystem::absolute(std::filesystem::u8path(index_path));
+          std::filesystem::path rel = std::filesystem::relative(idx_abs, outdir_abs);
+          std::string rel_s = posix_slashes(rel.generic_string());
+          if (!rel_s.empty() && !starts_with(rel_s, "../") && rel_s != ".." && rel_s.find("/../") == std::string::npos) {
+            outs.push_back(rel_s);
+          }
+        } catch (...) {
+          // ignore
+        }
+      }
+
+      const std::string meta = args.outdir + "/" + run_meta_name;
+      outs.push_back(run_meta_name);
       (void)write_run_meta_json(meta, "qeeg_region_summary_cli", args.outdir, args.input_csv, outs);
+    }
+
+    // JSON index for downstream tooling.
+    if (args.json_index && !index_path.empty()) {
+      write_region_summary_index_json(index_path, args, t, aggs,
+                                     run_meta_name, wide_csv_name, long_csv_name,
+                                     args.html_report ? report_html_name : "");
     }
 
     std::cout << "Wrote: " << wide_csv << "\n";

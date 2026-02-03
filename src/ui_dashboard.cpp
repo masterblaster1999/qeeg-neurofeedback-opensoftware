@@ -33,6 +33,13 @@ struct ToolSpec {
   std::string inject_flag_dir{""};
 };
 
+static std::string lower_ascii(std::string s) {
+  for (char& c : s) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
 static bool looks_like_qeeg_cli_exe_name(const std::string& filename, std::string* out_base) {
   // Accept:
   //   qeeg_*_cli           (POSIX)
@@ -93,6 +100,7 @@ static std::string infer_group_from_name(const std::string& tool) {
   if (tool.find("_ui_") != std::string::npos) return "UI";
   if (tool.find("_nf_") != std::string::npos) return "Neurofeedback";
   if (tool.find("microstates") != std::string::npos) return "Microstates";
+  if (tool.find("loreta") != std::string::npos) return "LORETA & Source Imaging";
   if (tool.find("plv") != std::string::npos || tool.find("coherence") != std::string::npos || tool.find("pac") != std::string::npos) {
     return "Connectivity";
   }
@@ -199,6 +207,16 @@ static std::vector<ToolSpec> default_tools() {
     {"qeeg_region_summary_cli", "Spectral & Maps",
      "Summarize per-channel qEEG metrics into coarse brain regions (lobe x hemisphere).",
      "qeeg_region_summary_cli --input out_map --outdir out_regions --html-report",
+     "--input", "--input"},
+
+    {"qeeg_loreta_metrics_cli", "LORETA & Source Imaging",
+     "Summarize ROI-level LORETA exports into a clean metrics table + optional HTML report + protocol candidates.",
+     "qeeg_loreta_metrics_cli --input out_loreta_raw --outdir out_loreta --atlas brodmann --html-report --json-index --protocol-json",
+     "--input", "--input"},
+
+    {"qeeg_loreta_connectivity_cli", "LORETA & Source Imaging",
+     "Convert ROI-to-ROI LORETA connectivity exports into standardized matrices + JSON index + protocol candidates.",
+     "qeeg_loreta_connectivity_cli --input loreta_connectivity.csv --outdir out_loreta_conn --atlas brodmann --json-index --protocol-json",
      "--input", "--input"},
 
     {"qeeg_spectral_features_cli", "Spectral & Maps",
@@ -873,6 +891,153 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
     if (runs.find(t.name) != runs.end()) ++n_with_runs;
   }
 
+  // Build a small "hub" list of report/dashboard artifacts from the latest run of each tool.
+  struct HubItem {
+    std::string tool;
+    std::string kind;       // report/dashboard/index/protocol/html
+    std::string file;       // filename only
+    std::string href_url;   // link relative to the HTML output
+    std::string select_path;  // path relative to --root (for Select)
+    std::string run_dir;      // directory relative to --root (for Browse)
+  };
+
+  auto hub_html_kind = [&](const std::string& lower_fname) -> std::string {
+    if (ends_with(lower_fname, "_report.html")) return "report";
+    if (lower_fname.find("dashboard") != std::string::npos) return "dashboard";
+    if (lower_fname.find("ui") != std::string::npos) return "ui";
+    return "html";
+  };
+
+  auto hub_html_pri = [&](const std::string& lower_fname) -> int {
+    if (ends_with(lower_fname, "_report.html")) return 0;
+    if (lower_fname.find("dashboard") != std::string::npos) return 1;
+    if (lower_fname.find("ui") != std::string::npos) return 2;
+    return 3;
+  };
+
+  auto hub_json_kind = [&](const std::string& lower_fname) -> std::string {
+    if (ends_with(lower_fname, "_index.json")) return "index";
+    if (ends_with(lower_fname, "_protocol.json")) return "protocol";
+    return "json";
+  };
+
+  auto hub_json_pri = [&](const std::string& lower_fname) -> int {
+    if (ends_with(lower_fname, "_index.json")) return 0;
+    if (ends_with(lower_fname, "_protocol.json")) return 1;
+    return 2;
+  };
+
+  std::vector<HubItem> hub_html;
+  std::vector<HubItem> hub_indices;
+  std::vector<HubItem> hub_dashboards;
+
+  auto add_known_dashboard = [&](const std::string& rel_name, const std::string& label) {
+    const std::filesystem::path abs = root / std::filesystem::u8path(rel_name);
+    std::error_code ec;
+    if (!std::filesystem::exists(abs, ec) || !std::filesystem::is_regular_file(abs, ec)) return;
+
+    HubItem it;
+    it.tool = "dashboard";
+    it.kind = "dashboard";
+    it.file = label;
+    it.href_url = url_encode_path(rel_link(out_dir, abs));
+    it.select_path = rel_name;
+    it.run_dir = "";
+    hub_dashboards.push_back(std::move(it));
+  };
+
+  // If users have already generated these dashboards (e.g. via scripts), expose them here.
+  add_known_dashboard("qeeg_reports_dashboard.html", "Reports dashboard");
+  add_known_dashboard("nf_sessions_dashboard.html", "Neurofeedback sessions dashboard");
+
+  for (const auto& kv : runs) {
+    const std::string tool = kv.first;
+    const RunInfo& info = kv.second;
+
+    std::string run_dir_rel;
+    {
+      std::error_code ec;
+      const std::filesystem::path rel = std::filesystem::relative(info.meta_dir, root, ec);
+      if (!ec) run_dir_rel = rel.generic_u8string();
+    }
+
+    struct Cand {
+      HubItem item;
+      int pri;
+    };
+    std::vector<Cand> cands_html;
+    std::vector<Cand> cands_json;
+
+    for (const std::string& out_rel_str : info.outputs) {
+      std::filesystem::path rel;
+      if (!parse_safe_rel_path(out_rel_str, &rel)) continue;
+
+      const std::filesystem::path abs = info.meta_dir / rel;
+      std::error_code ec;
+      if (!std::filesystem::exists(abs, ec) || !std::filesystem::is_regular_file(abs, ec)) continue;
+
+      const std::string fname = abs.filename().u8string();
+      const std::string lower_fname = lower_ascii(fname);
+
+      // Prefer surfacing HTML "reports" in the hub.
+      if (ends_with(lower_fname, ".html")) {
+        HubItem it;
+        it.tool = tool;
+        it.kind = hub_html_kind(lower_fname);
+        it.file = fname;
+        it.href_url = url_encode_path(rel_link(out_dir, abs));
+        it.run_dir = run_dir_rel;
+        {
+          std::error_code ec2;
+          const std::filesystem::path sel = std::filesystem::relative(abs, root, ec2);
+          if (!ec2) it.select_path = sel.generic_u8string();
+        }
+        cands_html.push_back({std::move(it), hub_html_pri(lower_fname)});
+      }
+
+      // Also surface index/protocol JSONs produced by brain-mapping tools.
+      if (ends_with(lower_fname, "_index.json") || ends_with(lower_fname, "_protocol.json")) {
+        HubItem it;
+        it.tool = tool;
+        it.kind = hub_json_kind(lower_fname);
+        it.file = fname;
+        it.href_url = url_encode_path(rel_link(out_dir, abs));
+        it.run_dir = run_dir_rel;
+        {
+          std::error_code ec2;
+          const std::filesystem::path sel = std::filesystem::relative(abs, root, ec2);
+          if (!ec2) it.select_path = sel.generic_u8string();
+        }
+        cands_json.push_back({std::move(it), hub_json_pri(lower_fname)});
+      }
+    }
+
+    auto take_top = [](std::vector<Cand>& cands, std::vector<HubItem>& out, size_t k) {
+      std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        if (a.pri != b.pri) return a.pri < b.pri;
+        if (a.item.tool != b.item.tool) return a.item.tool < b.item.tool;
+        return a.item.file < b.item.file;
+      });
+      for (size_t i = 0; i < cands.size() && i < k; ++i) {
+        out.push_back(std::move(cands[i].item));
+      }
+    };
+
+    take_top(cands_html, hub_html, 2);
+    take_top(cands_json, hub_indices, 4);
+  }
+
+  std::sort(hub_html.begin(), hub_html.end(), [](const HubItem& a, const HubItem& b) {
+    if (a.kind != b.kind) return a.kind < b.kind;
+    if (a.tool != b.tool) return a.tool < b.tool;
+    return a.file < b.file;
+  });
+  std::sort(hub_indices.begin(), hub_indices.end(), [](const HubItem& a, const HubItem& b) {
+    if (a.kind != b.kind) return a.kind < b.kind;
+    if (a.tool != b.tool) return a.tool < b.tool;
+    return a.file < b.file;
+  });
+
   o << "<!doctype html>\n"
     << "<html lang=\"en\">\n"
     << "<head>\n"
@@ -1036,6 +1201,12 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
   o << "    <div class=\"search\"><input id=\"search\" placeholder=\"Filter tools…\" autocomplete=\"off\"></div>\n";
 
   o << "    <nav class=\"nav\">\n";
+  o << "      <div class=\"group\">\n";
+  o << "        <div class=\"group-title\">Overview</div>\n";
+  o << "        <a href=\"#home\"><span class=\"dot\"></span><span class=\"nav-label\">Home</span></a>\n";
+  o << "        <a href=\"#functions\"><span class=\"dot\"></span><span class=\"nav-label\">Functions</span></a>\n";
+  o << "        <a href=\"#dashboards\"><span class=\"dot\"></span><span class=\"nav-label\">Dashboards &amp; reports</span></a>\n";
+  o << "      </div>\n";
   for (const auto& kv : by_group) {
     o << "      <div class=\"group\">\n";
     o << "        <div class=\"group-title\">" << html_escape(kv.first) << "</div>\n";
@@ -1068,7 +1239,7 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
 
   // Content.
   o << "  <main class=\"content\">\n";
-  o << "    <div class=\"hero\">\n";
+  o << "    <div class=\"hero\" id=\"home\">\n";
   o << "      <h2>All qeeg executables, one place</h2>\n";
   o << "      <p>This is a self-contained dashboard that lists every <code>qeeg_*_cli</code> executable, embeds its <code>--help</code> output (optional), and links any discovered run outputs via <code>*_run_meta.json</code> manifests.</p>\n";
   o << "      <p style=\"margin-top:10px\"><b>Optional:</b> serve this dashboard using <code>qeeg_ui_server_cli</code> to enable one-click runs from the browser (local-only).</p>\n";
@@ -1100,6 +1271,77 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
   o << "          <h4>Workspace browser</h4>\n";
   o << "          <div id=\"fsPanel\" class=\"small\">(available when served via <code>qeeg_ui_server_cli</code>)</div>\n";
   o << "        </div>\n";
+
+
+  o << "        <div class=\"card\" style=\"flex:1 1 420px\" id=\"functions\">\n";
+  o << "          <h4>Functions</h4>\n";
+  o << "          <div id=\"functionsPanel\" class=\"small\">Curated workflows that run multiple tools in sequence (requires <code>qeeg_ui_server_cli</code> for one-click runs).</div>\n";
+  o << "        </div>\n";
+  o << "        <div class=\"card\" style=\"flex:1 1 420px\" id=\"dashboards\">\n";
+  o << "          <h4>Dashboards &amp; reports</h4>\n";
+  o << "          <div class=\"small\">\n";
+  if(!hub_dashboards.empty()){
+    o << "            <div><b>Known dashboards:</b></div>\n";
+    o << "            <ul style=\"margin:6px 0 0 18px;padding:0\">\n";
+    for(const auto& it : hub_dashboards){
+      o << "              <li><a href=\"" << html_escape(it.href_url) << "\" target=\"_blank\" rel=\"noopener\">" << html_escape(it.file) << "</a>";
+      if(!it.select_path.empty()){
+        o << " <button class=\"btn chip\" type=\"button\" data-path=\"" << html_escape(it.select_path) << "\" onclick=\"selectPathAuto(this.dataset.path)\">Select</button>";
+      }
+      o << "</li>\n";
+    }
+    o << "            </ul>\n";
+  } else {
+    o << "            <div>No top-level dashboards found. Tip: run <code>scripts/render_reports_dashboard.py</code> to generate <code>qeeg_reports_dashboard.html</code>.</div>\n";
+  }
+
+  if(!hub_html.empty()){
+    o << "            <details style=\"margin-top:10px\" open>\n";
+    o << "              <summary><b>Latest HTML outputs</b> (" << hub_html.size() << ")</summary>\n";
+    o << "              <div class=\"small\">\n";
+    o << "                <ul style=\"margin:6px 0 0 18px;padding:0\">\n";
+    for(const auto& it : hub_html){
+      o << "                  <li><code>" << html_escape(it.tool) << "</code><span class=\"pill\">" << html_escape(it.kind) << "</span> ";
+      o << "<a href=\"" << html_escape(it.href_url) << "\" target=\"_blank\" rel=\"noopener\">" << html_escape(it.file) << "</a>";
+      if(!it.select_path.empty()){
+        o << " <button class=\"btn chip\" type=\"button\" data-path=\"" << html_escape(it.select_path) << "\" onclick=\"selectPathAuto(this.dataset.path)\">Select</button>";
+      }
+      if(!it.run_dir.empty()){
+        o << " <button class=\"btn chip\" type=\"button\" data-dir=\"" << html_escape(it.run_dir) << "\" onclick=\"browseInWorkspace(this.dataset.dir)\">Browse</button>";
+      }
+      o << "</li>\n";
+    }
+    o << "                </ul>\n";
+    o << "              </div>\n";
+    o << "            </details>\n";
+  } else {
+    o << "            <div style=\"margin-top:10px\">No HTML outputs discovered yet. Tools that support it can emit reports via <code>--html-report</code>.</div>\n";
+  }
+
+  if(!hub_indices.empty()){
+    o << "            <details style=\"margin-top:10px\">\n";
+    o << "              <summary><b>Indices &amp; protocols</b> (" << hub_indices.size() << ")</summary>\n";
+    o << "              <div class=\"small\">\n";
+    o << "                <ul style=\"margin:6px 0 0 18px;padding:0\">\n";
+    for(const auto& it : hub_indices){
+      o << "                  <li><code>" << html_escape(it.tool) << "</code><span class=\"pill\">" << html_escape(it.kind) << "</span> ";
+      o << "<a href=\"" << html_escape(it.href_url) << "\" target=\"_blank\" rel=\"noopener\">" << html_escape(it.file) << "</a>";
+      if(!it.select_path.empty()){
+        o << " <button class=\"btn chip\" type=\"button\" data-path=\"" << html_escape(it.select_path) << "\" onclick=\"selectPathAuto(this.dataset.path)\">Select</button>";
+      }
+      if(!it.run_dir.empty()){
+        o << " <button class=\"btn chip\" type=\"button\" data-dir=\"" << html_escape(it.run_dir) << "\" onclick=\"browseInWorkspace(this.dataset.dir)\">Browse</button>";
+      }
+      o << "</li>\n";
+    }
+    o << "                </ul>\n";
+    o << "              </div>\n";
+    o << "            </details>\n";
+  }
+
+  o << "          </div>\n";
+  o << "        </div>\n";
+
   o << "        <div class=\"card fx-card\" style=\"flex:1 1 420px\">\n";
   o << "          <h4>Procedural visuals</h4>\n";
   o << "          <div id=\"fxActivityLabel\" class=\"small\">Decorative previews (no data). Activity: <b>idle</b>.</div>\n";
@@ -1229,7 +1471,13 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
         o << "            <button class=\"btn\" id=\"" << stopbtn_id << "\" data-status-id=\"" << status_id << "\" disabled onclick=\"stopJob(this)\">Stop</button>\n";
         o << "            <button class=\"btn\" data-status-id=\"" << status_id << "\" data-logwrap-id=\"" << logwrap_id << "\" data-log-id=\"" << log_id << "\" onclick=\"toggleLog(this)\">Tail log</button>\n";
         o << "            <button class=\"btn\" data-status-id=\"" << status_id << "\" data-outwrap-id=\"" << outwrap_id << "\" data-out-id=\"" << out_id << "\" onclick=\"toggleOutputs(this)\">Outputs</button>\\n";
-
+        // Functions integration: capture this tool+args as a reusable workflow step.
+        o << "            <button class=\"btn chip\" data-tool=\"" << html_escape(t.name)
+          << "\" data-args-id=\"" << args_id
+          << "\" onclick=\"toolAddStepToBuilder(this)\">Add step to builder</button>\n";
+        o << "            <button class=\"btn chip\" data-tool=\"" << html_escape(t.name)
+          << "\" data-args-id=\"" << args_id
+          << "\" onclick=\"toolSaveAsFunction(this)\">Save 1-step func</button>\n";
         // Path injection dropdown (populated from embedded --help output when available).
         o << "            <select class=\"input inject-select\" id=\"" << injectsel_id
           << "\" data-default-file=\"" << html_escape(t.inject_flag_file)
@@ -1656,8 +1904,79 @@ static void write_html(std::ostream& o, const UiDashboardArgs& args) {
 </div>
 )HTML";
 
+  // Functions library modal (workflow definitions; saved via /api/functions when available).
+  o << R"HTML(
+<div id="fnLibBackdrop" class="modal-backdrop hidden" onclick="if(event.target===this) closeFunctionsLibrary();">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="fnLibTitle">
+    <div class="modal-header">
+      <div class="modal-title" id="fnLibTitle">Functions library</div>
+      <div class="file-actions">
+        <button class="btn" onclick="fnLibResetToDefaults()">Reset</button>
+        <button class="btn" onclick="fnLibLoadFromStore()">Load</button>
+        <button class="btn" id="fnLibSaveBtn" onclick="fnLibSaveToStore()">Save</button>
+        <button class="btn" onclick="fnLibExport()">Export</button>
+        <button class="btn" onclick="fnLibImport()">Import</button>
+        <button class="btn" onclick="closeFunctionsLibrary()">Close</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="small" style="margin-bottom:10px">
+        Stored as <code>qeeg_ui_functions.json</code> under your workspace root when connected to <code>qeeg_ui_server_cli</code>.
+        Format: <code>{ "version": 1, "functions": [ ... ] }</code>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <span class="small" id="fnLibStatus"></span>
+      </div>
+      <textarea class="input" id="fnLibText" style="min-height:360px;white-space:pre" spellcheck="false"></textarea>
+      <div class="small" style="margin-top:10px;color:var(--muted)">
+        Tips: each function needs <code>id</code>, <code>title</code>, <code>requires</code> (none|file|dir|any), and <code>steps</code> with <code>tool</code> + <code>args</code>.
+        Placeholders: <code>{{SEL}}</code>, <code>{{SEL_DIR}}</code>, <code>{{RUN_DIR}}</code>, <code>{{STEP0_OUTDIR}}</code>, <code>{{BIN_DIR}}</code>.
+      </div>
+    </div>
+  </div>
+</div>
+)HTML";
 
-  // Command palette modal (Ctrl+K quick actions).
+
+
+  
+  // Function plan / export modal (expanded commands + bash/ps scripts).
+  o << R"HTML(
+<div id="fnPlanBackdrop" class="modal-backdrop hidden" onclick="if(event.target===this) closeFnPlan();">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="fnPlanTitle">
+    <div class="modal-header">
+      <div class="modal-title" id="fnPlanTitle">Function plan</div>
+      <div class="file-actions">
+        <button class="btn" id="fnPlanCopyBtn" onclick="fnPlanCopy()">Copy</button>
+        <button class="btn" onclick="closeFnPlan()">Close</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <label class="small">Mode:
+          <select class="input" id="fnPlanMode" style="max-width:220px;width:auto" onchange="setFnPlanMode(this.value)">
+            <option value="expanded">Expanded</option>
+            <option value="template">Template</option>
+          </select>
+        </label>
+        <span class="small" id="fnPlanMeta"></span>
+      </div>
+      <div class="runs-tabs" style="margin-bottom:8px">
+        <button class="btn runs-tab" id="fnPlanTabCmd" type="button" onclick="setFnPlanView('cmd')">Commands</button>
+        <button class="btn runs-tab" id="fnPlanTabBash" type="button" onclick="setFnPlanView('bash')">Bash</button>
+        <button class="btn runs-tab" id="fnPlanTabPs" type="button" onclick="setFnPlanView('ps')">PowerShell</button>
+        <span id="fnPlanStatus" class="small"></span>
+      </div>
+      <textarea class="input" id="fnPlanText" style="min-height:340px;white-space:pre" readonly spellcheck="false"></textarea>
+      <div class="small" style="margin-top:10px;color:var(--muted)">
+        Tip: the exported scripts call the underlying CLI tools (headless). Run them from your workspace root (or adjust <code>ROOT</code>/<code>BIN_DIR</code>).
+      </div>
+    </div>
+  </div>
+</div>
+)HTML";
+
+// Command palette modal (Ctrl+K quick actions).
   o << R"HTML(
 <div id="cmdBackdrop" class="modal-backdrop hidden" onclick="if(event.target===this) closeCmdPalette();">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="cmdTitle">
@@ -1702,7 +2021,7 @@ function applyFilter(){const q=norm(search.value);
   });
   // Hide empty group titles in sidebar
   document.querySelectorAll('.group').forEach(g=>{
-    const links=[...g.querySelectorAll('a[data-tool]')];
+    const links=[...g.querySelectorAll('a')];
     const any=links.some(a=>!a.classList.contains('hidden'));
     g.classList.toggle('hidden', !any);
   });
@@ -1761,6 +2080,10 @@ function initSidebar(){
 
 let qeegApiOk=false;
 let qeegApiToken='';
+let qeegServerInfo=null;
+let qeegServerTools=[];
+let qeegServerToolsFetchedAt=0;
+let qeegServerToolsError='';
 let runsTimer=null;
 let runsViewMode='session';
 let runsHistory=[];
@@ -1787,6 +2110,8 @@ let fxEnabled=true;
 let fxMode='eeg'; // 'eeg' | 'topo' | 'spec'
 let fxEngine=null;
 let fxRunningCount=0;
+let fnRuns={}; // function id -> state for workflow runner
+let fnUiLastRender=0;
 let fxReduceMotion=false;
 let fxHasUserPref=false;
 let notesRunDir='';
@@ -1818,6 +2143,39 @@ let toolLive={}; // toolName -> {running, queued, stopping}
 
 function esc(s){
   return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function quoteArgIfNeeded(s){
+  s = (s===undefined || s===null) ? '' : String(s);
+  if(s === '') return '""';
+
+  // Only quote when needed (whitespace or quotes). This keeps logs readable and
+  // avoids surprising behavior when users paste tokens into other shells.
+  const needs = /[\s"]/g.test(s);
+  if(!needs) return s;
+
+  // Escape for our command-line token splitter (see split_commandline_args in C++).
+  // We double backslashes when they would otherwise escape a quote/backslash/space,
+  // and we escape embedded double quotes.
+  let out = '';
+  for(let i=0;i<s.length;i++){
+    const c = s[i];
+    if(c === '\\'){
+      const n = (i+1 < s.length) ? s[i+1] : '';
+      if(n === '' || n === '"' || n === '\\' || /\s/.test(n)){
+        out += '\\\\';
+      }else{
+        out += '\\';
+      }
+      continue;
+    }
+    if(c === '"'){
+      out += '\\"';
+      continue;
+    }
+    out += c;
+  }
+  return '"' + out + '"';
 }
 
 
@@ -1878,7 +2236,22 @@ function buildCmdItems(){
     items.push({title:'Selection: Clear', subtitle:'Clear selected path', action:()=>{ try{ selectionClear(); }catch(e){} }});
   }
 
+  // Function runner (workflow macros)
+  if(qeegApiOk && qeegApiToken){
+    try{
+      const fsugg = getSelectionFunctionSuggestions();
+      if(fsugg && fsugg.length){
+        for(const f of fsugg){
+          items.push({title:'Run: '+f.label, subtitle:'Function', action:()=>{ try{ runFunction(f.id); }catch(e){} }});
+        }
+      }
+    }catch(e){}
+  }
+
   // Quick actions
+  items.push({title:'Go: Home', subtitle:'Top of dashboard', action:()=>{try{const el=document.getElementById('home'); if(el) el.scrollIntoView({behavior:uiScrollBehavior(), block:'start'});}catch(e){}}});
+  items.push({title:'Go: Dashboards & reports', subtitle:'Central artifact hub', action:()=>{try{const el=document.getElementById('dashboards'); if(el) el.scrollIntoView({behavior:uiScrollBehavior(), block:'start'});}catch(e){}}});
+  items.push({title:'Go: Functions', subtitle:'Workflow runner', action:()=>{try{const el=document.getElementById('functions'); if(el) el.scrollIntoView({behavior:uiScrollBehavior(), block:'start'});}catch(e){}}});
   items.push({title:'Workspace: Root', subtitle:'Browse --root', action:()=>{ try{ fsRoot(); }catch(e){} }});
   if(fsNavPos>0){ items.push({title:'Workspace: Back', subtitle:'Go to previous folder', action:()=>{ try{ initFsBrowser(); fsBack(); }catch(e){} }}); }
   if(fsNavPos>=0 && fsNavPos < (fsNavHistory.length-1)){ items.push({title:'Workspace: Forward', subtitle:'Go to next folder', action:()=>{ try{ initFsBrowser(); fsForward(); }catch(e){} }}); }
@@ -3237,6 +3610,7 @@ function updateSelectedInputUi(){
   if(bClr) bClr.disabled = !selectedInputPath;
 
   try{ renderSelectionSuggestions(); }catch(e){}
+  try{ updateFunctionsUi(); }catch(e){}
 }
 
 function setSelectedInput(p, type){
@@ -3374,6 +3748,17 @@ function getSelectionSuggestions(){
     if(base.includes('bandpowers') || base.includes('bandpower')){
       out.push({label:'Bandratios', tool:'qeeg_bandratios_cli'});
     }
+
+    // Heuristic: LORETA exports are often CSV/TSV with "loreta"/ROI/connectivity in the filename.
+    const hasLoreta = (base.includes('loreta') || base.includes('sloreta') || base.includes('eloreta'));
+    const hasConn = (base.includes('connect') || base.includes('connectivity') || base.includes('_conn') || base.includes('-conn'));
+    const hasBA = /(^|[^a-z])ba\d+/.test(base);
+    if(hasLoreta || base.includes('roi') || base.includes('brodmann') || hasBA){
+      out.push({label:'LORETA metrics', tool:'qeeg_loreta_metrics_cli'});
+      if(hasConn) out.push({label:'LORETA connectivity', tool:'qeeg_loreta_connectivity_cli'});
+    }else if(hasConn){
+      out.push({label:'LORETA connectivity', tool:'qeeg_loreta_connectivity_cli'});
+    }
   }
 
   // Only show tools that exist in this dashboard build.
@@ -3409,86 +3794,1859 @@ function renderSelectionSuggestions(){
     html += '<div style="margin-top:6px"><span class="small">Serve via <code>qeeg_ui_server_cli</code> to enable quick-run.</span></div>';
   }
 
+  try{
+    const fsugg = getSelectionFunctionSuggestions();
+    if(fsugg && fsugg.length){
+      html += '<div style="margin-top:10px"><b>Functions:</b> ';
+      for(const f of fsugg){
+        html += '<button class="btn chip" type="button" onclick="runFunction(\''+escJs(f.id)+'\')">'+esc(f.label)+'</button> ';
+      }
+      html += '</div>';
+    }
+  }catch(e){}
+
   box.innerHTML = html;
 }
 
 
-function quoteArgIfNeeded(s){
+
+
+// -----------------------------
+// Function runner (workflow macros)
+// -----------------------------
+
+const qeegFunctionSpecs = [
+  {
+    id: 'brainmap_pipeline',
+    title: 'Brain mapping pipeline',
+    requires: 'file',
+    desc: 'Run the pipeline (map, bandpower, topos, region summary).',
+    steps: [
+      { tool: 'qeeg_pipeline_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_pipeline --topomaps --region-summary --write-ui', outdir_suffix: 'out_pipeline' }
+    ]
+  },
+  {
+    id: 'inspect_quick',
+    title: 'Quick inspect',
+    requires: 'file',
+    desc: 'Fast overview (duration, channel stats, simple plots).',
+    steps: [
+      { tool: 'qeeg_info_cli', args: '--input {{SEL}}', outdir_suffix: '' }
+    ]
+  },
+  {
+    id: 'map_report',
+    title: 'qEEG map report',
+    requires: 'file',
+    desc: 'Compute per-channel maps and render an HTML report.',
+    steps: [
+      { tool: 'qeeg_map_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_map --annotate --html-report', outdir_suffix: 'out_map' }
+    ]
+  },
+  {
+    id: 'region_summary_report',
+    title: 'Region summary report',
+    requires: 'dir',
+    desc: 'Summarize regions/ROIs from an existing map output folder.',
+    steps: [
+      { tool: 'qeeg_region_summary_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_regions --html-report --json-index', outdir_suffix: 'out_regions' }
+    ]
+  },
+  {
+    id: 'topomap_report',
+    title: 'Topomap report',
+    requires: 'dir',
+    desc: 'Render topomaps + HTML report from an existing table folder (bandpower/ratios/z-scores).',
+    steps: [
+      { tool: 'qeeg_topomap_cli', args: '--input {{SEL}} --metric alpha --outdir {{RUN_DIR}}/out_topo --annotate --html-report --json-index', outdir_suffix: 'out_topo' }
+    ]
+  },
+  {
+    id: 'connectivity_map_report',
+    title: 'Connectivity map report',
+    requires: 'dir',
+    desc: 'Render connectivity maps + HTML report from an existing connectivity output folder.',
+    steps: [
+      { tool: 'qeeg_connectivity_map_cli', args: '--input {{SEL}} --labels --outdir {{RUN_DIR}}/out_conn --html-report', outdir_suffix: 'out_conn' }
+    ]
+  },
+  {
+    id: 'microstates_report',
+    title: 'Microstates report',
+    requires: 'file',
+    desc: 'Compute microstates and render an HTML report.',
+    steps: [
+      { tool: 'qeeg_microstates_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_ms --html-report', outdir_suffix: 'out_ms' }
+    ]
+  },
+  {
+    id: 'connectivity_coherence_report',
+    title: 'Connectivity maps from coherence',
+    requires: 'file',
+    desc: 'Compute coherence then render connectivity maps + HTML report.',
+    steps: [
+      { tool: 'qeeg_coherence_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_coh', outdir_suffix: 'out_coh' },
+      { tool: 'qeeg_connectivity_map_cli', args: '--input {{STEP0_OUTDIR}} --metric coherence --labels --outdir {{RUN_DIR}}/out_conn --html-report', outdir_suffix: 'out_conn' }
+    ]
+  },
+  {
+    id: 'connectivity_plv_report',
+    title: 'Connectivity maps from PLV',
+    requires: 'file',
+    desc: 'Compute PLV then render connectivity maps + HTML report.',
+    steps: [
+      { tool: 'qeeg_plv_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_plv', outdir_suffix: 'out_plv' },
+      { tool: 'qeeg_connectivity_map_cli', args: '--input {{STEP0_OUTDIR}} --metric plv --labels --outdir {{RUN_DIR}}/out_conn --html-report', outdir_suffix: 'out_conn' }
+    ]
+  },
+  {
+    id: 'nf_biotrace_ui',
+    title: 'Neurofeedback BioTrace UI',
+    requires: 'file',
+    desc: 'Generate BioTrace-style HTML and derived NF events.',
+    steps: [
+      { tool: 'qeeg_nf_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_nf --biotrace-ui --export-derived-events', outdir_suffix: 'out_nf' }
+    ]
+  },
+  {
+    id: 'bandpower_to_topos',
+    title: 'Bandpower → topomaps',
+    requires: 'file',
+    desc: 'Compute bandpowers/ratios then render topomaps + HTML report.',
+    steps: [
+      { tool: 'qeeg_bandpower_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_bp', outdir_suffix: 'out_bp' },
+      { tool: 'qeeg_bandratios_cli', args: '--input {{STEP0_OUTDIR}} --outdir {{RUN_DIR}}/out_br', outdir_suffix: 'out_br' },
+      { tool: 'qeeg_topomap_cli', args: '--input {{STEP0_OUTDIR}} --metric alpha --outdir {{RUN_DIR}}/out_topo --annotate --html-report --json-index', outdir_suffix: 'out_topo' }
+    ]
+  },
+  {
+    id: 'loreta_metrics_report',
+    title: 'LORETA metrics report',
+    requires: 'any',
+    desc: 'Summarize LORETA ROI metrics and render a report (CSV/TSV input).',
+    steps: [
+      { tool: 'qeeg_loreta_metrics_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_loreta_metrics --html-report', outdir_suffix: 'out_loreta_metrics' }
+    ]
+  },
+  {
+    id: 'loreta_connectivity_report',
+    title: 'LORETA connectivity report',
+    requires: 'any',
+    desc: 'Compute connectivity summaries from LORETA connectivity exports and render a report.',
+    steps: [
+      { tool: 'qeeg_loreta_connectivity_cli', args: '--input {{SEL}} --outdir {{RUN_DIR}}/out_loreta_conn --html-report', outdir_suffix: 'out_loreta_conn' }
+    ]
+  },
+  {
+    id: 'generate_static_dashboard',
+    title: 'Generate static dashboard',
+    requires: 'none',
+    desc: 'Render a standalone HTML dashboard for the current workspace.',
+    steps: [
+      { tool: 'qeeg_ui_cli', args: '--root . --output {{RUN_DIR}}/qeeg_ui.html', outdir_suffix: '' }
+    ]
+  },
+  {
+    id: 'make_offline_bundle',
+    title: 'Make offline bundle',
+    requires: 'none',
+    needs_bin_dir: true,
+    desc: 'Package the offline app + dashboards into a single folder.',
+    steps: [
+      { tool: 'qeeg_bundle_cli', args: '--bin-dir {{BIN_DIR}} --outdir {{RUN_DIR}}/qeeg_bundle', outdir_suffix: 'qeeg_bundle' }
+    ]
+  }
+];
+
+
+
+// --- Functions library persistence (localStorage + optional server sync via /api/functions) ---
+let functionsStore = null;
+let functionsServerEnabled = false;
+let functionsSource = 'local'; // 'local' | 'server'
+let functionsSyncing = false;
+
+function functionsStoreKey(){
+  return 'qeeg-ui-functions-v1';
+}
+function emptyFunctionsStore(){
+  return {version:1, updated:new Date().toISOString(), functions:[]};
+}
+function deepCopy(obj){
+  return JSON.parse(JSON.stringify(obj));
+}
+function defaultFunctionSpecs(){
+  // Copy the built-in defaults so callers can mutate safely.
+  return deepCopy(qeegFunctionSpecs || []);
+}
+
+function sanitizeFunctionSpec(f){
+  if(!f || typeof f !== 'object') return null;
+  const out = {};
+  out.id = (typeof f.id === 'string') ? f.id.trim() : '';
+  out.title = (typeof f.title === 'string') ? f.title : '';
+  out.desc = (typeof f.desc === 'string') ? f.desc : '';
+  out.requires = (typeof f.requires === 'string') ? f.requires : 'any';
+  if(!out.requires) out.requires = 'any';
+  out.needs_bin_dir = !!f.needs_bin_dir;
+  const stepsIn = Array.isArray(f.steps) ? f.steps : [];
+  const steps = [];
+  for(const s of stepsIn){
+    if(!s || typeof s !== 'object') continue;
+    const tool = (typeof s.tool === 'string') ? s.tool.trim() : '';
+    if(!tool) continue;
+    const st = { tool: tool, args: (typeof s.args === 'string') ? s.args : '' };
+    if(typeof s.outdir_suffix === 'string' && s.outdir_suffix) st.outdir_suffix = s.outdir_suffix;
+    steps.push(st);
+  }
+  if(!out.id || steps.length===0) return null;
+  out.steps = steps;
+  return out;
+}
+
+function sanitizeFunctionList(list){
+  const out=[];
+  const seen=new Set();
+  if(!Array.isArray(list)) return out;
+  for(const f of list){
+    const s = sanitizeFunctionSpec(f);
+    if(!s) continue;
+    if(seen.has(s.id)) continue;
+    seen.add(s.id);
+    out.push(s);
+  }
+  return out;
+}
+
+function normalizeFunctionsStore(s){
+  // Accept either:
+  //   {version:1, functions:[...]}
+  // or legacy: an array of function specs.
+  if(!s) return emptyFunctionsStore();
+  if(Array.isArray(s)){
+    const st = emptyFunctionsStore();
+    st.functions = sanitizeFunctionList(s);
+    return st;
+  }
+  if(typeof s !== 'object') return emptyFunctionsStore();
+  const out = emptyFunctionsStore();
+  if(typeof s.version === 'number') out.version = s.version;
+  if(typeof s.updated === 'string') out.updated = s.updated;
+  const fns = s.functions;
+  out.functions = sanitizeFunctionList(fns);
+  return out;
+}
+
+function storeHasFunctions(store){
+  if(!store || typeof store !== 'object') return false;
+  return Array.isArray(store.functions) && store.functions.length>0;
+}
+
+function ensureFunctionsStore(){
+  if(functionsStore) return;
+  let st = null;
+  try{
+    const s = localStorage.getItem(functionsStoreKey());
+    if(s) st = normalizeFunctionsStore(JSON.parse(s));
+  }catch(e){ st = null; }
+  if(!st) st = emptyFunctionsStore();
+
+  // Seed with defaults if empty.
+  if(!storeHasFunctions(st)){
+    st.functions = defaultFunctionSpecs();
+    st.updated = new Date().toISOString();
+  }
+  functionsStore = st;
+  updateFunctionsLibraryStatus();
+}
+
+function saveLocalFunctionsStore(){
+  ensureFunctionsStore();
+  try{ localStorage.setItem(functionsStoreKey(), JSON.stringify(functionsStore||emptyFunctionsStore())); }catch(e){}
+}
+
+function scheduleFunctionsPersist(){
+  saveLocalFunctionsStore();
+  updateFunctionsLibraryStatus();
+  if(!(qeegApiOk && qeegApiToken) || !functionsServerEnabled) return;
+  if(functionsSyncing) return;
+  functionsSyncing = true;
+  setTimeout(async ()=>{
+    try{
+      await apiFetch('/api/functions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(functionsStore||emptyFunctionsStore())});
+      functionsSource = 'server';
+      updateFunctionsLibraryStatus();
+    }catch(e){
+      // keep local fallback
+      functionsSource = 'local';
+      updateFunctionsLibraryStatus();
+    }finally{
+      functionsSyncing = false;
+    }
+  }, 200);
+}
+
+async function maybeInitServerFunctions(){
+  if(!(qeegApiOk && qeegApiToken)) return;
+  if(functionsServerEnabled) return;
+  ensureFunctionsStore();
+  try{
+    const r = await apiFetch('/api/functions');
+    const j = await r.json();
+    if(!r.ok) throw new Error(j && j.error ? j.error : 'functions failed');
+    const serverStore = normalizeFunctionsStore((j && j.functions) ? j.functions : {});
+    const serverHas = storeHasFunctions(serverStore);
+    const localHas = storeHasFunctions(functionsStore);
+    functionsServerEnabled = true;
+    functionsSource = 'server';
+    if(serverHas){
+      functionsStore = serverStore;
+      saveLocalFunctionsStore();
+    } else if(localHas){
+      try{
+        await apiFetch('/api/functions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(functionsStore)});
+      }catch(e){}
+    }
+  }catch(e){
+    functionsServerEnabled = false;
+    functionsSource = 'local';
+  } finally {
+    updateFunctionsLibraryStatus();
+    maybeUpdateFunctionsUi(200);
+  }
+}
+
+function normalizeToolName(t){
+  t = String(t||'').trim();
+  if(t.toLowerCase().endsWith('.exe')) t = t.slice(0, -4);
+  return t;
+}
+
+function setServerTools(list, err){
+  qeegServerToolsError = err ? String(err||'') : '';
+  const out=[];
+  const seen=new Set();
+  if(Array.isArray(list)){
+    for(const t0 of list){
+      const t = normalizeToolName(t0);
+      if(!t) continue;
+      if(seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+    }
+  }
+  out.sort();
+  qeegServerTools = out;
+  qeegServerToolsFetchedAt = Date.now();
+}
+
+async function maybeInitServerTools(force){
+  if(!(qeegApiOk && qeegApiToken)) return;
+  const now = Date.now();
+  if(!force && qeegServerToolsFetchedAt && (now - qeegServerToolsFetchedAt) < 45000) return;
+  try{
+    const r = await apiFetch('/api/tools');
+    const j = await r.json();
+    if(!r.ok) throw new Error(j && j.error ? j.error : 'tools failed');
+    const list = (j && j.tools) ? j.tools : [];
+    setServerTools(list, (j && j.toolbox_ok===false && j.toolbox_error) ? String(j.toolbox_error) : '');
+  }catch(e){
+    setServerTools([], e && e.message ? e.message : String(e));
+  } finally {
+    try{ maybeUpdateFunctionsUi(0); }catch(e){}
+  }
+}
+
+function getKnownToolsList(){
+  const set = new Set();
+  document.querySelectorAll('.tool').forEach(el=>{
+    if(el && el.dataset && el.dataset.tool) set.add(String(el.dataset.tool));
+  });
+  if(Array.isArray(qeegServerTools)){
+    for(const t of qeegServerTools) set.add(String(t));
+  }
+  return Array.from(set).sort();
+}
+
+function serverHasTool(tool){
+  const t = normalizeToolName(tool);
+  if(!t) return false;
+  if(!Array.isArray(qeegServerTools) || qeegServerTools.length===0) return false;
+  // qeegServerTools is sorted; use simple scan for small lists.
+  return qeegServerTools.indexOf(t) >= 0;
+}
+
+function getFunctionLibrarySpecs(){
+  ensureFunctionsStore();
+  const list = (functionsStore && Array.isArray(functionsStore.functions)) ? functionsStore.functions : [];
+  return list && list.length ? list : (qeegFunctionSpecs||[]);
+}
+
+function setFunctionLibrarySpecs(list){
+  ensureFunctionsStore();
+  functionsStore.functions = sanitizeFunctionList(list);
+  functionsStore.updated = new Date().toISOString();
+  scheduleFunctionsPersist();
+  maybeUpdateFunctionsUi(150);
+}
+
+function updateFunctionsLibraryStatus(){
+  const el = document.getElementById('fnLibStatus');
+  if(!el) return;
+  const src = (functionsServerEnabled && functionsSource==='server') ? 'server' : 'local';
+  const count = (functionsStore && Array.isArray(functionsStore.functions)) ? functionsStore.functions.length : 0;
+  let extra = '';
+  if(src==='server') extra = ' (<code>qeeg_ui_functions.json</code>)';
+  el.innerHTML = 'Source: <b>'+src+'</b>' + extra + ' • ' + count + ' function(s)';
+}
+
+// --- Functions library modal helpers ---
+let fnLibImportInput = null;
+
+function openFunctionsLibrary(){
+  ensureFunctionsStore();
+  const back = document.getElementById('fnLibBackdrop');
+  if(!back) return;
+  fnLibLoadFromStore();
+  back.classList.remove('hidden');
+}
+function closeFunctionsLibrary(){
+  const back = document.getElementById('fnLibBackdrop');
+  if(back) back.classList.add('hidden');
+}
+function fnLibSetStatus(msg, isError){
+  const el = document.getElementById('fnLibStatus');
+  if(!el) return;
+  const base = el.innerHTML;
+  if(msg){
+    el.innerHTML = base + ' • ' + (isError ? '<span style="color:var(--bad)">'+esc(msg)+'</span>' : esc(msg));
+  }
+}
+
+function fnLibLoadFromStore(){
+  ensureFunctionsStore();
+  const ta = document.getElementById('fnLibText');
+  if(!ta) return;
+  const obj = functionsStore || emptyFunctionsStore();
+  ta.value = JSON.stringify(obj, null, 2);
+  updateFunctionsLibraryStatus();
+}
+
+function fnLibResetToDefaults(){
+  const ta = document.getElementById('fnLibText');
+  if(!ta) return;
+  const obj = emptyFunctionsStore();
+  obj.functions = defaultFunctionSpecs();
+  ta.value = JSON.stringify(obj, null, 2);
+  fnLibSetStatus('Reset to defaults (not saved yet).');
+}
+
+function fnLibParseTextarea(){
+  const ta = document.getElementById('fnLibText');
+  if(!ta) throw new Error('missing textarea');
+  const raw = String(ta.value||'').trim();
+  if(!raw) return emptyFunctionsStore();
+  const obj = JSON.parse(raw);
+  return normalizeFunctionsStore(obj);
+}
+
+function fnLibSaveToStore(){
+  try{
+    const st = fnLibParseTextarea();
+    if(!storeHasFunctions(st)){
+      if(!confirm('No valid functions found. Save empty library?')) return;
+    }
+    functionsStore = st;
+    functionsStore.updated = new Date().toISOString();
+    scheduleFunctionsPersist();
+    updateFunctionsLibraryStatus();
+    fnLibSetStatus('Saved.');
+  }catch(e){
+    fnLibSetStatus('Save failed: '+(e&&e.message?e.message:String(e)), true);
+  }
+}
+
+function fnLibExport(){
+  try{
+    const st = fnLibParseTextarea();
+    const data = JSON.stringify(st, null, 2);
+    const blob = new Blob([data], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'qeeg_ui_functions.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>{ try{ URL.revokeObjectURL(url);}catch(e){} }, 1500);
+  }catch(e){
+    fnLibSetStatus('Export failed: '+(e&&e.message?e.message:String(e)), true);
+  }
+}
+
+function ensureFnLibImportInput(){
+  if(fnLibImportInput) return fnLibImportInput;
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = 'application/json,.json';
+  inp.style.display = 'none';
+  inp.addEventListener('change', ()=>{
+    const file = inp.files && inp.files[0] ? inp.files[0] : null;
+    inp.value = '';
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      try{
+        const text = String(reader.result||'');
+        const obj = JSON.parse(text);
+        const st = normalizeFunctionsStore(obj);
+        const ta = document.getElementById('fnLibText');
+        if(ta) ta.value = JSON.stringify(st, null, 2);
+        updateFunctionsLibraryStatus();
+        fnLibSetStatus('Imported (not saved yet).');
+      }catch(e){
+        fnLibSetStatus('Import failed: '+(e&&e.message?e.message:String(e)), true);
+      }
+    };
+    reader.onerror = ()=>{ fnLibSetStatus('Import failed: cannot read file', true); };
+    reader.readAsText(file);
+  });
+  document.body.appendChild(inp);
+  fnLibImportInput = inp;
+  return inp;
+}
+
+function fnLibImport(){
+  const inp = ensureFnLibImportInput();
+  inp.click();
+}
+
+
+function delayMs(ms){
+  return new Promise(resolve => setTimeout(resolve, ms||0));
+}
+
+function joinRelPath(a, b){
+  a = String(a||'');
+  b = String(b||'');
+  if(!a) return b;
+  if(!b) return a;
+  if(a.endsWith('/')) a = a.slice(0, -1);
+  if(b.startsWith('/')) b = b.slice(1);
+  return a + '/' + b;
+}
+
+
+
+// --- Function Builder (compose workflows from tool run panels) ---
+let fnBuilder = null;
+let fnBuilderPersistTimer = null;
+
+function fnBuilderKey(){
+  return 'qeeg-ui-fn-builder-v1';
+}
+function fnBuilderEmpty(){
+  return {id:'custom_workflow', title:'Custom workflow', desc:'', requires:'any', needs_bin_dir:false, steps:[]};
+}
+function sanitizeFnBuilderStep(s){
+  if(!s || typeof s !== 'object') return null;
+  const tool = (typeof s.tool==='string') ? s.tool.trim() : '';
+  if(!tool) return null;
+  const out = {tool:tool, args:(typeof s.args==='string') ? s.args : ''};
+  if(typeof s.outdir_suffix==='string' && s.outdir_suffix) out.outdir_suffix = s.outdir_suffix;
+  return out;
+}
+function normalizeFnBuilder(b){
+  if(!b || typeof b!=='object') return fnBuilderEmpty();
+  const out = fnBuilderEmpty();
+  if(typeof b.id==='string') out.id = b.id;
+  if(typeof b.title==='string') out.title = b.title;
+  if(typeof b.desc==='string') out.desc = b.desc;
+  if(typeof b.requires==='string') out.requires = b.requires || 'any';
+  out.needs_bin_dir = !!b.needs_bin_dir;
+  const stepsIn = Array.isArray(b.steps) ? b.steps : [];
+  out.steps = [];
+  for(const s of stepsIn){
+    const st = sanitizeFnBuilderStep(s);
+    if(st) out.steps.push(st);
+  }
+  if(out.steps.length>50) out.steps = out.steps.slice(0,50);
+  if(out.title && !out.id) out.id = safeId(out.title, 32) || out.id;
+  return out;
+}
+function ensureFnBuilder(){
+  if(fnBuilder) return;
+  let b = null;
+  try{
+    const s = localStorage.getItem(fnBuilderKey());
+    if(s) b = normalizeFnBuilder(JSON.parse(s));
+  }catch(e){ b = null; }
+  fnBuilder = b || fnBuilderEmpty();
+}
+function persistFnBuilder(){
+  ensureFnBuilder();
+  try{ localStorage.setItem(fnBuilderKey(), JSON.stringify(fnBuilder)); }catch(e){}
+}
+function scheduleFnBuilderPersist(){
+  if(fnBuilderPersistTimer) clearTimeout(fnBuilderPersistTimer);
+  fnBuilderPersistTimer = setTimeout(()=>{ persistFnBuilder(); }, 250);
+}
+
+function fnBuilderSetField(k, v){
+  ensureFnBuilder();
+  fnBuilder[k] = v;
+  scheduleFnBuilderPersist();
+}
+function fnBuilderSetTitle(v){ fnBuilderSetField('title', String(v||'')); }
+function fnBuilderSetId(v){ fnBuilderSetField('id', String(v||'')); }
+function fnBuilderAutoId(){
+  ensureFnBuilder();
+  const base = fnBuilder.title || fnBuilder.id || 'workflow';
+  const id = safeId(base, 48) || 'workflow';
+  fnBuilder.id = id;
+  scheduleFnBuilderPersist();
+  updateFunctionsUi();
+}
+function fnBuilderSetDesc(v){ fnBuilderSetField('desc', String(v||'')); }
+function fnBuilderSetRequires(v){
+  v = String(v||'any');
+  if(v!=='none' && v!=='file' && v!=='dir' && v!=='any') v='any';
+  fnBuilderSetField('requires', v);
+}
+function fnBuilderSetNeedsBinDir(v){ fnBuilderSetField('needs_bin_dir', !!v); }
+
+function fnBuilderSetStepTool(i, tool){
+  ensureFnBuilder();
+  i = Number(i)||0;
+  if(i<0 || i>=fnBuilder.steps.length) return;
+  fnBuilder.steps[i].tool = String(tool||'');
+  scheduleFnBuilderPersist();
+}
+function fnBuilderSetStepArgs(i, args){
+  ensureFnBuilder();
+  i = Number(i)||0;
+  if(i<0 || i>=fnBuilder.steps.length) return;
+  fnBuilder.steps[i].args = String(args||'');
+  scheduleFnBuilderPersist();
+}
+function fnBuilderSetStepOutdir(i, v){
+  ensureFnBuilder();
+  i = Number(i)||0;
+  if(i<0 || i>=fnBuilder.steps.length) return;
+  const s = fnBuilder.steps[i];
+  v = String(v||'');
+  if(v){
+    s.outdir_suffix = v;
+  } else {
+    try{ delete s.outdir_suffix; }catch(e){ s.outdir_suffix = ''; }
+  }
+  scheduleFnBuilderPersist();
+}
+
+function fnBuilderAddStep(step){
+  ensureFnBuilder();
+  if(!Array.isArray(fnBuilder.steps)) fnBuilder.steps = [];
+  const st = sanitizeFnBuilderStep(step || {});
+  if(st){
+    fnBuilder.steps.push(st);
+  } else {
+    fnBuilder.steps.push({tool:'', args:''});
+  }
+  if(fnBuilder.steps.length>50) fnBuilder.steps = fnBuilder.steps.slice(0,50);
+  scheduleFnBuilderPersist();
+  updateFunctionsUi();
+}
+function fnBuilderRemoveStep(i){
+  ensureFnBuilder();
+  i = Number(i)||0;
+  if(i<0 || i>=fnBuilder.steps.length) return;
+  fnBuilder.steps.splice(i,1);
+  scheduleFnBuilderPersist();
+  updateFunctionsUi();
+}
+function fnBuilderMoveStep(i, dir){
+  ensureFnBuilder();
+  i = Number(i)||0;
+  dir = Number(dir)||0;
+  const j = i + (dir<0 ? -1 : 1);
+  if(i<0 || i>=fnBuilder.steps.length) return;
+  if(j<0 || j>=fnBuilder.steps.length) return;
+  const tmp = fnBuilder.steps[i];
+  fnBuilder.steps[i] = fnBuilder.steps[j];
+  fnBuilder.steps[j] = tmp;
+  scheduleFnBuilderPersist();
+  updateFunctionsUi();
+}
+function fnBuilderReset(){
+  if(!confirm('Reset builder?')) return;
+  fnBuilder = fnBuilderEmpty();
+  scheduleFnBuilderPersist();
+  updateFunctionsUi();
+}
+
+function fnBuilderToFunctionSpec(){
+  ensureFnBuilder();
+  const spec = {
+    id: String(fnBuilder.id||'').trim(),
+    title: String(fnBuilder.title||'').trim(),
+    desc: String(fnBuilder.desc||''),
+    requires: String(fnBuilder.requires||'any'),
+    needs_bin_dir: !!fnBuilder.needs_bin_dir,
+    steps: []
+  };
+  if(!spec.id){
+    spec.id = safeId(spec.title||'workflow', 48) || 'workflow';
+  }
+  if(!spec.title) spec.title = spec.id;
+  const steps = [];
+  for(const s of (fnBuilder.steps||[])){
+    if(!s || typeof s!=='object') continue;
+    const tool = (typeof s.tool==='string') ? s.tool.trim() : '';
+    if(!tool) continue;
+    const st = {tool: tool, args: (typeof s.args==='string') ? s.args : ''};
+    if(typeof s.outdir_suffix==='string' && s.outdir_suffix) st.outdir_suffix = s.outdir_suffix;
+    steps.push(st);
+  }
+  spec.steps = steps;
+  return sanitizeFunctionSpec(spec);
+}
+
+function upsertFunctionSpec(spec, promptOverwrite){
+  ensureFunctionsStore();
+  const s = sanitizeFunctionSpec(spec);
+  if(!s) throw new Error('invalid function spec');
+  let list = (functionsStore && Array.isArray(functionsStore.functions)) ? functionsStore.functions : [];
+  const idx = list.findIndex(x=>x && x.id===s.id);
+  if(idx>=0){
+    if(promptOverwrite){
+      if(!confirm('Function "'+s.id+'" exists. Overwrite?')) return false;
+    }
+    list[idx] = s;
+  } else {
+    list = [s].concat(list);
+  }
+  functionsStore.functions = sanitizeFunctionList(list);
+  functionsStore.updated = new Date().toISOString();
+  scheduleFunctionsPersist();
+  return true;
+}
+
+function fnBuilderSave(doRun){
+  let spec = fnBuilderToFunctionSpec();
+  if(!spec){
+    alert('Builder is empty. Add at least one step.');
+    return;
+  }
+  // Verify all tools exist on this page.
+  for(const st of spec.steps){
+    if(!findToolSectionByName(st.tool) && !serverHasTool(st.tool)){
+      alert('Tool not available on this page/server: '+st.tool);
+      return;
+    }
+  }
+  const saved = upsertFunctionSpec(spec, true);
+  if(!saved) return;
+  showToast('Saved function: '+spec.id, 2200);
+  updateFunctionsUi();
+  if(doRun){
+    setTimeout(()=>{ try{ runFunction(spec.id); }catch(e){} }, 120);
+  }
+}
+
+function getArgsValueById(argsId){
+  const el = document.getElementById(String(argsId||''));
+  if(!el) return '';
+  return String(el.value||'');
+}
+function templateArgsForFunction(args){
+  let a = String(args||'');
+  const sel = String(selectedInputPath||'');
+  const selDir = (selectedInputType==='dir') ? sel : parentDirOf(sel);
+  if(sel) a = a.split(sel).join('{{SEL}}');
+  if(selDir) a = a.split(selDir).join('{{SEL_DIR}}');
+  return a;
+}
+
+function openFunctionsSectionAndBuilder(forceOpen){
+  const sec = document.getElementById('functions');
+  if(sec) try{ sec.scrollIntoView({behavior:uiScrollBehavior(), block:'start'}); }catch(e){}
+  const det = document.getElementById('fnBuilderDetails');
+  if(det){
+    if(forceOpen===undefined || forceOpen===null) forceOpen = true;
+    if(forceOpen) det.open = true;
+  }
+}
+
+function toolAddStepToBuilder(btn){
+  const tool = btn && btn.dataset ? String(btn.dataset.tool||'') : '';
+  const argsId = btn && btn.dataset ? String(btn.dataset.argsId||'') : '';
+  if(!tool){ alert('Missing tool'); return; }
+  ensureFnBuilder();
+  let args = getArgsValueById(argsId);
+  if(!args){
+    const inp = document.getElementById(argsId);
+    if(inp && inp.dataset && inp.dataset.default) args = String(inp.dataset.default||'');
+  }
+  args = templateArgsForFunction(args);
+  fnBuilderAddStep({tool:tool, args:args});
+  openFunctionsSectionAndBuilder(true);
+  showToast('Added step: '+tool, 2000);
+}
+
+
+function makeUniqueFunctionId(base){
+  base = String(base||'').trim();
+  if(!base) base = 'function';
+  ensureFunctionsStore();
+  const existing = new Set((functionsStore.functions||[]).map(x=>x && x.id ? String(x.id) : ''));
+  let id = base;
+  let n = 1;
+  while(existing.has(id) && n < 200){
+    id = base + '_' + n;
+    n++;
+  }
+  return id;
+}
+
+
+function toolSaveAsFunction(btn){
+  const tool = btn && btn.dataset ? String(btn.dataset.tool||'') : '';
+  const argsId = btn && btn.dataset ? String(btn.dataset.argsId||'') : '';
+  if(!tool){ alert('Missing tool'); return; }
+  let args = getArgsValueById(argsId);
+  if(!args){
+    const inp = document.getElementById(argsId);
+    if(inp && inp.dataset && inp.dataset.default) args = String(inp.dataset.default||'');
+  }
+  args = templateArgsForFunction(args);
+
+  // Create a 1-step function id that won't collide.
+  const base = safeId(tool.replace(/^qeeg_/, ''), 42) || safeId(tool, 42) || 'tool';
+  const id = makeUniqueFunctionId(base);
+
+  const spec = {
+    id: id,
+    title: tool,
+    desc: '1-step function saved from tool panel.',
+    requires: 'any',
+    steps: [{tool: tool, args: args}]
+  };
+  const saved = upsertFunctionSpec(spec, false);
+  if(saved){
+    showToast('Saved 1-step function: '+id, 2400);
+    updateFunctionsUi();
+    openFunctionsSectionAndBuilder(false);
+  }
+}
+
+function templateArgsForSelPath(args, selPath){
+  let a = String(args||'');
+  const sel = String(selPath||'');
+  const selDir = sel ? parentDirOf(sel) : '';
+  if(sel) a = a.split(sel).join('{{SEL}}');
+  if(selDir) a = a.split(selDir).join('{{SEL_DIR}}');
+  return a;
+}
+
+function templateArgsForRunDir(args, runDir){
+  let a = String(args||'');
+  const rdRaw = String(runDir||'');
+  if(!rdRaw) return a;
+
+  const rdSlash = rdRaw.replace(/\\+/g,'/');
+  const rdBack = rdSlash.replace(/\//g,'\\');
+  const root = (qeegServerInfo && qeegServerInfo.root) ? String(qeegServerInfo.root||'') : '';
+  if(root){
+    const rootSlash = root.replace(/\\+/g,'/').replace(/\/+$/,'');
+    const absSlash = rootSlash + '/' + rdSlash;
+    a = a.split(absSlash).join('{{RUN_DIR_ABS}}');
+    const rootBack = root.replace(/\//g,'\\').replace(/\\+$/,'');
+    const absBack = rootBack + '\\' + rdBack;
+    a = a.split(absBack).join('{{RUN_DIR_ABS}}');
+  }
+
+  // Replace relative run dir references.
+  a = a.split(rdSlash).join('{{RUN_DIR}}');
+  a = a.split(rdBack).join('{{RUN_DIR}}');
+  return a;
+}
+
+function historyAddStepToBuilder(btn){
+  const tool = btn && btn.dataset ? String(btn.dataset.tool||'') : '';
+  let args = btn && btn.dataset ? String(btn.dataset.args||'') : '';
+  const input = btn && btn.dataset ? String(btn.dataset.input||'') : '';
+  if(!tool){ alert('Missing tool'); return; }
+  ensureFnBuilder();
+  if(args){
+    if(input) args = templateArgsForSelPath(args, input);
+    else args = templateArgsForFunction(args);
+  }
+  fnBuilderAddStep({tool:tool, args:args});
+  openFunctionsSectionAndBuilder(true);
+  showToast('Added history step: '+tool, 2000);
+}
+
+function historySaveAsFunction(btn){
+  const tool = btn && btn.dataset ? String(btn.dataset.tool||'') : '';
+  let args = btn && btn.dataset ? String(btn.dataset.args||'') : '';
+  const input = btn && btn.dataset ? String(btn.dataset.input||'') : '';
+  if(!tool){ alert('Missing tool'); return; }
+  if(args){
+    if(input) args = templateArgsForSelPath(args, input);
+    else args = templateArgsForFunction(args);
+  }
+
+  const base = safeId('hist_' + tool.replace(/^qeeg_/, ''), 42) || safeId('hist_' + tool, 42) || 'hist_tool';
+  const id = makeUniqueFunctionId(base);
+
+  const spec = {
+    id: id,
+    title: tool,
+    desc: '1-step function saved from history run.',
+    requires: 'any',
+    steps: [{tool: tool, args: args}]
+  };
+  const saved = upsertFunctionSpec(spec, false);
+  if(saved){
+    showToast('Saved function from history: '+id, 2400);
+    updateFunctionsUi();
+    openFunctionsSectionAndBuilder(false);
+  }
+}
+
+function historyPlanRun(btn){
+  const tool = btn && btn.dataset ? String(btn.dataset.tool||'') : '';
+  const args = btn && btn.dataset ? String(btn.dataset.args||'') : '';
+  const input = btn && btn.dataset ? String(btn.dataset.input||'') : '';
+  if(!tool){ alert('Missing tool'); return; }
+
+  const spec = {
+    id: 'hist_plan_' + (safeId(tool.replace(/^qeeg_/, ''), 24) || safeId(tool, 24) || 'tool'),
+    title: 'History run: ' + tool,
+    desc: 'Planned from a past UI run (history).',
+    requires: 'any',
+    steps: [{tool: tool, args: args}]
+  };
+
+  // Use the recorded input path (if available) for placeholder expansion. We treat it as a file by default.
+  openFnPlanWithSpec(spec, 'history', {sel_path: input || '', sel_type: 'file'});
+}
+
+async function historyRerun(btn){
+  if(!(qeegApiOk && qeegApiToken)){
+    alert('Rerun requires qeeg_ui_server_cli.');
+    return;
+  }
+  const tool = btn && btn.dataset ? String(btn.dataset.tool||'') : '';
+  let args = btn && btn.dataset ? String(btn.dataset.args||'') : '';
+  const runDir = btn && btn.dataset ? String(btn.dataset.runDir||'') : '';
+  if(!tool){ alert('Missing tool'); return; }
+  if(!args){ alert('Missing args'); return; }
+  if(runDir) args = templateArgsForRunDir(args, runDir);
+
+  const payload = {
+    tool: tool,
+    args: args,
+    group_dir: 'history_rerun',
+    run_name: 'rerun_' + (safeId(tool.replace(/^qeeg_/, ''), 24) || safeId(tool, 24) || 'tool')
+  };
+
+  try{
+    const r = await apiFetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j && j.error ? j.error : 'run failed');
+    const st = (j && j.status) ? String(j.status) : 'started';
+    showToast('Rerun '+st+': '+tool, 2400);
+    try{ setRunsView('session'); }catch(e){}
+    try{ refreshHistory(true); }catch(e){}
+  }catch(e){
+    alert('Rerun failed: ' + (e && e.message ? e.message : String(e)));
+  }
+}
+
+
+function getAvailableFunctions(){
+  const out=[];
+  for(const f of getFunctionLibrarySpecs()){
+    if(!f || !f.id || !f.steps || !f.steps.length) continue;
+    let ok=true;
+    for(const st of f.steps){
+      if(!st || !st.tool) { ok=false; break; }
+      if(!findToolSectionByName(st.tool) && !serverHasTool(st.tool)) { ok=false; break; }
+    }
+    if(ok) out.push(f);
+  }
+  return out;
+}
+
+function functionSelectionOk(f){
+  if(!f) return false;
+  const req = (f && f.requires) ? String(f.requires) : 'none';
+
+  // Some functions need server-provided config (e.g., --bin-dir for bundling).
+  if(f.needs_bin_dir){
+    const bd = (qeegServerInfo && qeegServerInfo.bin_dir) ? String(qeegServerInfo.bin_dir) : '';
+    if(!bd) return false;
+  }
+
+  if(req==='none') return true;
+  if(!selectedInputPath) return false;
+  if(req==='dir') return selectedInputType==='dir';
+  if(req==='file') return selectedInputType!=='dir';
+  return true; // 'any'
+}
+
+function expandFnArgs(tpl, ctx){
+  let s = String(tpl||'');
+
+  // Selection placeholders. Only replace when we actually have a value, so a
+  // missing selection doesn't silently turn into an empty argument.
+  const sel = (ctx && ctx.sel) ? String(ctx.sel) : '';
+  const selDir = (ctx && ctx.selDir) ? String(ctx.selDir) : '';
+  if(selDir) s = s.replace(/\{\{SEL_DIR\}\}/g, quoteArgIfNeeded(selDir));
+  if(sel) s = s.replace(/\{\{SEL\}\}/g, quoteArgIfNeeded(sel));
+
+  // Server-provided placeholders (only replace when known; otherwise keep the
+  // placeholder in place so the user can see what's missing).
+  const binDir = (ctx && ctx.server && ctx.server.bin_dir) ? String(ctx.server.bin_dir) : '';
+  if(binDir) s = s.replace(/\{\{BIN_DIR\}\}/g, quoteArgIfNeeded(binDir));
+
+  const rootAbs = (ctx && ctx.server && ctx.server.root) ? String(ctx.server.root) : '';
+  if(rootAbs) s = s.replace(/\{\{SERVER_ROOT\}\}/g, quoteArgIfNeeded(rootAbs));
+
+  const toolboxExe = (ctx && ctx.server && ctx.server.toolbox_exe) ? String(ctx.server.toolbox_exe) : '';
+  if(toolboxExe) s = s.replace(/\{\{TOOLBOX_EXE\}\}/g, quoteArgIfNeeded(toolboxExe));
+
+  // Step placeholders: {{STEP0_RUN_DIR}}, {{STEP0_OUTDIR}}, ...
+  s = s.replace(/\{\{STEP(\d+)_RUN_DIR\}\}/g, function(m, n){
+    const i = parseInt(n, 10);
+    const rd = (ctx && ctx.steps && ctx.steps[i] && ctx.steps[i].run_dir) ? String(ctx.steps[i].run_dir) : '';
+    if(!rd) return m;
+    return quoteArgIfNeeded(rd);
+  });
+  s = s.replace(/\{\{STEP(\d+)_OUTDIR\}\}/g, function(m, n){
+    const i = parseInt(n, 10);
+    const od = (ctx && ctx.steps && ctx.steps[i] && ctx.steps[i].outdir) ? String(ctx.steps[i].outdir) : '';
+    if(!od) return m;
+    return quoteArgIfNeeded(od);
+  });
+
+  return s;
+}
+
+// --- Function plan / export (copy as headless CLI commands) ---
+let fnPlanState = null; // {spec, source, group_dir, title, mode, view, sel_override, lastFocus}
+
+function openFnPlanForFunction(fnId){
+  const lib = getFnLib();
+  const fns = (lib && Array.isArray(lib.functions)) ? lib.functions : [];
+  const f = fns.find(x => x && x.id === fnId);
+  if(!f){ alert('Function not found: ' + fnId); return; }
+  openFnPlanWithSpec(f, 'function');
+}
+
+function openFnPlanForBuilder(){
+  const spec = fnBuilderToFunctionSpec();
+  if(!spec || !spec.steps || spec.steps.length===0){
+    alert('Builder has no steps.');
+    return;
+  }
+  openFnPlanWithSpec(spec, 'builder');
+}
+
+function openFnPlanWithSpec(spec, source, opts){
+  if(!spec) return;
+  const title = (spec.title || spec.id || 'Workflow');
+  const groupDir = nowCompactLocal() + '_plan_' + safeId(spec.id || title, 24);
+
+  opts = (opts && typeof opts === 'object') ? opts : {};
+  const selOverridePath = String(opts.sel_path || '').trim();
+  const selOverrideType = String(opts.sel_type || '').trim();
+  const selOverride = selOverridePath ? {path: selOverridePath, type: (selOverrideType==='dir' ? 'dir' : 'file')} : null;
+
+  const canExpand = !!selectedInputPath || (selOverride && selOverride.path);
+
+  let mode = 'template';
+  if(canExpand) mode = 'expanded';
+  try{
+    const pm = localStorage.getItem('qeeg_fn_plan_mode');
+    if(pm==='expanded' || pm==='template') mode = pm;
+  }catch(_e){}
+  if(mode==='expanded' && !canExpand) mode='template';
+
+  let view = 'cmd';
+  try{
+    const pv = localStorage.getItem('qeeg_fn_plan_view');
+    if(pv==='cmd' || pv==='bash' || pv==='ps') view = pv;
+  }catch(_e){}
+
+  fnPlanState = {
+    spec: spec,
+    source: source || 'function',
+    group_dir: groupDir,
+    title: title,
+    mode: mode,
+    view: view,
+    sel_override: selOverride,
+    lastFocus: document.activeElement
+  };
+
+  renderFnPlan();
+  const back = document.getElementById('fnPlanBackdrop');
+  if(back) back.classList.remove('hidden');
+}
+
+function closeFnPlan(){
+  const back = document.getElementById('fnPlanBackdrop');
+  if(back) back.classList.add('hidden');
+  const lf = fnPlanState ? fnPlanState.lastFocus : null;
+  fnPlanState = null;
+  if(lf && typeof lf.focus==='function'){ try{ lf.focus(); }catch(_e){} }
+}
+
+function setFnPlanView(view){
+  if(!fnPlanState) return;
+  view = (view==='bash' || view==='ps') ? view : 'cmd';
+  fnPlanState.view = view;
+  try{ localStorage.setItem('qeeg_fn_plan_view', view); }catch(_e){}
+  renderFnPlan();
+}
+
+function setFnPlanMode(mode){
+  if(!fnPlanState) return;
+  mode = (mode==='template') ? 'template' : 'expanded';
+  const hasSel = !!selectedInputPath || (fnPlanState && fnPlanState.sel_override && fnPlanState.sel_override.path);
+  if(mode==='expanded' && !hasSel) mode = 'template';
+  fnPlanState.mode = mode;
+  try{ localStorage.setItem('qeeg_fn_plan_mode', mode); }catch(_e){}
+  renderFnPlan();
+}
+
+function fnPlanCopy(){
+  const txt = document.getElementById('fnPlanText');
+  if(!txt) return;
+  navigator.clipboard.writeText(String(txt.value||'')).then(()=>{showToast('Copied');},()=>{});
+}
+
+function renderFnPlan(){
+  if(!fnPlanState) return;
+
+  const titleEl = document.getElementById('fnPlanTitle');
+  const metaEl = document.getElementById('fnPlanMeta');
+  const modeSel = document.getElementById('fnPlanMode');
+  const txtEl = document.getElementById('fnPlanText');
+  const stEl = document.getElementById('fnPlanStatus');
+
+  if(titleEl){
+    const prefix = (fnPlanState.source==='builder') ? 'Builder plan' : (fnPlanState.source==='history') ? 'History plan' : 'Function plan';
+    titleEl.textContent = prefix + ': ' + (fnPlanState.title||'');
+  }
+  if(modeSel){
+    modeSel.value = fnPlanState.mode;
+    const hasSel = !!selectedInputPath || (fnPlanState && fnPlanState.sel_override && fnPlanState.sel_override.path);
+    modeSel.disabled = (!hasSel);
+  }
+
+  const view = fnPlanState.view || 'cmd';
+  const t1 = document.getElementById('fnPlanTabCmd');
+  const t2 = document.getElementById('fnPlanTabBash');
+  const t3 = document.getElementById('fnPlanTabPs');
+  if(t1) t1.classList.toggle('active', view==='cmd');
+  if(t2) t2.classList.toggle('active', view==='bash');
+  if(t3) t3.classList.toggle('active', view==='ps');
+
+  const plan = buildFnPlanTexts(fnPlanState.spec, fnPlanState.group_dir, fnPlanState.mode, fnPlanState.sel_override);
+
+  if(metaEl) metaEl.innerHTML = plan.metaHtml;
+  if(stEl) stEl.textContent = plan.status || '';
+
+  if(txtEl){
+    txtEl.value = (view==='bash') ? plan.bash : (view==='ps') ? plan.ps : plan.cmd;
+    try{ txtEl.scrollTop = 0; }catch(_e){}
+  }
+}
+
+function buildFnPlanTexts(spec, groupDir, mode, selOverride){
+  spec = spec || {};
+  groupDir = String(groupDir||'').trim();
+  if(!groupDir) groupDir = nowCompactLocal() + '_workflow';
+  mode = (mode==='template') ? 'template' : 'expanded';
+
+  selOverride = (selOverride && typeof selOverride === 'object') ? selOverride : null;
+  const overridePath = selOverride && selOverride.path ? String(selOverride.path) : '';
+  const overrideType = selOverride && selOverride.type ? String(selOverride.type) : '';
+  const globalPath = selectedInputPath ? String(selectedInputPath) : '';
+  const usePath = overridePath || globalPath;
+  const useType = overridePath ? (overrideType || 'file') : (selectedInputType || 'file');
+  const hasSel = !!usePath;
+  const selIsDir = (useType === 'dir');
+  const selPath = (mode==='expanded' && hasSel) ? usePath : '';
+  const selDirPath = (mode==='expanded' && hasSel)
+    ? (selIsDir ? usePath : parentDirOf(usePath))
+    : '';
+
+  const server = qeegServerInfo || {};
+  const serverCtx = (mode==='expanded') ? {
+    root: server.root || '',
+    bin_dir: server.bin_dir || '',
+    toolbox_exe: server.toolbox_exe || '',
+    platform: server.platform || ''
+  } : {
+    root: '{{SERVER_ROOT}}',
+    bin_dir: '{{BIN_DIR}}',
+    toolbox_exe: '{{TOOLBOX_EXE}}',
+    platform: server.platform || ''
+  };
+
+  const ctx = {
+    sel: selPath,
+    selDir: selDirPath,
+    group_dir: groupDir,
+    server: serverCtx,
+    steps: []
+  };
+
+  const steps = (spec && Array.isArray(spec.steps)) ? spec.steps : [];
+  const groupRel = joinRelPath('ui_runs', groupDir);
+  const rootAbs = (serverCtx && serverCtx.root) ? String(serverCtx.root) : '';
+
+  const cmdLines = [];
+  const bash = [];
+  const ps = [];
+
+  const title = (spec.title || spec.id || 'Workflow');
+  cmdLines.push('# ' + title);
+  cmdLines.push('# group_dir: ' + groupDir);
+  if(mode==='expanded' && hasSel){
+    cmdLines.push('# selection: ' + selPath);
+  }else{
+    cmdLines.push('# selection: {{SEL}} (placeholder)');
+  }
+  cmdLines.push('');
+
+  // Bash script header
+  bash.push('#!/usr/bin/env bash');
+  bash.push('set -euo pipefail');
+  bash.push('');
+  bash.push('ROOT="${ROOT:-.}"');
+  bash.push('cd "$ROOT"');
+  bash.push('');
+  if(mode==='expanded' && hasSel){
+    bash.push('SEL=' + bashQuoteLiteral(selPath));
+  }else{
+    bash.push('SEL="${SEL:-path/to/file_or_dir}"');
+  }
+  if(mode==='expanded' && hasSel && selIsDir){
+    bash.push('SEL_DIR="${SEL_DIR:-$SEL}"');
+  }else{
+    bash.push('SEL_DIR="${SEL_DIR:-$(dirname "$SEL")}"');
+  }
+  const binDefault = (mode==='expanded' && serverCtx.bin_dir) ? String(serverCtx.bin_dir) : '{{BIN_DIR}}';
+  const tbDefault = (mode==='expanded' && serverCtx.toolbox_exe) ? String(serverCtx.toolbox_exe) : '{{TOOLBOX_EXE}}';
+  bash.push('BIN_DIR="${BIN_DIR:-' + bashEscapeParamDefault(binDefault) + '}"');
+  bash.push('TOOLBOX_EXE="${TOOLBOX_EXE:-' + bashEscapeParamDefault(tbDefault) + '}"');
+  bash.push('SERVER_ROOT="${SERVER_ROOT:-$ROOT}"');
+  bash.push('');
+  bash.push('GROUP_DIR=' + bashQuoteLiteral(groupRel));
+  bash.push('mkdir -p "$GROUP_DIR"');
+  bash.push('');
+
+  // PowerShell script header (best effort)
+  ps.push('# PowerShell script (best effort)');
+  ps.push('$ErrorActionPreference = "Stop"');
+  ps.push('$ROOT = $env:ROOT; if([string]::IsNullOrEmpty($ROOT)){ $ROOT = "." }');
+  ps.push('Set-Location $ROOT');
+  if(mode==='expanded' && hasSel){
+    ps.push('$SEL = ' + psQuoteLiteral(selPath));
+  }else{
+    ps.push('$SEL = $env:SEL; if([string]::IsNullOrEmpty($SEL)){ $SEL = ' + psQuoteLiteral('path\\to\\file_or_dir') + ' }');
+  }
+  if(mode==='expanded' && hasSel && selIsDir){
+    ps.push('$SEL_DIR = $env:SEL_DIR; if([string]::IsNullOrEmpty($SEL_DIR)){ $SEL_DIR = $SEL }');
+  }else{
+    ps.push('$SEL_DIR = $env:SEL_DIR; if([string]::IsNullOrEmpty($SEL_DIR)){ $SEL_DIR = Split-Path -Parent $SEL }');
+  }
+  const psBinDefault = (mode==='expanded' && serverCtx.bin_dir) ? String(serverCtx.bin_dir) : '{{BIN_DIR}}';
+  const psTbDefault = (mode==='expanded' && serverCtx.toolbox_exe) ? String(serverCtx.toolbox_exe) : '{{TOOLBOX_EXE}}';
+  ps.push('$BIN_DIR = $env:BIN_DIR; if([string]::IsNullOrEmpty($BIN_DIR)){ $BIN_DIR = ' + psQuoteLiteral(psBinDefault) + ' }');
+  ps.push('$TOOLBOX_EXE = $env:TOOLBOX_EXE; if([string]::IsNullOrEmpty($TOOLBOX_EXE)){ $TOOLBOX_EXE = ' + psQuoteLiteral(psTbDefault) + ' }');
+  ps.push('$SERVER_ROOT = $env:SERVER_ROOT; if([string]::IsNullOrEmpty($SERVER_ROOT)){ $SERVER_ROOT = $ROOT }');
+  ps.push('');
+  ps.push('$GROUP_DIR = ' + psQuoteLiteral(groupRel));
+  ps.push('New-Item -ItemType Directory -Force -Path $GROUP_DIR | Out-Null');
+  ps.push('');
+
+  // Precompute planned step directories (for cross-step placeholders).
+  const planSteps = [];
+  for(let i=0;i<steps.length;i++){
+    const st = steps[i] || {};
+    const tool = String(st.tool||'').trim();
+    if(!tool){ planSteps.push(null); continue; }
+    const toolSafe = safeId(tool, 32);
+    const stepRel = joinRelPath(groupRel, 'step' + String(i+1).padStart(2,'0') + '_' + toolSafe);
+    const stepAbs = rootAbs ? joinRelPath(rootAbs, stepRel) : '';
+    const outdir = st.outdir_suffix ? joinRelPath(stepRel, String(st.outdir_suffix)) : '';
+    planSteps.push({tool:tool, stepRel:stepRel, stepAbs:stepAbs, outdir:outdir});
+  }
+
+  // Declare step variables in scripts for convenience.
+  for(let i=0;i<planSteps.length;i++){
+    const p = planSteps[i];
+    if(!p) continue;
+    bash.push('STEP' + i + '_RUN_DIR=' + bashQuoteLiteral(p.stepRel));
+    if(p.outdir) bash.push('STEP' + i + '_OUTDIR=' + bashQuoteLiteral(p.outdir));
+    ps.push('$STEP' + i + '_RUN_DIR = ' + psQuoteLiteral(p.stepRel));
+    if(p.outdir) ps.push('$STEP' + i + '_OUTDIR = ' + psQuoteLiteral(p.outdir));
+  }
+  if(planSteps.some(p=>p)){
+    bash.push('');
+    ps.push('');
+  }
+
+  // Build the commands.
+  for(let i=0;i<steps.length;i++){
+    const st = steps[i] || {};
+    const p = planSteps[i];
+    const tool = p ? p.tool : String(st.tool||'').trim();
+    if(!tool) continue;
+
+    const stepRel = p ? p.stepRel : joinRelPath(groupRel, 'step'+String(i+1).padStart(2,'0'));
+    const stepAbs = p ? p.stepAbs : '';
+    const outdir = p ? p.outdir : '';
+
+    // Populate ctx.steps for {{STEPn_*}} expansions.
+    ctx.steps[i] = {tool: tool, run_dir: stepRel, run_dir_abs: stepAbs, outdir: outdir};
+
+    // Expand args for the commands view.
+    let args = expandFnArgs(String(st.args||''), ctx);
+    args = args.replace(/\{\{RUN_DIR\}\}/g, quoteArgIfNeeded(stepRel));
+    if(stepAbs){
+      args = args.replace(/\{\{RUN_DIR_ABS\}\}/g, quoteArgIfNeeded(stepAbs));
+    }
+
+    const cmd = (tool + ' ' + args).trim();
+
+    cmdLines.push('# Step ' + (i+1) + ': ' + tool);
+    cmdLines.push('#   run_dir: ' + stepRel + (outdir ? ('  outdir: ' + outdir) : ''));
+    cmdLines.push(cmd);
+    cmdLines.push('');
+
+    // Bash script: replace placeholders with bash variables when in template mode.
+    let bashCmd = cmd;
+    if(mode !== 'expanded'){
+      bashCmd = bashCmd
+        .replace(/\{\{SEL_DIR\}\}/g, '"$SEL_DIR"')
+        .replace(/\{\{SEL\}\}/g, '"$SEL"')
+        .replace(/\{\{BIN_DIR\}\}/g, '"$BIN_DIR"')
+        .replace(/\{\{SERVER_ROOT\}\}/g, '"$SERVER_ROOT"')
+        .replace(/\{\{TOOLBOX_EXE\}\}/g, '"$TOOLBOX_EXE"');
+      // STEP placeholders (if any remain) -> bash vars
+      bashCmd = bashCmd.replace(/\{\{STEP(\d+)_RUN_DIR\}\}/g, '"$STEP$1_RUN_DIR"');
+      bashCmd = bashCmd.replace(/\{\{STEP(\d+)_OUTDIR\}\}/g, '"$STEP$1_OUTDIR"');
+    }
+    bash.push('# Step ' + (i+1) + ': ' + tool);
+    bash.push('mkdir -p ' + bashQuoteLiteral(stepRel));
+    bash.push(bashCmd);
+    bash.push('');
+
+    // PowerShell script: replace placeholders with PS variables (best-effort).
+    let psCmd = cmd;
+    if(mode !== 'expanded'){
+      psCmd = psCmd
+        .replace(/\{\{SEL_DIR\}\}/g, '$SEL_DIR')
+        .replace(/\{\{SEL\}\}/g, '$SEL')
+        .replace(/\{\{BIN_DIR\}\}/g, '$BIN_DIR')
+        .replace(/\{\{SERVER_ROOT\}\}/g, '$SERVER_ROOT')
+        .replace(/\{\{TOOLBOX_EXE\}\}/g, '$TOOLBOX_EXE');
+      psCmd = psCmd.replace(/\{\{STEP(\d+)_RUN_DIR\}\}/g, '$STEP$1_RUN_DIR');
+      psCmd = psCmd.replace(/\{\{STEP(\d+)_OUTDIR\}\}/g, '$STEP$1_OUTDIR');
+    }
+    ps.push('# Step ' + (i+1) + ': ' + tool);
+    ps.push('New-Item -ItemType Directory -Force -Path ' + psQuoteLiteral(stepRel) + ' | Out-Null');
+    ps.push(psCmd);
+    ps.push('');
+  }
+
+  // Meta
+  const meta = [];
+  meta.push('<b>Group</b>: <code>' + esc(groupDir) + '</code>');
+  meta.push('<b>Mode</b>: ' + esc(mode));
+  if(mode==='expanded' && hasSel){
+    meta.push('<b>Selection</b>: <code>' + esc(selPath) + '</code>');
+  }else{
+    meta.push('<b>Selection</b>: <code>{{SEL}}</code>');
+    meta.push('<span style="color:var(--muted)">• pick a selection to enable Expanded</span>');
+  }
+  if(serverCtx && serverCtx.platform){
+    meta.push('<span style="color:var(--muted)">• server: ' + esc(serverCtx.platform) + '</span>');
+  }
+
+  let status = '';
+  if(mode==='expanded' && !hasSel) status = 'No selection; use Template mode.';
+  if(mode==='expanded' && spec && spec.requires && spec.requires!=='any'){
+    if(!functionSelectionOk(spec.requires)) status = 'Selection may not satisfy function requirement.';
+  }
+
+  return {cmd: cmdLines.join('\n'), bash: bash.join('\n'), ps: ps.join('\n'), metaHtml: meta.join(' '), status: status};
+}
+
+function bashQuoteLiteral(s){
   s = String(s||'');
-  if(s==='') return '""';
-  if(/[ \t\n\r"]/g.test(s) || s.includes("'")){
-    return '"'+s.replace(/\\/g,'\\\\').replace(/"/g,'\\"')+'"';
+  if(s==='') return "''";
+  // Single-quote, with standard bash escape for embedded single quotes.
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+function bashEscapeParamDefault(s){
+  // Escape a default value that will appear inside double quotes.
+  s = String(s||'');
+  return s.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\$/g,'\\$').replace(/`/g,'\\`');
+}
+function psQuoteLiteral(s){
+  s = String(s||'');
+  // PowerShell single-quote escaping: '' becomes a literal '
+  return "'" + s.replace(/'/g, "''") + "'";
+}
+
+function setFnStatus(fnId, html){
+  const el=document.getElementById('fn_'+fnId+'_status');
+  if(el) el.innerHTML = html;
+}
+
+function renderFunctionsPanel(){
+  const panel=document.getElementById('functionsPanel');
+  if(!panel) return;
+  ensureFnBuilder();
+  const b = fnBuilder || fnBuilderEmpty();
+
+  const fns = getAvailableFunctions();
+  const toolList = getKnownToolsList();
+
+  let html = '';
+  html += '<div class="small">Curated workflows that run multiple tools and keep outputs under <code>ui_runs/</code>. Use the selection bar above to choose an input first.</div>';
+  html += '<div style="margin-top:8px;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">';
+  html += '<div class="small" style="color:var(--muted)">Library: <b>'+esc(functionsSource||'local')+'</b></div>';
+  html += '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">';
+  html += '<button class="btn chip" type="button" onclick="openFunctionsLibrary()">Edit library</button>';
+  html += '</div></div>';
+
+  // Builder
+  html += '<details id="fnBuilderDetails" style="margin-top:10px" open>';
+  html += '<summary><b>Function builder</b> <span class="pill">compose</span></summary>';
+  html += '<div class="small" style="margin-top:6px;color:var(--muted)">';
+  html += 'Turn tool commands into reusable workflows. Tip: on any tool, click <b>Add step to builder</b>. ';
+  html += 'Only import workflows from sources you trust — they execute local commands. ';
+  html += '<a href="https://owasp.org/www-community/attacks/Command_Injection" target="_blank" rel="noopener">Security note</a>.';
+  html += '</div>';
+
+  html += '<div class="card" style="margin-top:10px;padding:10px">';
+
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:end">';
+  html += '<div><div class="small">Title</div><input class="input" value="'+esc(b.title||'')+'" oninput="fnBuilderSetTitle(this.value)"></div>';
+  html += '<div><div class="small">Id</div><div style="display:flex;gap:8px;align-items:center">';
+  html += '<input class="input" value="'+esc(b.id||'')+'" oninput="fnBuilderSetId(this.value)">';
+  html += '<button class="btn chip" type="button" onclick="fnBuilderAutoId()">Auto</button>';
+  html += '</div></div>';
+  html += '</div>';
+
+  html += '<div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:center">';
+  html += '<div><div class="small">Requires selection</div><select class="input" onchange="fnBuilderSetRequires(this.value)">';
+  const req = String(b.requires||'any');
+  const opt = (val, label)=>{ html += '<option value="'+esc(val)+'" '+(req===val?'selected':'')+'>'+esc(label)+'</option>'; };
+  opt('any','Any (file or folder)');
+  opt('file','File');
+  opt('dir','Folder');
+  opt('none','None (server only)');
+  html += '</select></div>';
+  html += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:18px">';
+  html += '<label class="small"><input type="checkbox" '+(b.needs_bin_dir?'checked':'')+' onchange="fnBuilderSetNeedsBinDir(this.checked)"> Needs server <code>bin_dir</code></label>';
+  html += '</div>';
+  html += '</div>';
+
+  html += '<div style="margin-top:10px"><div class="small">Description</div>';
+  html += '<textarea class="input" style="min-height:70px" oninput="fnBuilderSetDesc(this.value)">'+esc(b.desc||'')+'</textarea>';
+  html += '<div class="small" style="margin-top:6px;color:var(--muted)">Placeholders: <code>{{SEL}}</code>, <code>{{SEL_DIR}}</code>, <code>{{RUN_DIR}}</code>, <code>{{STEP0_OUTDIR}}</code>, <code>{{BIN_DIR}}</code>.</div>';
+  html += '</div>';
+
+  html += '<div style="margin-top:10px"><div class="small" style="color:var(--muted)">Steps</div></div>';
+
+  const steps = Array.isArray(b.steps) ? b.steps : [];
+  if(steps.length===0){
+    html += '<div class="small" style="margin-top:6px;color:var(--muted)">No steps yet. Add from a tool panel, or click <b>Add step</b> below.</div>';
+  } else {
+    for(let i=0;i<steps.length;i++){
+      const s = steps[i] || {};
+      const tool = String(s.tool||'');
+      const args = String(s.args||'');
+      const od = String(s.outdir_suffix||'');
+
+      html += '<div class="card" style="margin-top:8px;padding:10px">';
+      html += '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">';
+      html += '<div><b>Step '+(i+1)+'</b></div>';
+      html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+      html += '<button class="btn chip" type="button" '+(i===0?'disabled':'')+' onclick="fnBuilderMoveStep('+i+',-1)">Up</button>';
+      html += '<button class="btn chip" type="button" '+(i+1>=steps.length?'disabled':'')+' onclick="fnBuilderMoveStep('+i+',1)">Down</button>';
+      html += '<button class="btn chip" type="button" onclick="fnBuilderRemoveStep('+i+')">Remove</button>';
+      html += '</div>';
+      html += '</div>';
+
+      html += '<div style="margin-top:8px;display:grid;grid-template-columns:1fr;gap:8px">';
+      html += '<div><div class="small">Tool</div><select class="input" onchange="fnBuilderSetStepTool('+i+',this.value)">';
+      html += '<option value="">(choose tool)</option>';
+      for(const t of toolList){
+        html += '<option value="'+esc(t)+'" '+(t===tool?'selected':'')+'>'+esc(t)+'</option>';
+      }
+      html += '</select></div>';
+      html += '<div><div class="small">Args</div><textarea class="input" style="min-height:60px" oninput="fnBuilderSetStepArgs('+i+',this.value)">'+esc(args)+'</textarea></div>';
+      html += '<div><div class="small">outdir_suffix (optional)</div><input class="input" placeholder="e.g. out_map" value="'+esc(od)+'" oninput="fnBuilderSetStepOutdir('+i+',this.value)"></div>';
+      html += '</div>';
+
+      html += '</div>';
+    }
+  }
+
+  html += '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">';
+  html += '<button class="btn" type="button" onclick="fnBuilderAddStep()">Add step</button>';
+  html += '<button class="btn" type="button" onclick="fnBuilderSave(false)">Save as function</button>';
+  html += '<button class="btn" type="button" onclick="fnBuilderSave(true)">Save &amp; Run</button>';
+  html += '<button class="btn" type="button" onclick="openFnPlanForBuilder()">Plan / Export</button>';
+  html += '<button class="btn" type="button" onclick="fnBuilderReset()">Reset builder</button>';
+  html += '</div>';
+
+  html += '</div>';
+  html += '</details>';
+
+  if(fns.length===0){
+    html += '<div style="margin-top:8px">No functions available (tools missing from this build).</div>';
+    panel.innerHTML = html;
+    return;
+  }
+
+  html += '<div style="margin-top:10px;display:flex;flex-direction:column;gap:10px">';
+  for(const f of fns){
+    const st = fnRuns[f.id] || {};
+    const running = !!st.running;
+    const canRun = (qeegApiOk && qeegApiToken && functionSelectionOk(f) && !running);
+    const req2 = String(f.requires||'any');
+    let selHint = (req2==='file') ? 'Requires: file selection' :
+                  (req2==='dir' ? 'Requires: folder selection' :
+                  (req2==='any' ? 'Requires: any selection' :
+                  (req2==='none' ? 'Requires: server only' : '')));
+    if(f.needs_bin_dir){
+      selHint = (selHint ? (selHint + '; ') : '') + 'Needs: server bin_dir' + ((qeegServerInfo && qeegServerInfo.bin_dir) ? '' : ' (missing)');
+    }
+
+    html += '<div class="card" style="padding:10px">';
+    html += '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">';
+    html += '<div style="flex:1">';
+    html += '<div><b>'+esc(f.title)+'</b></div>';
+    html += '<div class="small" style="margin-top:2px;color:var(--muted)">'+esc(f.desc||'')+'</div>';
+    if(selHint) html += '<div class="small" style="margin-top:2px;color:var(--muted)">'+esc(selHint)+'</div>';
+    html += '<div class="small" style="margin-top:6px">Steps: ';
+    for(let i=0;i<f.steps.length;i++){
+      const t = f.steps[i].tool||'';
+      html += '<code>'+esc(t)+'</code>' + (i+1<f.steps.length?' &rarr; ':'');
+    }
+    html += '</div>';
+    html += '</div>';
+
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">';
+    html += '<button class="btn" type="button" id="fn_'+escJs(f.id)+'_run" '+(canRun?'':'disabled')+' onclick="runFunction(\''+escJs(f.id)+'\')">Run</button>';
+    html += '<button class="btn" type="button" onclick="openFnPlanForFunction(\''+escJs(f.id)+'\')">Plan</button>';
+    html += '<button class="btn" type="button" id="fn_'+escJs(f.id)+'_stop" '+(running?'':'disabled')+' onclick="stopFunction(\''+escJs(f.id)+'\')">Stop</button>';
+    html += '</div>';
+    html += '</div>';
+
+    html += '<div class="small" id="fn_'+escJs(f.id)+'_status" style="margin-top:8px;color:var(--muted)">';
+    if(running){
+      html += '<b>Running…</b>';
+    } else {
+      if(!(qeegApiOk && qeegApiToken)) html += 'Connect via <code>qeeg_ui_server_cli</code> to enable runs.';
+      else if(!functionSelectionOk(f)) html += 'Select an input above to enable.';
+      else html += 'Ready.';
+    }
+    html += '</div>';
+
+    // If we have step history, show it.
+    if(st.steps && st.steps.length){
+      html += '<details style="margin-top:8px" '+(running?'open':'')+'>'; 
+      html += '<summary><b>Progress</b></summary>';
+      html += '<div class="small" style="margin-top:6px">';
+      if(st.group_dir){
+        let g = String(st.group_dir||'');
+        if(g && !g.startsWith('ui_runs/')) g = 'ui_runs/' + g;
+        if(g){
+          const gHref = (g.endsWith('/')) ? g : (g + '/');
+          html += '<div style="margin-bottom:6px"><b>Group folder:</b> <a href="'+esc(gHref)+'" target="_blank" rel="noopener"><code>'+esc(g)+'</code></a> <button class="btn chip" type="button" onclick="browseInWorkspace(\''+escJs(g)+'\')">Browse</button></div>';
+        }
+      }
+      html += '<div style="display:flex;flex-direction:column;gap:6px">';
+      for(let i=0;i<st.steps.length;i++){
+        const si = st.steps[i]||{};
+        const label = (si.tool||('step '+i));
+        const status = si.status||'';
+        const runDir = si.run_dir||'';
+        const log = si.log||'';
+        const code = (si.exit_code!==undefined && si.exit_code!==null) ? String(si.exit_code) : '';
+        let row = '<div><code>'+esc(label)+'</code> — <b>'+esc(status||'')+'</b>';
+        if(code && status && status!=='running' && status!=='queued' && status!=='stopping') row += ' (exit '+esc(code)+')';
+        if(runDir){
+          const runHref = (!String(runDir).endsWith('/')) ? (String(runDir) + '/') : String(runDir);
+          row += ' — <a href="'+esc(runHref)+'" target="_blank" rel="noopener"><code>'+esc(runDir)+'</code></a>';
+          row += ' <button class="btn chip" type="button" onclick="browseInWorkspace(\''+escJs(runDir)+'\')">Browse</button>';
+        }
+        if(log){
+          row += ' — <a href="'+esc(log)+'" target="_blank" rel="noopener"><code>log</code></a>';
+        }
+        row += '</div>';
+        html += row;
+      }
+      html += '</div>';
+      html += '</div>';
+      html += '</details>';
+    }
+
+    html += '</div>';
+  }
+  html += '</div>';
+
+  panel.innerHTML = html;
+}
+
+
+function maybeUpdateFunctionsUi(throttleMs){
+  const now = Date.now();
+  const thr = (throttleMs===undefined || throttleMs===null) ? 850 : Number(throttleMs);
+  if(!thr || thr<=0){ updateFunctionsUi(); return; }
+  if(!fnUiLastRender || (now - fnUiLastRender) > thr){
+    fnUiLastRender = now;
+    updateFunctionsUi();
+  }
+}
+
+function updateFunctionsUi(){
+  // Re-render for simplicity; the panel is small and this keeps button state
+  // coherent when selection/API changes.
+  try{ renderFunctionsPanel(); }catch(e){}
+}
+
+function initFunctions(){
+  updateFunctionsUi();
+}
+
+async function apiRunTool(tool, args, groupDir, runName){
+  const payload = {tool:tool,args:args};
+  if(groupDir){ payload.group_dir = String(groupDir); }
+  if(runName){ payload.run_name = String(runName); }
+  const r=await apiFetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const j=await r.json();
+  if(!r.ok) throw new Error(j&&j.error?j.error:'run failed');
+  return j;
+}
+
+async function apiKillJob(id){
+  const r=await apiFetch('/api/kill/'+id,{method:'POST'});
+  const j=await r.json();
+  if(!r.ok) throw new Error(j&&j.error?j.error:'kill failed');
+  return j;
+}
+
+async function waitJobDone(id, onUpdate, isCanceledFn){
+  while(true){
+    const r=await apiFetch('/api/job/'+id);
+    const j=await r.json();
+    if(!r.ok) throw new Error(j&&j.error?j.error:'job query failed');
+    if(onUpdate) try{ onUpdate(j); }catch(e){}
+    const st = String(j.status||'');
+    if(st==='running' || st==='stopping' || st==='queued'){
+      if(isCanceledFn && isCanceledFn()){
+        // best-effort: do not spin too fast when user requested cancel
+        await delayMs(600);
+      } else {
+        await delayMs(st==='queued'?2000:1500);
+      }
+      continue;
+    }
+    return j;
+  }
+}
+
+function nowCompactLocal(){
+  const d=new Date();
+  const pad=(n)=>String(n).padStart(2,'0');
+  return ''+d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate())+'_'+pad(d.getHours())+pad(d.getMinutes())+pad(d.getSeconds());
+}
+function safeId(s, maxLen){
+  s = String(s||'').toLowerCase();
+  s = s.replace(/[^a-z0-9_-]+/g,'_');
+  s = s.replace(/_+/g,'_').replace(/^_+|_+$/g,'');
+  if(maxLen){
+    const m = Number(maxLen);
+    if(m>0 && s.length>m) s = s.slice(0,m);
   }
   return s;
 }
 
-function escapeRegExp(s){return String(s||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
-function escJs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
-
-function setFlagValue(args, flag, value){
-  args = String(args||'');
-  const v = quoteArgIfNeeded(value);
-  const f = escapeRegExp(flag);
-
-  // --flag=value
-  const reEq = new RegExp(f+'=("[^"]*"|\\\'[^\\\']*\\\'|[^\\s]+)');
-  if(reEq.test(args)){
-    return args.replace(reEq, flag+'='+v);
+async function runFunction(fnId){
+  const fns = getAvailableFunctions();
+  const f = fns.find(x=>x && x.id===fnId);
+  if(!f){ alert('Function not found: '+fnId); return; }
+  if(!(qeegApiOk && qeegApiToken)){
+    alert('Function runner requires qeeg_ui_server_cli (local).');
+    return;
   }
-
-  // --flag value
-  const re = new RegExp(f+'\\s+("[^"]*"|\\\'[^\\\']*\\\'|[^\\s]+)');
-  if(re.test(args)){
-    return args.replace(re, flag+' '+v);
+  if(!functionSelectionOk(f)){
+    alert('Please select an input first.');
+    return;
   }
-
-  return (args.trim()+' '+flag+' '+v).trim();
-}
-
-function useSelectedInput(btn){
-  const argsId = (btn && btn.dataset) ? btn.dataset.argsId : '';
-  const el = document.getElementById(argsId);
-  if(!el) return;
-  if(!selectedInputPath){
-    alert('Select a file or directory first (Workspace browser).');
+  if(fnRuns[fnId] && fnRuns[fnId].running){
+    alert('This function is already running.');
     return;
   }
 
-  const flag = getInjectFlag(btn);
-  if(!flag){
-    const isDir = (selectedInputType==='dir');
-    alert(isDir
-      ? 'Selected path is a directory. Choose a directory-related flag from the dropdown (e.g., --outdir/--dataset/--bids-root) or select a file instead.'
-      : 'No inject flag detected for this tool. Choose a flag from the dropdown or edit args manually.');
-    return;
+  const sel = String(selectedInputPath||'');
+  const selDir = (selectedInputType==='dir') ? sel : parentDirOf(sel);
+  const groupDir = (()=>{
+    // Use one stable group folder across all steps so outputs stay together.
+    const stamp = nowCompactLocal();
+    const safeFn = safeId(fnId, 32);
+    const safeSel = safeId(selectionBaseName(sel), 24);
+    let g = stamp + '_fn_' + safeFn;
+    if(safeSel) g += '_' + safeSel;
+    return g;
+  })();
+  const ctx = { sel: sel, selDir: selDir, group_dir: groupDir, server: (qeegServerInfo||{}), steps: [] };
+
+  fnRuns[fnId] = { running:true, canceled:false, group_dir: groupDir, steps: [] };
+  updateFunctionsUi();
+
+  try{
+    setFnStatus(fnId, '<b>Starting…</b>');
+    for(let i=0;i<f.steps.length;i++){
+      const step=f.steps[i];
+      const tool=String(step.tool||'');
+      const argsT=String(step.args||'');
+      const args=expandFnArgs(argsT, ctx);
+
+      // Initialize step state before launching.
+      const st = { tool: tool, status: 'starting', args: args };
+      fnRuns[fnId].steps[i] = st;
+      updateFunctionsUi();
+
+      const runName = 'step' + String(i+1).padStart(2,'0') + '_' + tool;
+      const started = await apiRunTool(tool, args, groupDir, runName);
+      st.job_id = started.id;
+      st.run_dir = started.run_dir || '';
+      st.log = started.log || '';
+      st.status = started.status || 'running';
+      if(step.outdir_suffix && st.run_dir){
+        st.outdir = joinRelPath(String(st.run_dir), String(step.outdir_suffix));
+      }
+      ctx.steps[i] = st;
+      updateFunctionsUi();
+
+      // Wait to finish, updating status as we poll.
+      const done = await waitJobDone(started.id, (j)=>{
+        st.status = String(j.status||st.status||'');
+        if(j.exit_code!==undefined) st.exit_code = j.exit_code;
+        if(j.run_dir && !st.run_dir) st.run_dir = String(j.run_dir);
+        if(j.log && !st.log) st.log = String(j.log);
+        if(step.outdir_suffix && st.run_dir){
+          st.outdir = joinRelPath(String(st.run_dir), String(step.outdir_suffix));
+        }
+        ctx.steps[i] = st;
+        // Lightweight status line update.
+        const label = '<b>Step '+(i+1)+'/'+f.steps.length+':</b> <code>'+esc(tool)+'</code> — <b>'+esc(st.status||'')+'</b>';
+        setFnStatus(fnId, label);
+        maybeUpdateFunctionsUi(900);
+      }, ()=>!!(fnRuns[fnId] && fnRuns[fnId].canceled));
+
+      st.status = String(done.status||st.status||'');
+      if(done.exit_code!==undefined) st.exit_code = done.exit_code;
+      if(done.run_dir) st.run_dir = String(done.run_dir);
+      if(done.log) st.log = String(done.log);
+      if(step.outdir_suffix && st.run_dir){
+        st.outdir = joinRelPath(String(st.run_dir), String(step.outdir_suffix));
+      }
+      ctx.steps[i] = st;
+      updateFunctionsUi();
+
+      const code = (done.exit_code!==undefined) ? Number(done.exit_code) : 0;
+      if(fnRuns[fnId] && fnRuns[fnId].canceled){
+        setFnStatus(fnId, '<b>Canceled.</b>');
+        break;
+      }
+      if(code!==0){
+        setFnStatus(fnId, '<b>Error.</b> Step '+(i+1)+' exited with code '+esc(String(code))+'.');
+        break;
+      }
+    }
+  }catch(e){
+    setFnStatus(fnId, '<b>Error:</b> '+esc(e && e.message ? e.message : String(e)));
+  }finally{
+    if(fnRuns[fnId]) fnRuns[fnId].running=false;
+    updateFunctionsUi();
+    refreshRuns();
+  }
+}
+
+async function stopFunction(fnId){
+  const st = fnRuns[fnId];
+  if(!st || !st.running) return;
+  st.canceled=true;
+  // Best-effort: kill the most recent step with a job id.
+  let id=0;
+  if(st.steps && st.steps.length){
+    for(let i=st.steps.length-1;i>=0;--i){
+      const s = st.steps[i];
+      if(s && s.job_id){ id = Number(s.job_id)||0; break; }
+    }
+  }
+  updateFunctionsUi();
+  if(!id) return;
+  try{
+    await apiKillJob(id);
+  }catch(e){
+    // ignore
+  }
+}
+
+function getSelectionFunctionSuggestions(){
+  const out=[];
+  if(!selectedInputPath) return out;
+
+  const sel = String(selectedInputPath);
+  const lower = sel.toLowerCase();
+  const base = selectionBaseName(sel).toLowerCase();
+  const isLoreta = (lower.includes('loreta') || base.includes('loreta') || lower.includes('sLORETA'.toLowerCase()));
+  const isEegLike = (/(\.edf|\.bdf|\.set|\.fif|\.vhdr)$/.test(lower) || (lower.endsWith('.csv') && !isLoreta));
+
+  if(selectedInputType==='dir'){
+    // Directory-driven suggestions (run downstream tools on existing outputs).
+    if(base.includes('out_map') || base.includes('map')){
+      out.push({fnId:'region_summary_report', label:'Run Region summary report'});
+    }
+    if(base.includes('out_bp') || base.includes('out_br') || base.includes('bandpower') || base.includes('ratio') || base.includes('topo')){
+      out.push({fnId:'topomap_report', label:'Run Topomap report'});
+    }
+    if(base.includes('out_coh') || base.includes('out_plv') || base.includes('coherence') || base.includes('plv') || base.includes('connect')){
+      out.push({fnId:'connectivity_map_report', label:'Run Connectivity map report'});
+    }
+  } else if(isEegLike){
+    out.push({fnId:'brainmap_pipeline', label:'Run Brain mapping pipeline'});
+    out.push({fnId:'inspect_quick', label:'Run Quick inspect'});
+    out.push({fnId:'map_report', label:'Run qEEG map report'});
+    out.push({fnId:'bandpower_to_topos', label:'Run Bandpower → topomaps'});
+    out.push({fnId:'connectivity_coherence_report', label:'Run Connectivity (coherence)'});
+    out.push({fnId:'microstates_report', label:'Run Microstates report'});
+    out.push({fnId:'nf_biotrace_ui', label:'Run Neurofeedback BioTrace UI'});
   }
 
-  el.value = setFlagValue(el.value, flag, selectedInputPath);
-}
-
-function resetArgs(argsId){
-  const el=document.getElementById(argsId);
-  if(!el) return;
-  const d = el.getAttribute('data-default') || '';
-  el.value = d;
-}
-
-
-function presetsLegacyKey(tool){ return 'qeeg_presets_'+tool; }
-function presetsStoreKey(){ return 'qeeg_presets_store_v1'; }
-
-function emptyPresetsStore(){
-  return {version:1, tools:{}};
-}
-
-function sanitizePresetMap(m){
-  const out = {};
-  if(!m || typeof m !== 'object') return out;
-  for(const k in m){
-    if(!Object.prototype.hasOwnProperty.call(m,k)) continue;
-    const v = m[k];
-    if(typeof v === 'string') out[String(k)] = v;
+  // LORETA workflows (file or folder exports).
+  if(isLoreta){
+    out.push({fnId:'loreta_metrics_report', label:'Run LORETA metrics report'});
+    out.push({fnId:'loreta_connectivity_report', label:'Run LORETA connectivity report'});
   }
+
   return out;
 }
 
@@ -4681,7 +6839,18 @@ function setApiUi(){
   const s=document.getElementById('apiStatus');
   if(s){
     const label = (qeegApiOk && qeegApiToken) ? 'connected' : (qeegApiOk ? 'token-missing' : 'offline');
-    s.innerHTML = 'Run API: <b>'+label+'</b>';
+    let extra = '';
+    if(qeegApiOk && qeegApiToken && qeegServerInfo){
+      const a = Number(qeegServerInfo.active_jobs||0);
+      const q = Number(qeegServerInfo.queued_jobs||0);
+      const mp = Number(qeegServerInfo.max_parallel||0);
+      const parts = [];
+      if(mp) parts.push('max '+String(mp));
+      if(a) parts.push(String(a)+' active');
+      if(q) parts.push(String(q)+' queued');
+      if(parts.length) extra = ' <span class="small" style="color:var(--muted)">(' + parts.join(', ') + ')</span>';
+    }
+    s.innerHTML = 'Run API: <b>'+label+'</b>'+extra;
   }
   document.querySelectorAll('.run-btn').forEach(b=>{b.disabled = !(qeegApiOk && qeegApiToken);});
   document.querySelectorAll('.statusline').forEach(el=>{
@@ -4832,6 +7001,12 @@ function renderHistory(){
     if(args){
       actions += '<button class="btn" data-tool="'+esc(tool)+'" data-args="'+esc(args)+'" onclick="loadHistoryArgs(this)">Load args</button> ';
     }
+    if(tool && args){
+      actions += '<button class="btn" data-tool="'+esc(tool)+'" data-args="'+esc(args)+'" data-run-dir="'+esc(run)+'" onclick="historyRerun(this)">Rerun</button> ';
+      actions += '<button class="btn" data-tool="'+esc(tool)+'" data-args="'+esc(args)+'" data-input="'+esc(input)+'" onclick="historyAddStepToBuilder(this)">Add step</button> ';
+      actions += '<button class="btn" data-tool="'+esc(tool)+'" data-args="'+esc(args)+'" data-input="'+esc(input)+'" onclick="historySaveAsFunction(this)">Save func</button> ';
+      actions += '<button class="btn" data-tool="'+esc(tool)+'" data-args="'+esc(args)+'" data-input="'+esc(input)+'" onclick="historyPlanRun(this)">Plan</button> ';
+    }
     if(input){
       actions += '<button class="btn" data-input="'+esc(input)+'" onclick="selectHistoryInput(this)">Select input</button> ';
     }
@@ -4923,10 +7098,12 @@ async function detectApi(){
     if(!r.ok) throw new Error('bad');
     const j=await r.json();
     qeegApiOk = !!(j && j.ok);
-    qeegApiToken = (j && j.token) ? j.token : '';
+    qeegApiToken = (j && j.token) ? String(j.token) : '';
+    qeegServerInfo = j || null;
   }catch(e){
     qeegApiOk=false;
     qeegApiToken='';
+    qeegServerInfo=null;
   }
   setApiUi();
   if(qeegApiOk && qeegApiToken){
@@ -4934,6 +7111,8 @@ async function detectApi(){
     initFsBrowser();
     initRunsPanel();
     maybeInitServerPresets();
+    maybeInitServerFunctions();
+    maybeInitServerTools();
   } else {
     stopRunsPoll();
     stopHistoryPoll();
@@ -4941,8 +7120,15 @@ async function detectApi(){
     toolLive = {};
     updateLiveBadges();
     presetsServerEnabled=false;
+    functionsServerEnabled=false;
+    functionsSource='local';
     presetsSource='local';
+    qeegServerTools=[];
+    qeegServerToolsFetchedAt=0;
+    qeegServerToolsError='';
     updatePresetsStatus();
+    try{ updateFunctionsLibraryStatus(); }catch(e){}
+    maybeUpdateFunctionsUi(0);
   }
 }
 
@@ -8478,6 +10664,9 @@ async function runBatch(){
   let okCount=0;
   let outHtml = '<div class="small">Submitting '+paths.length+' job(s)…</div>';
 
+  // Group batch submissions under one folder for easier browsing in the Runs tab.
+  const groupDir = 'batch_' + safeId(tool, 24) + '_' + Date.now();
+
   const flag = getBatchInjectFlag();
   const hasInputPlaceholder = tplRaw.includes('{input}');
 
@@ -8498,7 +10687,8 @@ async function runBatch(){
     try{
 )JS";
 
-o << R"JS(      const r = await apiFetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tool:tool, args:args})});
+o << R"JS(      const runName = 'item' + String(i+1).padStart(3,'0') + '_' + String(e && e.name ? e.name : p);
+      const r = await apiFetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tool:tool, args:args, group_dir: groupDir, run_name: runName})});
       const j = await r.json();
       if(!r.ok) throw new Error(j && j.error ? j.error : 'run failed');
       okCount++;

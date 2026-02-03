@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_sessions_dashboard_index.schema.json",
+  "title": "scripts/render_nf_sessions_dashboard.py --json-index output",
+  "description": "Schema for the machine-readable JSON index emitted by scripts/render_nf_sessions_dashboard.py when --json-index is provided. This file is intended for downstream tools (GUIs, offline bundles, analysis pipelines) to discover, summarize, and link to multiple qeeg_nf_cli session outputs without parsing the dashboard HTML.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_utc",
+    "roots",
+    "dashboard_html",
+    "sessions_summary",
+    "sessions"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema hint for editors/validators (points at this schema's $id).",
+      "const": "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_nf_sessions_dashboard_index.schema.json"
+    },
+    "schema_version": {
+      "type": "integer",
+      "description": "Version of the JSON index payload structure.",
+      "const": 1
+    },
+    "generated_utc": {
+      "type": "string",
+      "description": "UTC timestamp (ISO-8601 with trailing 'Z') when the index was generated.",
+      "format": "date-time"
+    },
+    "roots": {
+      "type": "array",
+      "description": "Original scan roots (typically absolute paths).",
+      "items": {
+        "type": "string"
+      }
+    },
+    "roots_rel": {
+      "type": "array",
+      "description": "Scan roots as POSIX-style relative paths from the JSON file's directory (portable when moving the report folder).",
+      "items": {
+        "type": "string"
+      }
+    },
+    "dashboard_html": {
+      "type": "string",
+      "description": "POSIX-style relative path to the generated dashboard HTML, relative to the JSON index file."
+    },
+    "sessions_summary": {
+      "type": "object",
+      "description": "Convenience counts of session statuses.",
+      "additionalProperties": false,
+      "required": [
+        "total",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ok": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "sessions": {
+      "type": "array",
+      "description": "List of detected neurofeedback sessions (one per output directory containing nf_feedback.csv).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "session_dir",
+          "timestamp_utc",
+          "protocol",
+          "metric_spec",
+          "nf_feedback_csv",
+          "note",
+          "ok",
+          "stats"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-based session index in the dashboard ordering."
+          },
+          "session_dir": {
+            "type": "string",
+            "description": "POSIX-style relative path to the session/output directory, relative to the JSON index file."
+          },
+          "timestamp_utc": {
+            "type": "string",
+            "description": "Best-effort session timestamp (UTC ISO-8601). May be empty if unknown."
+          },
+          "protocol": {
+            "type": "string",
+            "description": "Protocol name from nf_summary.json (best-effort)."
+          },
+          "metric_spec": {
+            "type": "string",
+            "description": "Compact human-readable metric spec from nf_summary.json (best-effort)."
+          },
+          "nf_feedback_csv": {
+            "type": "string",
+            "description": "POSIX-style relative path to nf_feedback.csv, relative to the JSON index file."
+          },
+          "nf_summary_json": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional relative path to nf_summary.json (null if missing)."
+          },
+          "nf_run_meta_json": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional relative path to nf_run_meta.json (null if missing)."
+          },
+          "derived_events": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional relative path to derived events TSV/CSV (null if missing)."
+          },
+          "report_html": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional relative path to nf_feedback_report.html (null if missing)."
+          },
+          "note": {
+            "type": "string",
+            "description": "Best-effort note/message about the session (e.g., parsing warnings or errors)."
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "Whether the session was parsed successfully (best-effort)."
+          },
+          "stats": {
+            "type": "object",
+            "description": "Per-session summary statistics derived from nf_feedback.csv (best-effort).",
+            "additionalProperties": false,
+            "required": [
+              "n_frames",
+              "duration_sec",
+              "dt_median_sec",
+              "reward_frac",
+              "artifact_frac",
+              "artifact_ready_frac",
+              "metric_mean",
+              "metric_min",
+              "metric_max",
+              "metric_last",
+              "threshold_mean",
+              "threshold_min",
+              "threshold_max",
+              "threshold_last",
+              "reward_rate_mean",
+              "reward_rate_last",
+              "bad_channels_mean",
+              "phase_counts",
+              "derived_durations"
+            ],
+            "properties": {
+              "n_frames": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "duration_sec": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "dt_median_sec": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "reward_frac": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "artifact_frac": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "artifact_ready_frac": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "metric_mean": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "metric_min": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "metric_max": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "metric_last": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "threshold_mean": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "threshold_min": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "threshold_max": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "threshold_last": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "reward_rate_mean": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "reward_rate_last": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "bad_channels_mean": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "phase_counts": {
+                "type": "object",
+                "description": "Counts per phase label (best-effort).",
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "derived_durations": {
+                "type": "object",
+                "description": "Total duration (seconds) per derived event label (best-effort).",
+                "additionalProperties": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "dashboard_exists": {
+      "type": "boolean",
+      "description": "Whether the dashboard_html file existed at generation time (best-effort)."
+    },
+    "dashboard_mtime_utc": {
+      "type": "string",
+      "description": "UTC mtime of dashboard_html at generation time (ISO-8601 with trailing Z).",
+      "format": "date-time"
+    },
+    "dashboard_size_bytes": {
+      "type": "integer",
+      "description": "Size of dashboard_html in bytes at generation time (best-effort).",
+      "minimum": 0
+    }
+  }
+}
