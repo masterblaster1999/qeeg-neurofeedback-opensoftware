@@ -4011,7 +4011,8 @@ function sanitizeFunctionList(list){
   for(const f of list){
     const s = sanitizeFunctionSpec(f);
     if(!s) continue;
-    if(seen.has(s.id)) continue;
+)JS";
+o << R"JS(    if(seen.has(s.id)) continue;
     seen.add(s.id);
     out.push(s);
   }
@@ -4459,7 +4460,8 @@ function fnBuilderAddStep(step){
 function fnBuilderRemoveStep(i){
   ensureFnBuilder();
   i = Number(i)||0;
-  if(i<0 || i>=fnBuilder.steps.length) return;
+)JS";
+o << R"JS(  if(i<0 || i>=fnBuilder.steps.length) return;
   fnBuilder.steps.splice(i,1);
   scheduleFnBuilderPersist();
   updateFunctionsUi();
@@ -4862,7 +4864,8 @@ function openFnPlanWithSpec(spec, source, opts){
   opts = (opts && typeof opts === 'object') ? opts : {};
   const selOverridePath = String(opts.sel_path || '').trim();
   const selOverrideType = String(opts.sel_type || '').trim();
-  const selOverride = selOverridePath ? {path: selOverridePath, type: (selOverrideType==='dir' ? 'dir' : 'file')} : null;
+)JS";
+o << R"JS(  const selOverride = selOverridePath ? {path: selOverridePath, type: (selOverrideType==='dir' ? 'dir' : 'file')} : null;
 
   const canExpand = !!selectedInputPath || (selOverride && selOverride.path);
 
@@ -5222,7 +5225,8 @@ function renderFunctionsPanel(){
   const toolList = getKnownToolsList();
 
   let html = '';
-  html += '<div class="small">Curated workflows that run multiple tools and keep outputs under <code>ui_runs/</code>. Use the selection bar above to choose an input first.</div>';
+)JS";
+o << R"JS(  html += '<div class="small">Curated workflows that run multiple tools and keep outputs under <code>ui_runs/</code>. Use the selection bar above to choose an input first.</div>';
   html += '<div style="margin-top:8px;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">';
   html += '<div class="small" style="color:var(--muted)">Library: <b>'+esc(functionsSource||'local')+'</b></div>';
   html += '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">';
@@ -5514,7 +5518,8 @@ async function runFunction(fnId){
     if(safeSel) g += '_' + safeSel;
     return g;
   })();
-  const ctx = { sel: sel, selDir: selDir, group_dir: groupDir, server: (qeegServerInfo||{}), steps: [] };
+)JS";
+o << R"JS(  const ctx = { sel: sel, selDir: selDir, group_dir: groupDir, server: (qeegServerInfo||{}), steps: [] };
 
   fnRuns[fnId] = { running:true, canceled:false, group_dir: groupDir, steps: [] };
   updateFunctionsUi();
@@ -5666,6 +5671,7 @@ function normalizePresetsStore(s){
   out.tools = {};
   for(const t in tools){
 )JS";
+
 
 o << R"JS(    if(!Object.prototype.hasOwnProperty.call(tools,t)) continue;
     if(t==='version' || t==='updated' || t==='exported') continue;

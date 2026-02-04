@@ -1077,6 +1077,10 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_edf_reader PRIVATE qeeg)
   add_test(NAME qeeg_test_edf_reader COMMAND qeeg_test_edf_reader)
 
+  add_executable(qeeg_test_rec_autodetect tests/test_rec_autodetect.cpp)
+  target_link_libraries(qeeg_test_rec_autodetect PRIVATE qeeg)
+  add_test(NAME qeeg_test_rec_autodetect COMMAND qeeg_test_rec_autodetect)
+
   add_executable(qeeg_test_edf_writer tests/test_edf_writer.cpp)
   target_link_libraries(qeeg_test_edf_writer PRIVATE qeeg)
   add_test(NAME qeeg_test_edf_writer COMMAND qeeg_test_edf_writer)

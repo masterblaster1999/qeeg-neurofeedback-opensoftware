@@ -1026,6 +1026,9 @@ This project reads EDF/EDF+ and BDF/BDF+. If the export includes peripheral chan
 **Notes on BioTrace+ export formats**
 - The `.bcd` / `.mbd` formats are BioTrace+/NeXus session containers/backups and are **not supported** directly by the C++ readers here.
   Export to EDF/BDF or ASCII from BioTrace+ first.
+- Some BioTrace+/NeXus exports use `.rec` (and occasionally `.edf`) for both EDF and BDF recordings.
+  `read_recording_auto()` treats `.rec` like `.edf` and will route BDF content to `BDFReader`
+  by header sniffing (best effort).
 
   **About `.m2k`:** some `.m2k` files are plain ASCII/CSV exports (supported as CSV input), but some `.m2k` files are ZIP-like containers (especially SD-card/session backups). If your `.m2k` triggers a "ZIP container" error, use the extractor below.
   

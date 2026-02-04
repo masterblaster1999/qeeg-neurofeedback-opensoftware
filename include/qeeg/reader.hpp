@@ -13,7 +13,9 @@ public:
 };
 
 // Read a file based on extension:
-// - .edf/.EDF => EDFReader (16-bit EDF/EDF+)
+// - .edf/.EDF/.rec => EDFReader (16-bit EDF/EDF+) by default.
+//   If the file header indicates BDF (e.g., BioSemi-style 0xFF "BIOSEMI"),
+//   the loader will route it to BDFReader instead (best effort).
 // - .bdf/.BDF => BDFReader (24-bit BDF/BDF+)
 // - .csv => CSVReader (fs_hz_for_csv can be omitted if the first column is a time axis)
 //

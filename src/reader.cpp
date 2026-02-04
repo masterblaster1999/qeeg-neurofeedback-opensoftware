@@ -9,7 +9,26 @@
 #include "qeeg/utils.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
+
+namespace {
+
+static bool file_looks_like_bdf(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  unsigned char b[8] = {0};
+  f.read(reinterpret_cast<char*>(b), static_cast<std::streamsize>(sizeof(b)));
+  if (!f) return false;
+  if (b[0] != 0xFFu) return false;
+  const unsigned char sig[7] = {'B', 'I', 'O', 'S', 'E', 'M', 'I'};
+  for (int i = 0; i < 7; ++i) {
+    if (b[1 + i] != sig[i]) return false;
+  }
+  return true;
+}
+
+} // namespace
 
 namespace qeeg {
 
@@ -66,6 +85,19 @@ EEGRecording read_recording_auto(const std::string& path, double fs_hz_for_csv) 
   }
 
   if (ends_with(low, ".edf") || ends_with(low, ".edf+") || ends_with(low, ".rec")) {
+    // Some exporters (including some NeXus/BioTrace workflows) can use .rec/.edf
+    // extensions for BDF (24-bit) content. Detect and route accordingly.
+    if (file_looks_like_bdf(resolved_path)) {
+      BDFReader r;
+      EEGRecording rec = r.read(resolved_path);
+      // Many BDF recordings store triggers in a "Status" channel rather than an Annotations signal.
+      if (rec.events.empty()) {
+        const TriggerExtractionResult tr = extract_events_from_triggers_auto(rec);
+        if (!tr.events.empty()) rec.events = tr.events;
+      }
+      return rec;
+    }
+
     EDFReader r;
     EEGRecording rec = r.read(resolved_path);
     // If the file contains no EDF+ annotations, try to recover event markers from a trigger-like channel.
