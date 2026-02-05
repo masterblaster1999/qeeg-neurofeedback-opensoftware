@@ -895,6 +895,24 @@ if(QEEG_BUILD_TESTS)
       set_tests_properties(qeeg_test_nf_cli_json_schema_validation_demo
                            PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
+      # Validate the JSON Schema files in schemas/ (meta-validation).
+      add_test(NAME qeeg_test_schema_files_selftest
+               COMMAND ${Python3_EXECUTABLE} -B
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/validate_schema_files.py
+                 --schemas-dir ${CMAKE_CURRENT_SOURCE_DIR}/schemas)
+
+      set_tests_properties(qeeg_test_schema_files_selftest
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+      # Python unit tests for validation scripts (fast; no build artifacts).
+      add_test(NAME qeeg_test_python_unit_tests
+               COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+                 -s ${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests
+                 -p test_*.py)
+
+      set_tests_properties(qeeg_test_python_unit_tests
+                           PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
       # Smoke test the dependency-free HTML report renderers.
       add_test(NAME qeeg_test_report_renderers_selftest
                COMMAND ${Python3_EXECUTABLE} -B
@@ -1018,6 +1036,27 @@ if(QEEG_BUILD_TESTS)
                           --verbose
                         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
                         COMMENT "Validate BioTrace helper JSON outputs against schemas"
+                        VERBATIM)
+
+      # Developer convenience: validate the JSON Schema files in schemas/.
+      add_custom_target(qeeg_validate_schema_files
+                        COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+                          ${Python3_EXECUTABLE} -B
+                          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/validate_schema_files.py
+                          --schemas-dir ${CMAKE_CURRENT_SOURCE_DIR}/schemas
+                          --require-jsonschema
+                          --verbose
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                        COMMENT "Validate JSON Schema files in schemas/"
+                        VERBATIM)
+
+      # Developer convenience: smoke test the multi-session neurofeedback sessions dashboard renderer.
+      add_custom_target(qeeg_selftest_nf_sessions_dashboard
+                        COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+                          ${Python3_EXECUTABLE} -B
+                          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/selftest_nf_sessions_dashboard.py
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                        COMMENT "Smoke test the neurofeedback sessions dashboard renderer"
                         VERBATIM)
 
       # Developer convenience: smoke test the real-time dashboard server.

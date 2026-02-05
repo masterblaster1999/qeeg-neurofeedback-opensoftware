@@ -35,8 +35,10 @@ Run-Step "[ci] test: ctest --preset $Preset" "ctest" @("--preset", $Preset)
 # Optional: validate machine-readable JSON outputs against schemas/.
 # These convenience targets are added when CMake finds a Python3 interpreter.
 $targets = @(
+  "qeeg_validate_schema_files",
   "qeeg_validate_nf_cli_json",
   "qeeg_validate_biotrace_json",
+  "qeeg_selftest_nf_sessions_dashboard",
   "qeeg_selftest_rt_dashboard"
 )
 
