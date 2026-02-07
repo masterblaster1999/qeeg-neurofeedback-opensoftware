@@ -1050,6 +1050,21 @@ if(QEEG_BUILD_TESTS)
                         COMMENT "Validate JSON Schema files in schemas/"
                         VERBATIM)
 
+      # Developer convenience: run Python unit tests for scripts/.
+      #
+      # This complements the CTest-registered qeeg_test_python_unit_tests by providing
+      # a build-system target that can be invoked with:
+      #   cmake --build build --target qeeg_selftests_python
+      add_custom_target(qeeg_selftests_python
+                        COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+                          ${Python3_EXECUTABLE} -B -m unittest discover
+                            -s ${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests
+                            -p test_*.py
+                            -v
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                        COMMENT "Run Python unit tests (scripts/tests)"
+                        VERBATIM)
+
       # Developer convenience: smoke test the multi-session neurofeedback sessions dashboard renderer.
       add_custom_target(qeeg_selftest_nf_sessions_dashboard
                         COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1

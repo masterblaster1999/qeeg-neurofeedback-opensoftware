@@ -114,6 +114,11 @@ class TestValidateSchemaFiles(unittest.TestCase):
             self.assertIn("$ref error", err)
 
     def test_require_jsonschema_flag(self) -> None:
+        try:
+            import jsonschema  # noqa: F401
+        except ImportError:
+            self.skipTest("jsonschema is not installed")
+
         with tempfile.TemporaryDirectory() as td:
             schemas = Path(td)
 

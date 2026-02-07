@@ -29,6 +29,8 @@
 #include "qeeg/osc.hpp"
 #include "qeeg/version.hpp"
 
+#include "validate_json_schema.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -41,6 +43,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -53,12 +56,7 @@ using namespace qeeg;
 // Canonical JSON Schema locations for qeeg_nf_cli machine-readable outputs.
 //
 // These URLs match the $id fields in the corresponding schema documents under /schemas.
-static constexpr const char* k_schema_base_url =
-  "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/";
-
-static std::string schema_url(const char* schema_file) {
-  return std::string(k_schema_base_url) + schema_file;
-}
+// (See validate_json_schema.hpp.)
 
 struct Args {
   std::string input_path;
