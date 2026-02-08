@@ -784,10 +784,14 @@ def _write_json_index(items: Sequence[ReportItem], roots: Sequence[str], *, out_
     os.makedirs(out_dir, exist_ok=True)
 
     def _rel(p: str) -> str:
+        # report_common.posix_relpath is intentionally best-effort (never
+        # raises). Keep a fallback anyway for robustness, and always normalize
+        # to POSIX-style slashes so the JSON index is portable.
         try:
-            return _posix_relpath(os.path.abspath(p), out_dir)
+            rel = _posix_relpath(os.path.abspath(str(p)), out_dir)
         except Exception:
-            return p
+            rel = os.path.abspath(str(p))
+        return str(rel).replace("\\", "/")
 
     schema_id = "https://raw.githubusercontent.com/masterblaster1999/qeeg-neurofeedback-opensoftware/main/schemas/qeeg_reports_dashboard_index.schema.json"
 

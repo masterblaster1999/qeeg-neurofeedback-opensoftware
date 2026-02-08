@@ -772,8 +772,12 @@ bool parse_iso8601_to_utc_millis(const std::string& ts, int64_t* out_utc_ms) {
   if (!out_utc_ms) return false;
   *out_utc_ms = 0;
 
+  // Be tolerant of leading/trailing whitespace (common when timestamps come from
+  // JSON/CSV fields or user input).
+  const std::string s = trim(ts);
+
   // Minimum length for: YYYY-MM-DDTHH:MM:SSZ
-  if (ts.size() < 20) return false;
+  if (s.size() < 20) return false;
 
   int year = 0;
   int mon = 0;
@@ -782,16 +786,18 @@ bool parse_iso8601_to_utc_millis(const std::string& ts, int64_t* out_utc_ms) {
   int mm = 0;
   int ss = 0;
 
-  if (!parse_4dig(ts, 0, &year) || ts[4] != '-') return false;
-  if (!parse_2dig(ts, 5, &mon) || ts[7] != '-') return false;
-  if (!parse_2dig(ts, 8, &day)) return false;
+  if (!parse_4dig(s, 0, &year) || s[4] != '-') return false;
+  if (!parse_2dig(s, 5, &mon) || s[7] != '-') return false;
+  if (!parse_2dig(s, 8, &day)) return false;
 
-  const char t = ts[10];
-  if (t != 'T' && t != 't') return false;
+  // ISO-8601 recommends 'T' as the date/time separator, but many tools emit a
+  // single space instead. Accept both.
+  const char t = s[10];
+  if (t != 'T' && t != 't' && t != ' ') return false;
 
-  if (!parse_2dig(ts, 11, &hh) || ts[13] != ':') return false;
-  if (!parse_2dig(ts, 14, &mm) || ts[16] != ':') return false;
-  if (!parse_2dig(ts, 17, &ss)) return false;
+  if (!parse_2dig(s, 11, &hh) || s[13] != ':') return false;
+  if (!parse_2dig(s, 14, &mm) || s[16] != ':') return false;
+  if (!parse_2dig(s, 17, &ss)) return false;
 
   if (!valid_civil(year, mon, day)) return false;
   if (hh < 0 || hh > 23) return false;
@@ -802,15 +808,15 @@ bool parse_iso8601_to_utc_millis(const std::string& ts, int64_t* out_utc_ms) {
   int millis = 0;
 
   // Optional fractional seconds.
-  if (i < ts.size() && ts[i] == '.') {
+  if (i < s.size() && (s[i] == '.' || s[i] == ',')) {
     ++i;
-    if (i >= ts.size()) return false;
-    if (ts[i] < '0' || ts[i] > '9') return false;
+    if (i >= s.size()) return false;
+    if (s[i] < '0' || s[i] > '9') return false;
 
     int mult = 100;
     size_t nd = 0;
-    while (i < ts.size()) {
-      const char c = ts[i];
+    while (i < s.size()) {
+      const char c = s[i];
       if (c < '0' || c > '9') break;
       if (nd < 3) {
         millis += (c - '0') * mult;
@@ -821,29 +827,48 @@ bool parse_iso8601_to_utc_millis(const std::string& ts, int64_t* out_utc_ms) {
     }
   }
 
-  if (i >= ts.size()) return false;
+  if (i >= s.size()) return false;
 
   // Time zone spec.
   int offset_seconds = 0;
-  const char z = ts[i];
-  if ((z == 'Z' || z == 'z') && i + 1 == ts.size()) {
+  const char z = s[i];
+  if ((z == 'Z' || z == 'z') && i + 1 == s.size()) {
     offset_seconds = 0;
     i += 1;
-  } else if ((z == '+' || z == '-') && i + 6 == ts.size() && ts[i + 3] == ':') {
+  } else if (z == '+' || z == '-') {
     int oh = 0;
     int om = 0;
-    if (!parse_2dig(ts, i + 1, &oh)) return false;
-    if (!parse_2dig(ts, i + 4, &om)) return false;
+
+    // RFC3339-style numeric offset with colon: "+HH:MM".
+    if (i + 6 == s.size() && s[i + 3] == ':') {
+      if (!parse_2dig(s, i + 1, &oh)) return false;
+      if (!parse_2dig(s, i + 4, &om)) return false;
+      i += 6;
+
+    // Common ISO-8601 variant without colon: "+HHMM".
+    } else if (i + 5 == s.size()) {
+      if (!parse_2dig(s, i + 1, &oh)) return false;
+      if (!parse_2dig(s, i + 3, &om)) return false;
+      i += 5;
+
+    // Hours-only offset: "+HH".
+    } else if (i + 3 == s.size()) {
+      if (!parse_2dig(s, i + 1, &oh)) return false;
+      om = 0;
+      i += 3;
+    } else {
+      return false;
+    }
+
     if (oh < 0 || oh > 23) return false;
     if (om < 0 || om > 59) return false;
     offset_seconds = oh * 3600 + om * 60;
     if (z == '-') offset_seconds = -offset_seconds;
-    i += 6;
   } else {
     return false;
   }
 
-  if (i != ts.size()) return false;
+  if (i != s.size()) return false;
 
   const int64_t days = days_from_civil(year, static_cast<unsigned>(mon), static_cast<unsigned>(day));
   const int64_t local_seconds = days * 86400 + static_cast<int64_t>(hh) * 3600 + static_cast<int64_t>(mm) * 60 + static_cast<int64_t>(ss);
@@ -857,6 +882,7 @@ bool parse_iso8601_to_utc_millis(const std::string& ts, int64_t* out_utc_ms) {
   *out_utc_ms = utc_seconds * 1000 + static_cast<int64_t>(millis);
   return true;
 }
+
 
 std::string json_escape(const std::string& s) {
   // Minimal JSON string escape.

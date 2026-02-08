@@ -84,9 +84,23 @@ def is_dir(path: str) -> bool:
 
 
 def posix_relpath(path: str, start: str) -> str:
-    """os.path.relpath with forward slashes (for HTML hrefs)."""
-    rel = os.path.relpath(path, start)
-    return rel.replace(os.sep, "/")
+    """os.path.relpath with forward slashes (for HTML hrefs).
+
+    Robustness notes:
+      - On Windows, os.path.relpath() raises ValueError when path/start are on
+        different drives. For portability, we fall back to an absolute path.
+      - Always returns POSIX-style slashes ("/") even on Windows.
+      - Never raises.
+    """
+
+    try:
+        rel = os.path.relpath(path, start)
+    except Exception:
+        rel = os.path.abspath(path)
+
+    # Use forward slashes regardless of platform, and also normalize any
+    # caller-provided backslashes.
+    return str(rel).replace("\\", "/")
 
 
 def utc_now_iso() -> str:

@@ -268,11 +268,105 @@ def _validate_minimal(instance: Any, schema_id: str, *, verbose: bool) -> None:
 def _resolve_rel_posix(base_dir: str, posix_path: str) -> str:
     """Resolve a POSIX-style path relative to base_dir into an OS path."""
 
+    def _looks_like_windows_abs(x: str) -> bool:
+        # Treat Windows drive-letter paths as absolute even when validating on
+        # a POSIX host. This makes --check-files behave sensibly when the index
+        # was generated on Windows.
+        #
+        # Accept:
+        #   C:\path\to\file
+        #   C:/path/to/file
+        if len(x) < 3:
+            return False
+        if x[1] != ":":
+            return False
+        if not ("A" <= x[0].upper() <= "Z"):
+            return False
+        return x[2] in ("/", "\\", os.sep)
+
     # The JSON index intentionally uses forward slashes for portability.
     p = str(posix_path).replace("/", os.sep)
-    if os.path.isabs(p):
+    if os.path.isabs(p) or _looks_like_windows_abs(p):
         return os.path.normpath(p)
     return os.path.normpath(os.path.join(base_dir, p))
+
+
+def _validate_invariants(instance: Any, *, verbose: bool) -> None:
+    """Validate non-schema invariants that downstream tools rely on."""
+
+    if not isinstance(instance, dict):
+        raise RuntimeError("Index must be a JSON object")
+
+    dash = instance.get("dashboard_html")
+    if isinstance(dash, str) and "\\" in dash:
+        raise RuntimeError("dashboard_html must use forward slashes (POSIX-style)")
+
+    roots_rel = instance.get("roots_rel")
+    if isinstance(roots_rel, list):
+        for i, r in enumerate(roots_rel):
+            if isinstance(r, str) and "\\" in r:
+                raise RuntimeError(f"roots_rel[{i}] must use forward slashes (POSIX-style)")
+
+    reports = instance.get("reports")
+    if not isinstance(reports, list):
+        raise RuntimeError("reports must be an array")
+
+    allowed_status = {"ok", "skipped", "error"}
+    ok_n = 0
+    skipped_n = 0
+    error_n = 0
+
+    for i, it in enumerate(reports):
+        if not isinstance(it, dict):
+            raise RuntimeError(f"reports[{i}] must be an object")
+
+        for path_key in ("outdir", "report_html"):
+            v = it.get(path_key)
+            if isinstance(v, str) and "\\" in v:
+                raise RuntimeError(f"reports[{i}].{path_key} must use forward slashes (POSIX-style)")
+
+        st = it.get("status")
+        if isinstance(st, str):
+            if st not in allowed_status:
+                raise RuntimeError(f"reports[{i}].status must be one of {sorted(allowed_status)}")
+            if st == "ok":
+                ok_n += 1
+            elif st == "skipped":
+                skipped_n += 1
+            elif st == "error":
+                error_n += 1
+
+    if "reports_summary" in instance:
+        rs = instance.get("reports_summary")
+        if not isinstance(rs, dict):
+            raise RuntimeError("reports_summary must be an object")
+
+        for k in ("total", "ok", "skipped", "error"):
+            if k not in rs:
+                raise RuntimeError(f"reports_summary missing required key: {k}")
+            if not _is_int(rs[k]) or int(rs[k]) < 0:
+                raise RuntimeError(f"reports_summary.{k} must be a non-negative integer")
+
+        total = int(rs["total"])
+        ok = int(rs["ok"])
+        skipped = int(rs["skipped"])
+        err = int(rs["error"])
+
+        if total != len(reports):
+            raise RuntimeError(f"reports_summary.total ({total}) must match len(reports) ({len(reports)})")
+        if ok + skipped + err != total:
+            raise RuntimeError("reports_summary counts must sum to total")
+
+        # Stronger invariant: summary counts must reflect actual report statuses.
+        if ok != ok_n or skipped != skipped_n or err != error_n:
+            raise RuntimeError(
+                "reports_summary counts do not match reports statuses: "
+                f"expected ok={ok_n}, skipped={skipped_n}, error={error_n}; "
+                f"got ok={ok}, skipped={skipped}, error={err}"
+            )
+
+    if verbose:
+        print("OK: invariants")
 
 
 def _check_files(instance: Any, *, index_path: str, verbose: bool) -> None:
@@ -361,6 +455,11 @@ def validate_index(path: str, *, schemas_dir: str, verbose: bool, check_files: b
 
     if not validated:
         _validate_minimal(instance, schema_id, verbose=verbose)
+
+    # Even when JSON Schema validation succeeds, enforce invariants that are
+    # intentionally kept out of the schema (e.g., POSIX-style path separators
+    # and internal summary consistency).
+    _validate_invariants(instance, verbose=verbose)
 
     if check_files:
         _check_files(instance, index_path=path, verbose=verbose)

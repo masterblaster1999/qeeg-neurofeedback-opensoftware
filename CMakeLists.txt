@@ -1184,6 +1184,10 @@ if(QEEG_BUILD_TESTS)
   target_link_libraries(qeeg_test_http_range PRIVATE qeeg)
   add_test(NAME qeeg_test_http_range COMMAND qeeg_test_http_range)
 
+  add_executable(qeeg_test_iso8601 tests/test_iso8601.cpp)
+  target_link_libraries(qeeg_test_iso8601 PRIVATE qeeg)
+  add_test(NAME qeeg_test_iso8601 COMMAND qeeg_test_iso8601)
+
   add_executable(qeeg_test_random_token tests/test_random_token.cpp)
   target_link_libraries(qeeg_test_random_token PRIVATE qeeg)
   add_test(NAME qeeg_test_random_token COMMAND qeeg_test_random_token)
